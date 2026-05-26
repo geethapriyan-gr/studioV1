@@ -1,0 +1,18 @@
+
+# Ignore generated and temporary files
+build/
+dist/
+*.log
+.DS_Store
+Thumbs.db
+
+# Ignore node modules and similar
+node_modules/
+.venv/
+__pycache__/
+
+# Ignore IDE files
+.idea/
+.vscode/
+*.swp
+*.iml

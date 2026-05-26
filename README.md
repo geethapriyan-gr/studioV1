@@ -1,0 +1,1 @@
+A Mobile based video editing app which is built using flutter.
