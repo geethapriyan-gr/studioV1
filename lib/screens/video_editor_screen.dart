@@ -3347,7 +3347,10 @@ class _TransitionPreviewState extends State<_TransitionPreview> {
   @override
   void didUpdateWidget(covariant _TransitionPreview oldWidget) {
     super.didUpdateWidget(oldWidget);
-    if (oldWidget.transition.id != widget.transition.id) {
+    if (oldWidget.transition.id != widget.transition.id ||
+        oldWidget.transition.clipId2 != widget.transition.clipId2 ||
+        oldWidget.clip1.id != widget.clip1.id) {
+      _lastClip2SyncAt = null;
       _resolveClip2();
       _ensureClip2Controller();
     }
@@ -3479,9 +3482,14 @@ class _TransitionPreviewState extends State<_TransitionPreview> {
     final clip2 = _resolvedClip2;
     if (clip2 == null || !controller.value.isInitialized) return;
 
+    if (!widget.provider.isPlaying && controller.value.isPlaying) {
+      await controller.pause();
+      return;
+    }
+
     final now = DateTime.now();
     if (_lastClip2SyncAt != null &&
-        now.difference(_lastClip2SyncAt!) < const Duration(milliseconds: 90)) {
+        now.difference(_lastClip2SyncAt!) < const Duration(milliseconds: 16)) {
       return;
     }
     _lastClip2SyncAt = now;

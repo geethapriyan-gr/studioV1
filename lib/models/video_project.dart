@@ -329,7 +329,9 @@ class VideoClip {
     double? playbackSpeed,
     bool? isReversed,
     String? reversedFilePath,
+    bool clearReversedFilePath = false,
     ChromaKeySettings? chromaKeySettings,
+    bool clearChromaKeySettings = false,
     Offset? overlayPosition,
     Size? overlaySize,
     double? overlayOpacity,
@@ -353,8 +355,12 @@ class VideoClip {
       isMirrored: isMirrored ?? this.isMirrored,
       playbackSpeed: playbackSpeed ?? this.playbackSpeed,
       isReversed: isReversed ?? this.isReversed,
-      reversedFilePath: reversedFilePath ?? this.reversedFilePath,
-      chromaKeySettings: chromaKeySettings ?? this.chromaKeySettings,
+      reversedFilePath: clearReversedFilePath
+          ? null
+          : reversedFilePath ?? this.reversedFilePath,
+      chromaKeySettings: clearChromaKeySettings
+          ? null
+          : chromaKeySettings ?? this.chromaKeySettings,
       overlayPosition: overlayPosition ?? this.overlayPosition,
       overlaySize: overlaySize ?? this.overlaySize,
       overlayOpacity: overlayOpacity ?? this.overlayOpacity,
