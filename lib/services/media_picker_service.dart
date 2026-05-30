@@ -7,6 +7,13 @@ import 'package:file_picker/file_picker.dart';
 import '../main.dart' show AppColors;
 import '../widgets/asset_media_library.dart';
 
+/// Returns true if the given file extension is a video format.
+bool _isVideoExt(String? ext) {
+  if (ext == null) return false;
+  return ['mp4', 'mov', 'm4v', 'avi', 'mkv', 'webm']
+      .contains(ext.toLowerCase());
+}
+
 /// Represents a picked media item with its source info.
 class PickedMedia {
   /// File path — either an asset path (String) or a device file path.
@@ -45,32 +52,32 @@ class PickedMedia {
 }
 
 /// Global media picker service used across the entire app.
-///
-/// Every feature (project creation, overlay, chroma key, replace clip,
-/// add background, add sticker/video, add B-roll) calls:
-///
-/// ```dart
-/// final media = await MediaPickerService.open(context);
-/// ```
-///
-/// The popup always shows:
-///   1. Media Library (bundled Flutter assets)
-///   2. Import From Gallery (device gallery via image_picker)
 class MediaPickerService {
   MediaPickerService._();
 
-  /// Opens the universal media picker popup.
+  /// Opens the universal media picker popup (single-select).
   ///
   /// Returns a [PickedMedia] if the user selected something, or `null`
   /// if they dismissed the picker.
   ///
-  /// [allowMultiple] — reserved for future multi-select support.
   /// [mediaFilter] — optionally restrict to 'image' or 'video'.
   static Future<PickedMedia?> open(
     BuildContext context, {
-    String? mediaFilter, // 'image', 'video', or null for all
+    String? mediaFilter,
   }) async {
-    return await showModalBottomSheet<PickedMedia>(
+    final list = await openMultiple(context, mediaFilter: mediaFilter);
+    return list?.isNotEmpty == true ? list!.first : null;
+  }
+
+  /// Opens the universal media picker popup with **multi-select** support.
+  ///
+  /// Returns a non-empty [List<PickedMedia>] on success, or `null` if the
+  /// user dismissed the picker without selecting anything.
+  static Future<List<PickedMedia>?> openMultiple(
+    BuildContext context, {
+    String? mediaFilter,
+  }) async {
+    return await showModalBottomSheet<List<PickedMedia>>(
       context: context,
       backgroundColor: Colors.transparent,
       isScrollControlled: true,
@@ -97,82 +104,58 @@ class MediaPickerService {
     return File(file.path);
   }
 
-  /// Pick any media (image or video) from device gallery.
-  /// Shows a chooser for type, then opens the appropriate picker.
-  static Future<File?> pickFromGallery(BuildContext context) async {
-    final picker = ImagePicker();
+  /// Pick multiple media files (images and/or videos) from the device gallery.
+  ///
+  /// Uses [FilePicker] so the native system picker handles multi-select.
+  /// Returns a non-empty list on success, or null if cancelled.
+  static Future<List<PickedMedia>?> pickMultipleFromGallery({
+    String? mediaFilter,
+  }) async {
+    FilePickerResult? result;
 
-    // Let user choose between video and image
-    final type = await showModalBottomSheet<String>(
-      context: context,
-      backgroundColor: Colors.transparent,
-      builder: (modalContext) => Container(
-        decoration: BoxDecoration(
-          color: AppColors.surface,
-          borderRadius: const BorderRadius.vertical(top: Radius.circular(20)),
-          border:
-              Border.all(color: AppColors.border.withOpacity(0.5), width: 1),
-        ),
-        padding: const EdgeInsets.symmetric(vertical: 16),
-        child: Column(
-          mainAxisSize: MainAxisSize.min,
-          children: [
-            Container(
-              width: 40,
-              height: 4,
-              decoration: BoxDecoration(
-                color: AppColors.textTertiary.withOpacity(0.5),
-                borderRadius: BorderRadius.circular(2),
-              ),
-            ),
-            const SizedBox(height: 20),
-            const Text(
-              'Select Media Type',
-              style: TextStyle(
-                color: AppColors.textPrimary,
-                fontSize: 16,
-                fontWeight: FontWeight.w600,
-              ),
-            ),
-            const SizedBox(height: 16),
-            _GalleryTypeOption(
-              icon: Icons.videocam_rounded,
-              label: 'Video',
-              subtitle: 'Import a video from your gallery',
-              color: AppColors.primary,
-              onTap: () => Navigator.pop(modalContext, 'video'),
-            ),
-            _GalleryTypeOption(
-              icon: Icons.photo_rounded,
-              label: 'Image',
-              subtitle: 'Import an image from your gallery',
-              color: AppColors.accent,
-              onTap: () => Navigator.pop(modalContext, 'image'),
-            ),
-            const SizedBox(height: 8),
-          ],
-        ),
-      ),
-    );
-
-    if (type == null) return null;
-
-    if (type == 'video') {
-      final XFile? file = await picker.pickVideo(source: ImageSource.gallery);
-      if (file == null) return null;
-      return File(file.path);
-    } else {
-      final XFile? file = await picker.pickImage(
-        source: ImageSource.gallery,
-        imageQuality: 100,
+    if (mediaFilter == 'video') {
+      result = await FilePicker.platform.pickFiles(
+        type: FileType.video,
+        allowMultiple: true,
       );
-      if (file == null) return null;
-      return File(file.path);
+    } else if (mediaFilter == 'image') {
+      result = await FilePicker.platform.pickFiles(
+        type: FileType.image,
+        allowMultiple: true,
+      );
+    } else {
+      result = await FilePicker.platform.pickFiles(
+        type: FileType.custom,
+        allowedExtensions: [
+          'mp4', 'mov', 'm4v', 'avi', 'mkv', 'webm',
+          'jpg', 'jpeg', 'png', 'gif', 'bmp', 'heic', 'heif', 'webp',
+        ],
+        allowMultiple: true,
+      );
     }
+
+    if (result == null || result.files.isEmpty) return null;
+
+    final picked = <PickedMedia>[];
+    for (final f in result.files) {
+      final filePath = f.path;
+      if (filePath == null) continue;
+      final isVideo = _isVideoExt(f.extension);
+      picked.add(PickedMedia(path: filePath, isAsset: false, isVideo: isVideo));
+    }
+    return picked.isEmpty ? null : picked;
+  }
+
+  /// Pick any media (image or video) from device gallery (single file, legacy).
+  static Future<File?> pickFromGallery(BuildContext context) async {
+    final list = await pickMultipleFromGallery();
+    if (list == null || list.isEmpty) return null;
+    return File(list.first.path);
   }
 }
 
-/// Internal popup widget that displays the two options.
+/// Internal popup widget that displays the picker options.
+/// Returns a [List<PickedMedia>] to support multi-select.
 class _MediaPickerPopup extends StatelessWidget {
   final String? mediaFilter;
 
@@ -300,43 +283,31 @@ class _MediaPickerPopup extends StatelessWidget {
                 ),
               );
               if (media != null && context.mounted) {
-                Navigator.pop(context, media);
+                Navigator.pop(context, [media]);
               }
             },
           ),
 
-          // Option 2: Import From Gallery
+          // Option 2: Import From Gallery (multi-select)
           _MediaOptionTile(
             icon: Icons.photo_library_rounded,
             title: 'Import From Gallery',
-            subtitle: 'Select from your device photos & videos',
+            subtitle: 'Select one or more photos & videos',
             gradientColors: const [
               AppColors.accent,
               Color(0xFF06D4A0),
             ],
             onTap: () async {
-              final file = await MediaPickerService.pickFromGallery(context);
-              if (file != null && context.mounted) {
-                final path = file.path.toLowerCase();
-                final isVideo = path.endsWith('.mp4') ||
-                    path.endsWith('.mov') ||
-                    path.endsWith('.m4v') ||
-                    path.endsWith('.avi') ||
-                    path.endsWith('.mkv') ||
-                    path.endsWith('.webm');
-                Navigator.pop(
-                  context,
-                  PickedMedia(
-                    path: file.path,
-                    isAsset: false,
-                    isVideo: isVideo,
-                  ),
-                );
+              final picked = await MediaPickerService.pickMultipleFromGallery(
+                mediaFilter: mediaFilter,
+              );
+              if (picked != null && picked.isNotEmpty && context.mounted) {
+                Navigator.pop(context, picked);
               }
             },
           ),
 
-          // Option 3: Import From Drive
+          // Option 3: Import From Drive (multi-select)
           _MediaOptionTile(
             icon: Icons.add_to_drive_rounded,
             title: 'Import From Drive',
@@ -347,32 +318,36 @@ class _MediaPickerPopup extends StatelessWidget {
             ],
             onTap: () async {
               FilePickerResult? result;
-              
+
               if (mediaFilter == 'video') {
-                result = await FilePicker.platform.pickFiles(type: FileType.video);
+                result = await FilePicker.platform
+                    .pickFiles(type: FileType.video, allowMultiple: true);
               } else if (mediaFilter == 'image') {
-                result = await FilePicker.platform.pickFiles(type: FileType.image);
+                result = await FilePicker.platform
+                    .pickFiles(type: FileType.image, allowMultiple: true);
               } else {
-                result = await FilePicker.platform.pickFiles(type: FileType.media);
+                result = await FilePicker.platform.pickFiles(
+                  type: FileType.custom,
+                  allowedExtensions: [
+                    'mp4', 'mov', 'm4v', 'avi', 'mkv', 'webm',
+                    'jpg', 'jpeg', 'png', 'gif', 'bmp', 'heic', 'heif', 'webp',
+                  ],
+                  allowMultiple: true,
+                );
               }
 
-              if (result != null && result.files.single.path != null && context.mounted) {
-                final filePath = result.files.single.path!;
-                final path = filePath.toLowerCase();
-                final isVideo = path.endsWith('.mp4') ||
-                    path.endsWith('.mov') ||
-                    path.endsWith('.m4v') ||
-                    path.endsWith('.avi') ||
-                    path.endsWith('.mkv') ||
-                    path.endsWith('.webm');
-                Navigator.pop(
-                  context,
-                  PickedMedia(
-                    path: filePath,
-                    isAsset: false,
-                    isVideo: isVideo,
-                  ),
-                );
+              if (result != null && result.files.isNotEmpty && context.mounted) {
+                final picked = result.files
+                    .where((f) => f.path != null)
+                    .map((f) => PickedMedia(
+                          path: f.path!,
+                          isAsset: false,
+                          isVideo: _isVideoExt(f.extension),
+                        ))
+                    .toList();
+                if (picked.isNotEmpty) {
+                  Navigator.pop(context, picked);
+                }
               }
             },
           ),

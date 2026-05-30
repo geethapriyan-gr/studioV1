@@ -57,10 +57,14 @@ class _TimelineWidgetState extends State<TimelineWidget>
   late AnimationController _zoomAnimController;
   Animation<double>? _zoomAnimation;
 
-  // Trim handle optimization - accumulate deltas and update in batches
-  static const int _trimUpdateThresholdMs = 50;
+  // Trim handle optimization - throttle provider updates to ~60fps
+  static const int _trimUpdateThresholdMs = 16; // ~60fps
   int _textTrimAccumulatedDeltaMs = 0;
   int _audioTrimAccumulatedDeltaMs = 0;
+
+  // Video clip trim throttle
+  DateTime? _lastVideoTrimUpdate;
+  static const _videoTrimThrottle = Duration(milliseconds: 16);
 
   @override
   void initState() {
@@ -800,13 +804,15 @@ class _TimelineWidgetState extends State<TimelineWidget>
 
   Future<void> _openMainVideoPicker(VideoEditorProvider provider) async {
     try {
-      final media = await MediaPickerService.open(context);
-      if (media != null) {
-        final file = await media.getFile();
-        if (media.isVideo) {
-          await provider.loadVideoFile(file);
-        } else {
-          await provider.loadImageFile(file);
+      final medias = await MediaPickerService.openMultiple(context);
+      if (medias != null) {
+        for (final media in medias) {
+          final file = await media.getFile();
+          if (media.isVideo) {
+            await provider.loadVideoFile(file);
+          } else {
+            await provider.loadImageFile(file);
+          }
         }
       }
     } catch (e) {
@@ -1483,7 +1489,11 @@ class _TimelineWidgetState extends State<TimelineWidget>
                             const Icon(Icons.layers,
                                 color: AppColors.textPrimary, size: 9),
                             const SizedBox(width: 2),
-                            Text((clip.mediaType == MediaType.image || clip.imageFile != null) ? 'Image' : 'Video',
+                            Text(
+                              (clip.mediaType == MediaType.image ||
+                                      clip.imageFile != null)
+                                  ? 'Image'
+                                  : 'Video',
                               style: TextStyle(
                                 color: AppColors.textPrimary,
                                 fontSize: 9,
@@ -1592,6 +1602,17 @@ class _TimelineWidgetState extends State<TimelineWidget>
     final bool hasNextClip = project != null &&
         clipIndex >= 0 &&
         clipIndex < project.videoClips.length - 1;
+    final nextClip = hasNextClip ? project.videoClips[clipIndex + 1] : null;
+    Transition? appliedTransition;
+    if (nextClip != null && project != null) {
+      for (final transition in project.transitions) {
+        if (transition.clipId1 == clip.id &&
+            transition.clipId2 == nextClip.id) {
+          appliedTransition = transition;
+          break;
+        }
+      }
+    }
 
     return Positioned(
       left: left,
@@ -1711,7 +1732,11 @@ class _TimelineWidgetState extends State<TimelineWidget>
                         child: Row(
                           mainAxisSize: MainAxisSize.min,
                           children: [
-                            Text((clip.mediaType == MediaType.image || clip.imageFile != null) ? 'Image' : 'Video',
+                            Text(
+                              (clip.mediaType == MediaType.image ||
+                                      clip.imageFile != null)
+                                  ? 'Image'
+                                  : 'Video',
                               style: TextStyle(
                                 color: AppColors.textPrimary,
                                 fontSize: 9,
@@ -1736,7 +1761,7 @@ class _TimelineWidgetState extends State<TimelineWidget>
               ),
             ),
           ),
-          // VN-style transition button: white circle with "+" centered on clip boundary
+          // VN-style transition button centered on clip boundary.
           if (hasNextClip)
             Positioned(
               right: -12,
@@ -1754,21 +1779,61 @@ class _TimelineWidgetState extends State<TimelineWidget>
                       width: 24,
                       height: 24,
                       decoration: BoxDecoration(
-                        color: Colors.white,
+                        color: appliedTransition == null
+                            ? Colors.white
+                            : AppColors.primary,
                         shape: BoxShape.circle,
+                        border: appliedTransition == null
+                            ? null
+                            : Border.all(
+                                color: AppColors.textPrimary,
+                                width: 1.5,
+                              ),
                         boxShadow: [
                           BoxShadow(
-                            color: Colors.black.withOpacity(0.35),
+                            color: Colors.black.withValues(alpha: 0.35),
                             blurRadius: 4,
                             offset: const Offset(0, 1),
                           ),
                         ],
                       ),
-                      child: const Icon(
-                        Icons.add,
-                        size: 16,
-                        color: Colors.black87,
+                      child: Icon(
+                        appliedTransition == null
+                            ? Icons.add
+                            : appliedTransition.getIcon(),
+                        size: appliedTransition == null ? 16 : 14,
+                        color: appliedTransition == null
+                            ? Colors.black87
+                            : AppColors.textPrimary,
                       ),
+                    ),
+                  ),
+                ),
+              ),
+            ),
+          if (appliedTransition != null)
+            Positioned(
+              right: -28,
+              bottom: -14,
+              child: IgnorePointer(
+                child: Container(
+                  constraints: const BoxConstraints(maxWidth: 56),
+                  padding:
+                      const EdgeInsets.symmetric(horizontal: 5, vertical: 2),
+                  decoration: BoxDecoration(
+                    color: AppColors.primary.withValues(alpha: 0.95),
+                    borderRadius: BorderRadius.circular(6),
+                    border: Border.all(color: AppColors.textPrimary, width: 1),
+                  ),
+                  child: Text(
+                    '${appliedTransition.duration.inMilliseconds}ms',
+                    maxLines: 1,
+                    overflow: TextOverflow.ellipsis,
+                    textAlign: TextAlign.center,
+                    style: const TextStyle(
+                      color: AppColors.textPrimary,
+                      fontSize: 8,
+                      fontWeight: FontWeight.w700,
                     ),
                   ),
                 ),
@@ -1784,6 +1849,16 @@ class _TimelineWidgetState extends State<TimelineWidget>
                 behavior: HitTestBehavior.translucent,
                 onHorizontalDragUpdate: (details) {
                   final deltaMs = (details.delta.dx / _timelineScale).round();
+                  if (deltaMs == 0) return;
+
+                  final now = DateTime.now();
+                  if (_lastVideoTrimUpdate != null &&
+                      now.difference(_lastVideoTrimUpdate!) <
+                          _videoTrimThrottle) {
+                    return;
+                  }
+                  _lastVideoTrimUpdate = now;
+
                   final delta = Duration(milliseconds: deltaMs);
                   final newTrimStart = clip.trimStart + delta;
                   if (newTrimStart < clip.sourceStart ||
@@ -1792,6 +1867,10 @@ class _TimelineWidgetState extends State<TimelineWidget>
                     return;
                   }
                   provider.trimVideoClip(clip.id, newTrimStart, clip.trimEnd);
+                },
+                onHorizontalDragEnd: (_) {
+                  provider.recordUndo();
+                  _lastVideoTrimUpdate = null;
                 },
                 child: Container(
                   width: 8,
@@ -1815,14 +1894,37 @@ class _TimelineWidgetState extends State<TimelineWidget>
                 behavior: HitTestBehavior.translucent,
                 onHorizontalDragUpdate: (details) {
                   final deltaMs = (details.delta.dx / _timelineScale).round();
-                  final delta = Duration(milliseconds: deltaMs);
-                  final newTrimEnd = clip.trimEnd + delta;
-                  if (newTrimEnd <=
-                          clip.trimStart + const Duration(milliseconds: 100) ||
-                      newTrimEnd > clip.sourceEnd) {
+                  if (deltaMs == 0) return;
+
+                  // Throttle to ~60fps to keep drag smooth
+                  final now = DateTime.now();
+                  if (_lastVideoTrimUpdate != null &&
+                      now.difference(_lastVideoTrimUpdate!) <
+                          _videoTrimThrottle) {
                     return;
                   }
-                  provider.trimVideoClip(clip.id, clip.trimStart, newTrimEnd);
+                  _lastVideoTrimUpdate = now;
+
+                  final delta = Duration(milliseconds: deltaMs);
+                  final newTrimEnd = clip.trimEnd + delta;
+
+                  if (newTrimEnd <=
+                      clip.trimStart + const Duration(milliseconds: 100)) {
+                    return;
+                  }
+
+                  if (clip.mediaType == MediaType.image) {
+                    // Image clips can be extended freely — no source-end cap
+                    provider.extendImageClipDuration(clip.id, newTrimEnd);
+                  } else {
+                    if (newTrimEnd > clip.sourceEnd) return;
+                    provider.trimVideoClip(clip.id, clip.trimStart, newTrimEnd);
+                  }
+                },
+                onHorizontalDragEnd: (_) {
+                  // Commit undo record on drag end (not during drag)
+                  provider.recordUndo();
+                  _lastVideoTrimUpdate = null;
                 },
                 child: Container(
                   width: 8,
@@ -2036,7 +2138,28 @@ class _TimelineWidgetState extends State<TimelineWidget>
                       width: double.infinity,
                       child: ElevatedButton.icon(
                         onPressed: () async {
-                          final start = (clip.endTime - selectedDuration);
+                          var safeDuration = selectedDuration;
+                          final clipLimit = Duration(
+                            milliseconds:
+                                (clip.duration.inMilliseconds * 0.4).floor(),
+                          );
+                          final nextLimit = Duration(
+                            milliseconds:
+                                (nextClip.duration.inMilliseconds * 0.4)
+                                    .floor(),
+                          );
+                          if (safeDuration > clipLimit) {
+                            safeDuration = clipLimit;
+                          }
+                          if (safeDuration > nextLimit) {
+                            safeDuration = nextLimit;
+                          }
+                          if (safeDuration <
+                              const Duration(milliseconds: 100)) {
+                            safeDuration = const Duration(milliseconds: 100);
+                          }
+
+                          final start = (clip.endTime - safeDuration);
                           final startTime =
                               start.isNegative ? Duration.zero : start;
 
@@ -2048,14 +2171,14 @@ class _TimelineWidgetState extends State<TimelineWidget>
                               clipId1: clip.id,
                               clipId2: nextClip.id,
                               type: selectedType,
-                              duration: selectedDuration,
+                              duration: safeDuration,
                               startTime: startTime,
                             );
                             await provider.addTransition(t);
                           } else {
                             final updated = existingTransition.copyWith(
                               type: selectedType,
-                              duration: selectedDuration,
+                              duration: safeDuration,
                               startTime: startTime,
                             );
                             await provider.updateTransition(
@@ -2270,26 +2393,40 @@ class _TimelineWidgetState extends State<TimelineWidget>
 
     // If we have fewer frames than expected, fill remaining with the last frame
     return RepaintBoundary(
-      child: Row(
-        children: List.generate(expectedFrameCount, (index) {
-          // Use the real frame if available, otherwise tile the last available one
-          final frameData = index < thumbs.length ? thumbs[index] : thumbs.last;
+      child: SizedBox(
+        width: totalWidth,
+        height: double.infinity,
+        child: Row(
+          children: List.generate(expectedFrameCount, (index) {
+            // Use the real frame if available, otherwise tile the last available one
+            final frameData =
+                index < thumbs.length ? thumbs[index] : thumbs.last;
 
-          final isLast = index == expectedFrameCount - 1;
-          final currentWidth = isLast
-              ? math.max(frameWidth, totalWidth - (frameWidth * index))
-              : frameWidth;
-
-          return SizedBox(
-            width: currentWidth,
-            height: double.infinity,
-            child: Image.memory(
-              frameData,
-              fit: BoxFit.cover,
-              gaplessPlayback: true,
-            ),
-          );
-        }),
+            final isLast = index == expectedFrameCount - 1;
+            if (isLast) {
+              // Use Expanded for the last tile so floating-point rounding never
+              // causes the Row to overflow its container.
+              return Expanded(
+                child: SizedBox.expand(
+                  child: Image.memory(
+                    frameData,
+                    fit: BoxFit.cover,
+                    gaplessPlayback: true,
+                  ),
+                ),
+              );
+            }
+            return SizedBox(
+              width: frameWidth,
+              height: double.infinity,
+              child: Image.memory(
+                frameData,
+                fit: BoxFit.cover,
+                gaplessPlayback: true,
+              ),
+            );
+          }),
+        ),
       ),
     );
   }
@@ -2299,23 +2436,34 @@ class _TimelineWidgetState extends State<TimelineWidget>
   Widget _buildTiledFrameStrip(
       Uint8List frameData, double totalWidth, int tileCount) {
     final double tileWidth = totalWidth / math.max(1, tileCount);
-    return Row(
-      children: List.generate(tileCount, (index) {
-        final isLast = index == tileCount - 1;
-        final currentWidth = isLast
-            ? math.max(tileWidth, totalWidth - (tileWidth * index))
-            : tileWidth;
-
-        return SizedBox(
-          width: currentWidth,
-          height: double.infinity,
-          child: Image.memory(
-            frameData,
-            fit: BoxFit.cover,
-            gaplessPlayback: true,
-          ),
-        );
-      }),
+    return SizedBox(
+      width: totalWidth,
+      height: double.infinity,
+      child: Row(
+        children: List.generate(tileCount, (index) {
+          final isLast = index == tileCount - 1;
+          if (isLast) {
+            return Expanded(
+              child: SizedBox.expand(
+                child: Image.memory(
+                  frameData,
+                  fit: BoxFit.cover,
+                  gaplessPlayback: true,
+                ),
+              ),
+            );
+          }
+          return SizedBox(
+            width: tileWidth,
+            height: double.infinity,
+            child: Image.memory(
+              frameData,
+              fit: BoxFit.cover,
+              gaplessPlayback: true,
+            ),
+          );
+        }),
+      ),
     );
   }
 
@@ -2862,17 +3010,18 @@ class _TimelineWidgetState extends State<TimelineWidget>
   }
 
   Future<void> _importMediaFromTimeline() async {
+    // Capture provider before async gap to satisfy use_build_context_synchronously
+    final provider = Provider.of<VideoEditorProvider>(context, listen: false);
     try {
-      final media = await MediaPickerService.open(context);
-      if (media != null) {
-        final provider =
-            Provider.of<VideoEditorProvider>(context, listen: false);
-        final file = await media.getFile();
-
-        if (media.isVideo) {
-          await provider.loadVideoFile(file);
-        } else {
-          await provider.loadImageFile(file);
+      final medias = await MediaPickerService.openMultiple(context);
+      if (medias != null && mounted) {
+        for (final media in medias) {
+          final file = await media.getFile();
+          if (media.isVideo) {
+            await provider.loadVideoFile(file);
+          } else {
+            await provider.loadImageFile(file);
+          }
         }
       }
     } catch (_) {}
@@ -3117,5 +3266,3 @@ class TimeRulerPainter extends CustomPainter {
         oldDelegate.scale != scale;
   }
 }
-
-

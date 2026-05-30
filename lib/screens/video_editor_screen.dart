@@ -313,8 +313,16 @@ class _VideoEditorScreenState extends State<VideoEditorScreen>
 
   @override
   void didChangeAppLifecycleState(AppLifecycleState state) {
+    final provider = Provider.of<VideoEditorProvider>(context, listen: false);
     if (state == AppLifecycleState.resumed) {
       _checkPermissionsSilently();
+      // Restart video if the OS paused it while app was in background
+      // (e.g. file picker, notification shade, home button).
+      provider.handleAppResume();
+    } else if (state == AppLifecycleState.paused ||
+        state == AppLifecycleState.inactive) {
+      // Proactively pause media so Android doesn't trigger audio-focus loss.
+      provider.handleAppPause();
     }
   }
 
@@ -1144,10 +1152,6 @@ class _VideoEditorScreenState extends State<VideoEditorScreen>
   }
 
   Widget _buildEditorView(VideoEditorProvider provider, bool isLandscape) {
-    print(
-        'DEBUG: _buildEditorView called, editorPanelMode = ${provider.editorPanelMode}');
-    print(
-        'DEBUG: showTimeline=${provider.showTimeline}, showFilters=${provider.showFilters}, showTextEditor=${provider.showTextEditor}, showCropEditor=${provider.showCropEditor}, showTrimEditor=${provider.showTrimEditor}');
     return LayoutBuilder(
       builder: (context, constraints) {
         final totalHeight = constraints.maxHeight;
@@ -1390,7 +1394,7 @@ class _VideoEditorScreenState extends State<VideoEditorScreen>
     if (project == null) return 1080.0;
 
     final currentClip = provider.currentVideoClip;
-    
+
     // If it's an image, or we have no initialized controller, follow project settings
     if (currentClip?.mediaType == MediaType.image ||
         provider.previewController == null ||
@@ -1951,7 +1955,8 @@ class _VideoEditorScreenState extends State<VideoEditorScreen>
                                 const SizedBox(height: 4),
                                 // Input field with character count
                                 Container(
-                                  padding: const EdgeInsets.fromLTRB(0, 4, 0, 8),
+                                  padding:
+                                      const EdgeInsets.fromLTRB(0, 4, 0, 8),
                                   child: Row(
                                     crossAxisAlignment: CrossAxisAlignment.end,
                                     children: [
@@ -1969,7 +1974,8 @@ class _VideoEditorScreenState extends State<VideoEditorScreen>
                                           decoration: InputDecoration(
                                             hintText: 'Untitled V',
                                             hintStyle: TextStyle(
-                                              color: Colors.white.withOpacity(0.35),
+                                              color: Colors.white
+                                                  .withOpacity(0.35),
                                               fontSize: 20,
                                               fontWeight: FontWeight.w400,
                                             ),
@@ -1984,11 +1990,13 @@ class _VideoEditorScreenState extends State<VideoEditorScreen>
                                       ),
                                       const SizedBox(width: 10),
                                       Padding(
-                                        padding: const EdgeInsets.only(bottom: 8),
+                                        padding:
+                                            const EdgeInsets.only(bottom: 8),
                                         child: Text(
                                           '${controller.text.length}/50',
                                           style: TextStyle(
-                                            color: Colors.white.withOpacity(0.40),
+                                            color:
+                                                Colors.white.withOpacity(0.40),
                                             fontSize: 13,
                                             fontWeight: FontWeight.w400,
                                           ),
@@ -2033,7 +2041,8 @@ class _VideoEditorScreenState extends State<VideoEditorScreen>
                                     Expanded(
                                       child: DecoratedBox(
                                         decoration: BoxDecoration(
-                                          borderRadius: BorderRadius.circular(30),
+                                          borderRadius:
+                                              BorderRadius.circular(30),
                                           boxShadow: [
                                             BoxShadow(
                                               color: const Color(0xFFCBAAFF)
@@ -2046,7 +2055,8 @@ class _VideoEditorScreenState extends State<VideoEditorScreen>
                                         ),
                                         child: ElevatedButton(
                                           onPressed: () {
-                                            final value = controller.text.trim();
+                                            final value =
+                                                controller.text.trim();
                                             if (value.isEmpty) {
                                               Navigator.of(context).pop();
                                             } else {
@@ -2569,15 +2579,6 @@ class _VideoEditorScreenState extends State<VideoEditorScreen>
       colorFilter = const ColorFilter();
     }
     final selectedClipId = provider.selectedVideoClipId;
-    // debugging
-    if (provider.previewController != null &&
-        provider.previewController!.value.isInitialized) {
-      final videoAspect = provider.previewController!.value.aspectRatio;
-      final videoSize = provider.previewController!.value.size;
-      final outputRes = provider.currentProject?.outputResolution;
-      print(
-          'DEBUG: _buildFilteredMedia called - videoAspect=$videoAspect videoSize=$videoSize outputRes=$outputRes');
-    }
     final currentClip = provider.currentVideoClip;
     double rotation = 0.0;
     bool isMirrored = false;
@@ -2692,11 +2693,15 @@ class _VideoEditorScreenState extends State<VideoEditorScreen>
     }
 
     // ============ CHROMA KEY PREVIEW SUPPORT ============
-    // Apply chroma key effect - show background behind video
-    // Note: Flutter doesn't have a built-in chroma key filter. The actual green
-    // removal is done by FFmpeg during export. This shows the background behind.
-    // Use current editing settings from provider for preview
-    final chromaKeySettings = provider.currentChromaKeySettings;
+    // Apply chroma key effect - show background behind video.
+    // Use per-clip settings at the playhead; fall back to the editor draft only
+    // when the chroma panel is open on the clip currently being previewed.
+    final chromaKeySettings =
+        (provider.editorPanelMode == EditorPanelMode.chromaKey &&
+                selectedClipId != null &&
+                currentClip.id == selectedClipId)
+            ? provider.currentChromaKeySettings
+            : currentClip.chromaKeySettings;
     if (chromaKeySettings != null && chromaKeySettings.enabled) {
       final backgrounds = provider.currentProject?.chromaKeyBackgrounds ?? [];
       if (backgrounds.isNotEmpty) {
@@ -3330,6 +3335,7 @@ class _TransitionPreviewState extends State<_TransitionPreview> {
   // Dedicated controller for when clip2 shares the same file as clip1
   VideoPlayerController? _dedicatedClip2Controller;
   bool _usesDedicatedController = false;
+  DateTime? _lastClip2SyncAt;
 
   @override
   void initState() {
@@ -3442,6 +3448,63 @@ class _TransitionPreviewState extends State<_TransitionPreview> {
     }
   }
 
+  Duration _clip2TransitionTarget(
+    VideoClip clip2,
+    VideoPlayerController controller,
+  ) {
+    final elapsed =
+        widget.provider.currentPosition - widget.transition.startTime;
+    var target = clip2.sourceStart + elapsed;
+    if (target < clip2.sourceStart) target = clip2.sourceStart;
+
+    final clipEnd = clip2.sourceEnd;
+    if (clipEnd > clip2.sourceStart && target >= clipEnd) {
+      target = clipEnd - const Duration(milliseconds: 1);
+    }
+
+    final videoDuration = controller.value.duration;
+    if (videoDuration <= Duration.zero || target <= Duration.zero) {
+      return Duration.zero;
+    }
+    const frameEps = Duration(milliseconds: 1);
+    final lastFrame =
+        videoDuration > frameEps ? videoDuration - frameEps : Duration.zero;
+    if (target >= videoDuration) return lastFrame;
+    return target;
+  }
+
+  Future<void> _syncClip2ToTransition(
+    VideoPlayerController controller,
+  ) async {
+    final clip2 = _resolvedClip2;
+    if (clip2 == null || !controller.value.isInitialized) return;
+
+    final now = DateTime.now();
+    if (_lastClip2SyncAt != null &&
+        now.difference(_lastClip2SyncAt!) < const Duration(milliseconds: 90)) {
+      return;
+    }
+    _lastClip2SyncAt = now;
+
+    final target = _clip2TransitionTarget(clip2, controller);
+    final driftMs = (controller.value.position - target).inMilliseconds.abs();
+    if (driftMs > 140) {
+      await controller.seekTo(target);
+    }
+    await controller.setVolume(0.0);
+    if (clip2.playbackSpeed != controller.value.playbackSpeed) {
+      await controller.setPlaybackSpeed(clip2.playbackSpeed);
+    }
+
+    if (widget.provider.isPlaying) {
+      if (!controller.value.isPlaying) {
+        await controller.play();
+      }
+    } else if (controller.value.isPlaying) {
+      await controller.pause();
+    }
+  }
+
   @override
   Widget build(BuildContext context) {
     final c1 = widget.provider.previewController; // currently playing clip1
@@ -3455,6 +3518,7 @@ class _TransitionPreviewState extends State<_TransitionPreview> {
         child: VideoPlayer(c1, key: ValueKey(c1)),
       );
     }
+    unawaited(_syncClip2ToTransition(c2));
 
     // Calculate normalised progress t ∈ [0, 1]
     final now = widget.provider.currentPosition;
@@ -3502,5 +3566,3 @@ class _CircleRevealClipper extends CustomClipper<Path> {
     return oldClipper.progress != progress;
   }
 }
-
-

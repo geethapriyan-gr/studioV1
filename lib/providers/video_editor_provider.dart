@@ -56,6 +56,10 @@ class VideoEditorProvider extends ChangeNotifier {
   bool _isAutoSaving = false;
   DateTime? _lastAutoSaved;
   Timer? _seekPauseTimer;
+  bool _timelinePausedForBackground = false;
+  String? _activePreviewClipId;
+  bool _previewSyncInFlight = false;
+  DateTime? _lastVideoResyncAttempt;
 
   final List<VideoProject> _undoStack = [];
   final List<VideoProject> _redoStack = [];
@@ -131,7 +135,8 @@ class VideoEditorProvider extends ChangeNotifier {
   final Map<String, ColorFilter> _clipColorFilters = {};
 
   /// Get the per-clip color filter map (read-only access)
-  Map<String, ColorFilter> get clipColorFilters => Map.unmodifiable(_clipColorFilters);
+  Map<String, ColorFilter> get clipColorFilters =>
+      Map.unmodifiable(_clipColorFilters);
 
   // Track management for multiple overlay and audio tracks
   int _overlayTrackCount = 1;
@@ -579,6 +584,57 @@ class VideoEditorProvider extends ChangeNotifier {
     notifyListeners();
   }
 
+  /// Extend (or shrink) an **image** clip's duration by updating sourceEnd.
+  ///
+  /// Unlike videos, image clips have no inherent length so sourceEnd can grow
+  /// to any positive value.  Call this from the right-trim handle instead of
+  /// [trimVideoClip] for image-type clips.
+  void extendImageClipDuration(String clipId, Duration newTrimEnd) {
+    if (_currentProject == null) return;
+
+    final clipIndex =
+        _currentProject!.videoClips.indexWhere((c) => c.id == clipId);
+    if (clipIndex == -1) return;
+
+    final originalClip = _currentProject!.videoClips[clipIndex];
+    if (originalClip.mediaType != MediaType.image) return;
+
+    // Minimum 100 ms duration
+    if (newTrimEnd <=
+        originalClip.trimStart + const Duration(milliseconds: 100)) {
+      return;
+    }
+
+    final oldDuration = originalClip.trimEnd - originalClip.trimStart;
+    final newDuration = newTrimEnd - originalClip.trimStart;
+    final durationDiff = newDuration - oldDuration;
+
+    final updatedClip = originalClip.copyWith(
+      trimEnd: newTrimEnd,
+      sourceEnd: newTrimEnd,
+      endTime: originalClip.startTime + newDuration,
+    );
+
+    final updatedClips = List<VideoClip>.from(_currentProject!.videoClips);
+    updatedClips[clipIndex] = updatedClip;
+
+    // Shift all subsequent clips by the duration change
+    for (int i = clipIndex + 1; i < updatedClips.length; i++) {
+      final c = updatedClips[i];
+      updatedClips[i] = c.copyWith(
+        startTime: c.startTime + durationDiff,
+        endTime: c.endTime + durationDiff,
+      );
+    }
+
+    _currentProject = _currentProject!.copyWith(
+      videoClips: updatedClips,
+      totalDuration: _currentProject!.calculateTotalDuration(),
+    );
+    // No recordUndo during drag — only on drag end
+    notifyListeners();
+  }
+
   Future<void> trimVideoClip(
       String clipId, Duration startTrim, Duration endTrim) async {
     if (_currentProject == null) return;
@@ -588,6 +644,14 @@ class VideoEditorProvider extends ChangeNotifier {
     if (clipIndex == -1) return;
 
     final originalClip = _currentProject!.videoClips[clipIndex];
+
+    // For image clips, delegate to extendImageClipDuration for right-trim
+    if (originalClip.mediaType == MediaType.image &&
+        startTrim == originalClip.trimStart &&
+        endTrim != originalClip.trimEnd) {
+      extendImageClipDuration(clipId, endTrim);
+      return;
+    }
 
     // Strictly enforce trim boundaries to not exceed source boundaries
     if (startTrim < originalClip.sourceStart ||
@@ -624,7 +688,8 @@ class VideoEditorProvider extends ChangeNotifier {
       );
     }
 
-    recordUndo();
+    // recordUndo() is called by the drag-end handler in the UI, not here,
+    // so we don't duplicate an undo entry for every drag frame.
     _currentProject = _currentProject!.copyWith(
       videoClips: updatedClips,
       totalDuration: _currentProject!.calculateTotalDuration(),
@@ -1266,8 +1331,8 @@ class VideoEditorProvider extends ChangeNotifier {
         );
       } else {
         if (_currentProject!.videoClips.isEmpty) {
-          _currentProject = _currentProject!
-              .copyWith(outputResolution: Size(finalW, finalH));
+          _currentProject =
+              _currentProject!.copyWith(outputResolution: Size(finalW, finalH));
         }
         _currentProject = _currentProject!.addVideoClip(imageClip);
       }
@@ -1289,49 +1354,40 @@ class VideoEditorProvider extends ChangeNotifier {
       await _previewController?.pause();
       _isPlaying = false;
       _stopTimelineClock();
+      _activePreviewClipId = null;
       for (final p in _audioPlayers.values) {
         await p.pause();
       }
     } else {
       _isPlaying = true;
-      _startTimelineClock();
 
       final clip = _clipAtTimeline(_currentPosition);
       if (clip != null) {
         if (clip.mediaType == MediaType.video && clip.videoFile != null) {
-          // Determine which file to use - reversed file if available, otherwise original
-          String videoPath;
-          if (clip.isReversed &&
-              clip.reversedFilePath != null &&
-              File(clip.reversedFilePath!).existsSync()) {
-            videoPath = clip.reversedFilePath!;
+          final synced = await _forceSyncPreviewToTimeline(
+            clip,
+            play: true,
+            forceSeek: true,
+          );
+          if (synced) {
+            _activePreviewClipId = clip.id;
           } else {
-            videoPath = clip.videoFile!.path;
-          }
-
-          // Await the controller switch to ensure it's ready before playing
-          await _switchActivePreviewController(videoPath);
-
-          // Now safely use the controller after it's guaranteed to be ready
-          if (_previewController != null) {
-            final offsetWithinClip = _currentPosition - clip.startTime;
-            final sourcePosition = clip.sourceStart + offsetWithinClip;
-            final dur = _previewController!.value.duration;
-            const frameEps = Duration(milliseconds: 1);
-            final almostEnd = dur > frameEps ? dur - frameEps : Duration.zero;
-            final clamped = sourcePosition >= dur ? almostEnd : sourcePosition;
-            await _previewController!.seekTo(clamped);
-            await _applyPreviewVolumeForCurrentPosition();
-            await _previewController!.play();
+            _isPlaying = false;
+            _activePreviewClipId = null;
           }
         } else {
           await _previewController?.pause();
           await _previewController?.setVolume(0.0);
+          if (clip.mediaType == MediaType.image) {
+            _activePreviewClipId = clip.id;
+          }
         }
       }
 
-      // Prepare audio for playback - await to ensure smooth audio
-      await _prepareAudioForPlayback();
+      if (_isPlaying) {
+        await _prepareAudioForPlayback();
+        _startTimelineClock();
+      }
     }
     _startPositionListener();
     unawaited(_syncAudioPlayback());
@@ -1376,27 +1432,12 @@ class VideoEditorProvider extends ChangeNotifier {
   }
 
   void _videoPositionListener() {
-    if (_previewController != null && _previewController!.value.isInitialized) {
-      final position = _previewController!.value.position;
-      final mappedTimelinePos = _mapSourceToTimeline(position);
-
-      // Only update position if we're in a valid clip
-      if (mappedTimelinePos != null && _isPlaying) {
-        // Check if position is within any clip's timeline range
-        final currentClip = _clipAtTimeline(mappedTimelinePos);
-        if (currentClip != null) {
-          // Additional validation: ensure the mapped position makes sense
-          final offsetInClip = mappedTimelinePos - currentClip.startTime;
-          if (offsetInClip >= Duration.zero &&
-              offsetInClip < currentClip.duration) {
-            _currentPosition = mappedTimelinePos;
-            _updateTimelineClock();
-            unawaited(_preloadUpcomingTransitionControllers(mappedTimelinePos));
-            notifyListeners();
-          }
-        }
-      }
-    }
+    // Timeline position is driven by the wall clock only. The listener is kept
+    // so the VideoPlayer widget repaints; do not write back to [_currentPosition].
+    if (!_isPlaying) return;
+    final clip = _clipAtTimeline(_currentPosition);
+    if (clip == null || clip.mediaType != MediaType.video) return;
+    unawaited(_preloadUpcomingTransitionControllers(_currentPosition));
   }
 
   Future<void> _preloadUpcomingTransitionControllers(Duration now) async {
@@ -1421,17 +1462,17 @@ class VideoEditorProvider extends ChangeNotifier {
           continue;
         }
         final path = clip2.videoFile!.path;
-        
-        // Skip preloading if clip2 shares the same active file. Preloading 
+
+        // Skip preloading if clip2 shares the same active file. Preloading
         // would seek the currently active preview controller to 0 and loop the video!
         if (path == _activeFilePath) continue;
-        
+
         final c2 = await ensurePreviewController(path);
         if (c2 == null || !c2.value.isInitialized) continue;
-        // Seek to start so clip2 is ready to play immediately during transition.
-        if ((c2.value.position - Duration.zero).abs() >
+        // Seek to the trimmed source start so clip2 is ready during transition.
+        if ((c2.value.position - clip2.sourceStart).abs() >
             const Duration(milliseconds: 40)) {
-          await c2.seekTo(Duration.zero);
+          await c2.seekTo(clip2.sourceStart);
         }
         await c2.pause();
       }
@@ -1463,10 +1504,176 @@ class VideoEditorProvider extends ChangeNotifier {
   }
 
   void _startPositionListener() {
+    _previewController?.removeListener(_videoPositionListener);
     _previewController?.addListener(_videoPositionListener);
   }
 
+  @visibleForTesting
+  static Duration calculateSourcePositionForTimeline(
+    VideoClip clip,
+    Duration timelinePosition,
+  ) {
+    final offsetWithinClip = timelinePosition - clip.startTime;
+    if (offsetWithinClip <= Duration.zero) return clip.sourceStart;
+    return clip.sourceStart + offsetWithinClip;
+  }
+
+  @visibleForTesting
+  static Duration clampSourcePositionForVideo(
+    Duration sourcePosition,
+    Duration videoDuration,
+  ) {
+    if (videoDuration <= Duration.zero || sourcePosition <= Duration.zero) {
+      return Duration.zero;
+    }
+    const frameEps = Duration(milliseconds: 1);
+    final lastFrame =
+        videoDuration > frameEps ? videoDuration - frameEps : Duration.zero;
+    if (sourcePosition >= videoDuration) return lastFrame;
+    return sourcePosition;
+  }
+
+  String? _resolvePlaybackPath(VideoClip clip) {
+    if (clip.mediaType != MediaType.video || clip.videoFile == null) {
+      return null;
+    }
+    if (clip.isReversed &&
+        clip.reversedFilePath != null &&
+        File(clip.reversedFilePath!).existsSync()) {
+      return clip.reversedFilePath!;
+    }
+    return clip.videoFile!.path;
+  }
+
+  Future<void> _discardPreviewController(String filePath) async {
+    final controller = _previewControllers.remove(filePath);
+    _lruAccessList.remove(filePath);
+    if (identical(_previewController, controller) ||
+        _activeFilePath == filePath) {
+      _previewController?.removeListener(_videoPositionListener);
+      _previewController = null;
+      _activeFilePath = null;
+    }
+    await controller?.dispose();
+  }
+
+  Future<bool> _forceSyncPreviewToTimeline(
+    VideoClip clip, {
+    required bool play,
+    bool forceSeek = false,
+    bool allowControllerRecovery = true,
+    bool refreshController = false,
+  }) async {
+    if (_previewSyncInFlight) {
+      for (var i = 0; i < 20 && _previewSyncInFlight; i++) {
+        await Future<void>.delayed(const Duration(milliseconds: 25));
+      }
+      if (_previewSyncInFlight) return false;
+    }
+    if (clip.mediaType != MediaType.video) return false;
+
+    final videoPath = _resolvePlaybackPath(clip);
+    if (videoPath == null) return false;
+
+    _previewSyncInFlight = true;
+    try {
+      if (refreshController && Platform.isAndroid) {
+        await _discardPreviewController(videoPath);
+      }
+
+      var synced = await _syncPreviewControllerOnce(
+        clip,
+        videoPath,
+        play: play,
+        forceSeek: forceSeek,
+      );
+      if (synced || !allowControllerRecovery) return synced;
+
+      await _discardPreviewController(videoPath);
+      synced = await _syncPreviewControllerOnce(
+        clip,
+        videoPath,
+        play: play,
+        forceSeek: true,
+      );
+      return synced;
+    } finally {
+      _previewSyncInFlight = false;
+    }
+  }
+
+  Future<bool> _syncPreviewControllerOnce(
+    VideoClip clip,
+    String videoPath, {
+    required bool play,
+    required bool forceSeek,
+  }) async {
+    if (_activeFilePath != videoPath || _previewController == null) {
+      await _switchActivePreviewController(videoPath);
+    }
+
+    final controller = _previewController;
+    if (controller == null || !controller.value.isInitialized) return false;
+
+    final sourcePosition =
+        calculateSourcePositionForTimeline(clip, _currentPosition);
+    final videoDuration = controller.value.duration;
+    if (sourcePosition >= videoDuration && videoDuration > Duration.zero) {
+      await controller.pause();
+      await controller.setVolume(0.0);
+      return true;
+    }
+
+    final target = clampSourcePositionForVideo(sourcePosition, videoDuration);
+    final currentNativePosition = controller.value.position;
+    final driftMs = (currentNativePosition - target).inMilliseconds.abs();
+
+    final nativePositionAhead = currentNativePosition - target;
+    final nativeNearEnd = videoDuration > const Duration(milliseconds: 250) &&
+        currentNativePosition >=
+            videoDuration - const Duration(milliseconds: 120);
+    final targetSafelyBeforeEnd =
+        target < videoDuration - const Duration(milliseconds: 250);
+    final replayingBackwardOnAndroid = Platform.isAndroid &&
+        play &&
+        forceSeek &&
+        (nativePositionAhead > const Duration(milliseconds: 500) ||
+            (nativeNearEnd && targetSafelyBeforeEnd));
+    if (replayingBackwardOnAndroid) return false;
+
+    if (forceSeek || driftMs > 120 || !controller.value.isPlaying) {
+      await controller.seekTo(target);
+    }
+
+    await _applyPreviewVolumeForCurrentPosition();
+    if (clip.playbackSpeed != controller.value.playbackSpeed) {
+      await controller.setPlaybackSpeed(clip.playbackSpeed);
+    }
+
+    if (!play) return true;
+
+    await controller.play();
+    await Future<void>.delayed(const Duration(milliseconds: 80));
+
+    final value = controller.value;
+    if (!value.isInitialized) return false;
+    if (!value.isPlaying && !value.isBuffering) return false;
+
+    final postPlayDrift = (value.position - target).inMilliseconds.abs();
+    final nearVideoEnd = videoDuration > const Duration(milliseconds: 250) &&
+        value.position >= videoDuration - const Duration(milliseconds: 80);
+    final targetNearEnd = videoDuration > const Duration(milliseconds: 250) &&
+        target >= videoDuration - const Duration(milliseconds: 250);
+
+    if (!value.isBuffering && postPlayDrift > 500) return false;
+    if (!value.isBuffering && nearVideoEnd && !targetNearEnd) return false;
+
+    return true;
+  }
+
   Future<void> seekTo(Duration position) async {
+    final previousPosition = _currentPosition;
+
     // Clamp position to not exceed total duration
     final maxDuration = totalDuration;
     if (position > maxDuration) {
@@ -1478,6 +1685,7 @@ class VideoEditorProvider extends ChangeNotifier {
 
     _currentPosition = position;
     _updateTimelineClock();
+    _activePreviewClipId = null;
     final clip = _clipAtTimeline(position);
     if (clip == null) {
       // No video clip at this position - ensure video is muted and don't play video
@@ -1491,30 +1699,16 @@ class VideoEditorProvider extends ChangeNotifier {
         await _previewController?.pause();
         await _previewController?.setVolume(0.0);
       } else if (clip.mediaType == MediaType.video && clip.videoFile != null) {
-        // Determine which file to use - reversed file if available, otherwise original
-        String videoPath;
-        if (clip.isReversed &&
-            clip.reversedFilePath != null &&
-            File(clip.reversedFilePath!).existsSync()) {
-          videoPath = clip.reversedFilePath!;
-        } else {
-          videoPath = clip.videoFile!.path;
-        }
-        await _switchActivePreviewController(videoPath);
-        final offsetWithinClip = position - clip.startTime;
-        final sourcePosition = clip.sourceStart + offsetWithinClip;
-        final videoDuration = _previewController!.value.duration;
-        if (sourcePosition >= videoDuration) {
-          await _previewController!.pause();
-          await _previewController!.setVolume(0.0);
-        } else {
-          final clampedSource =
-              sourcePosition > videoDuration ? videoDuration : sourcePosition;
-          await _previewController!.seekTo(clampedSource);
-          await _applyPreviewVolumeForCurrentPosition();
-          if (_isPlaying && !_previewController!.value.isPlaying) {
-            await _previewController!.play();
-          }
+        final isBackwardSeek =
+            previousPosition - position > const Duration(milliseconds: 500);
+        final synced = await _forceSyncPreviewToTimeline(
+          clip,
+          play: _isPlaying,
+          forceSeek: true,
+          refreshController: isBackwardSeek,
+        );
+        if (synced) {
+          _activePreviewClipId = clip.id;
         }
       }
     }
@@ -1599,19 +1793,33 @@ class VideoEditorProvider extends ChangeNotifier {
     _seekPauseTimer?.cancel();
     _seekPauseTimer = Timer(const Duration(milliseconds: 100), () async {
       if (!_isPlaying) return;
-      _startTimelineClock();
-
       final clip = _clipAtTimeline(_currentPosition);
-      await _applyPreviewVolumeForCurrentPosition();
+      var canResumeTimeline = true;
 
-      // Only play video if there's a clip at current position - no longer pause video
-      if (clip != null && _previewController != null) {
-        if (!_previewController!.value.isPlaying) {
-          await _previewController!.play();
+      if (clip != null && clip.mediaType == MediaType.video) {
+        final synced = await _forceSyncPreviewToTimeline(
+          clip,
+          play: true,
+          forceSeek: true,
+        );
+        if (synced) {
+          _activePreviewClipId = clip.id;
+        } else {
+          _isPlaying = false;
+          _activePreviewClipId = null;
+          canResumeTimeline = false;
         }
+      } else if (clip != null && clip.mediaType == MediaType.image) {
+        await _previewController?.pause();
+        await _previewController?.setVolume(0.0);
+        _activePreviewClipId = clip.id;
+      }
+      if (canResumeTimeline) {
+        _startTimelineClock();
       }
       // Use unawaited for audio sync to not block video playback
       unawaited(_syncAudioPlayback(force: true));
+      notifyListeners();
     });
   }
 
@@ -1684,10 +1892,6 @@ class VideoEditorProvider extends ChangeNotifier {
     if (clipIndex == -1) return;
     final clip = _currentProject!.videoClips[clipIndex];
 
-    // Debug: print clip info
-    print(
-        'toggleVideoClipReverse: clip.isReversed = ${clip.isReversed}, reversedFilePath = ${clip.reversedFilePath}');
-
     // If already reversed, just toggle the flag (keep the reversed file)
     if (clip.isReversed) {
       final updatedClip = clip.copyWith(isReversed: false);
@@ -1695,7 +1899,6 @@ class VideoEditorProvider extends ChangeNotifier {
       _currentProject = _currentProject!.updateVideoClip(clipId, updatedClip);
       _scheduleAutoSave();
       notifyListeners();
-      print('toggleVideoClipReverse: Turned off reverse');
       return;
     }
 
@@ -1707,15 +1910,12 @@ class VideoEditorProvider extends ChangeNotifier {
       _currentProject = _currentProject!.updateVideoClip(clipId, updatedClip);
       _scheduleAutoSave();
       notifyListeners();
-      print('toggleVideoClipReverse: Using existing reversed file');
       return;
     }
 
     // Need to process the video with FFmpeg
-    print('toggleVideoClipReverse: Processing video with FFmpeg...');
     final reversedPath =
         await processVideoReverse(clipId, onProgress: onProgress);
-    print('toggleVideoClipReverse: FFmpeg returned: $reversedPath');
     if (reversedPath != null) {
       // Update the clip with reversed file info
       final updatedClip = clip.copyWith(
@@ -3132,23 +3332,22 @@ class VideoEditorProvider extends ChangeNotifier {
         timer.cancel();
         return;
       }
+      final maxDuration = totalDuration;
       final elapsed = DateTime.now().difference(_playbackStartTime!);
       final newPosition = _playbackStartPosition! + elapsed;
-      final maxDuration = totalDuration;
       if (newPosition >= maxDuration) {
-        // Stop at the end of content
         _currentPosition = maxDuration;
         _isPlaying = false;
         _stopTimelineClock();
         _previewController?.pause();
-        // Stop all audio players
         for (final p in _audioPlayers.values) {
           unawaited(p.pause());
         }
       } else {
         _currentPosition = newPosition;
-        _handleTimelineAdvance();
       }
+
+      _handleTimelineAdvance();
       notifyListeners();
     });
   }
@@ -3168,6 +3367,20 @@ class VideoEditorProvider extends ChangeNotifier {
   }
 
   void _handleTimelineAdvance() {
+    final maxDuration = totalDuration;
+    if (_currentPosition >= maxDuration) {
+      if (_currentPosition > maxDuration) _currentPosition = maxDuration;
+      if (_isPlaying) {
+        _isPlaying = false;
+        _stopTimelineClock();
+        _previewController?.pause();
+        for (final p in _audioPlayers.values) {
+          unawaited(p.pause());
+        }
+      }
+      return;
+    }
+
     // If we're inside a transition window, drive preview using clip2
     // to avoid running two decoders simultaneously (reduces lag).
     final activeTransition = _getActiveTransitionAt(_currentPosition);
@@ -3182,38 +3395,61 @@ class VideoEditorProvider extends ChangeNotifier {
 
     final currentClip = _clipAtTimeline(_currentPosition);
 
-    // Use a larger lookback window to better detect clip boundaries
-    final previousPos = _currentPosition - const Duration(milliseconds: 33);
-    final previousClip = _clipAtTimeline(previousPos);
-
-    if (currentClip != null &&
-        (previousClip == null || previousClip.id != currentClip.id)) {
-      // Entering a new clip - ensure smooth transition
-      _enterClip(currentClip);
-    } else if (currentClip == null && previousClip != null) {
-      // Left the clip area
-      _leaveClip();
-    }
-
-    // Check if we're near a clip boundary and need to enter a new clip
-    const boundaryEps = Duration(milliseconds: 50);
-    if (currentClip == null && _currentProject != null) {
-      VideoClip? nearStart;
-      for (final c in _currentProject!.videoClips) {
-        final diff = (_currentPosition - c.startTime).abs();
-        if (diff <= boundaryEps) {
-          if (nearStart == null || c.startTime < nearStart.startTime) {
-            nearStart = c;
-          }
-        }
-      }
-      if (nearStart != null) {
-        _enterClip(nearStart);
-      }
+    if (currentClip != null && currentClip.id != _activePreviewClipId) {
+      unawaited(_enterClip(currentClip));
+    } else if (currentClip == null && _activePreviewClipId != null) {
+      _activePreviewClipId = null;
+      unawaited(_leaveClip());
+    } else if (_isPlaying &&
+        currentClip != null &&
+        currentClip.mediaType == MediaType.video) {
+      _maybeResyncStalledVideo(currentClip);
     }
 
     unawaited(_applyPreviewVolumeForCurrentPosition());
     unawaited(_syncAudioPlayback());
+  }
+
+  /// If the decoder stalls or drifts from the wall-clock timeline, re-seek at
+  /// most once per second. Android video_player can report playing while the
+  /// rendered frame is stale after replay/seek, so don't rely on isPlaying only.
+  void _maybeResyncStalledVideo(VideoClip clip) {
+    final controller = _previewController;
+    if (controller == null || !controller.value.isInitialized) return;
+    if (controller.value.isBuffering) return;
+
+    final expected = clampSourcePositionForVideo(
+      calculateSourcePositionForTimeline(clip, _currentPosition),
+      controller.value.duration,
+    );
+    final driftMs = (controller.value.position - expected).inMilliseconds.abs();
+    final needsResync = !controller.value.isPlaying || driftMs > 350;
+    if (!needsResync) return;
+
+    final now = DateTime.now();
+    if (_lastVideoResyncAttempt != null &&
+        now.difference(_lastVideoResyncAttempt!) <
+            const Duration(milliseconds: 1000)) {
+      return;
+    }
+    _lastVideoResyncAttempt = now;
+    unawaited(_forceSyncPreviewToTimeline(
+      clip,
+      play: true,
+      forceSeek: driftMs > 350,
+      allowControllerRecovery: true,
+    ).then((synced) {
+      if (synced) _activePreviewClipId = clip.id;
+    }));
+  }
+
+  Future<void> _syncVideoToTimeline(VideoClip clip) async {
+    final synced = await _forceSyncPreviewToTimeline(
+      clip,
+      play: _isPlaying,
+      forceSeek: false,
+    );
+    if (synced) _activePreviewClipId = clip.id;
   }
 
   Transition? _getActiveTransitionAt(Duration now) {
@@ -3286,75 +3522,56 @@ class VideoEditorProvider extends ChangeNotifier {
     _transitionOpInFlight = false;
   }
 
-  void _enterClip(VideoClip clip) async {
+  Future<void> _enterClip(VideoClip clip) async {
     if (clip.mediaType == MediaType.image) {
-      _previewController?.pause();
-      _previewController?.setVolume(0.0);
+      await _previewController?.pause();
+      await _previewController?.setVolume(0.0);
+      _activePreviewClipId = clip.id;
       return;
     }
+    await _syncVideoToTimeline(clip);
+  }
 
-    // Determine which file to use - reversed file if available, otherwise original
-    String? videoPath;
-    if (clip.isReversed &&
-        clip.reversedFilePath != null &&
-        File(clip.reversedFilePath!).existsSync()) {
-      videoPath = clip.reversedFilePath;
-    } else {
-      videoPath = clip.videoFile?.path;
+  Future<void> _leaveClip() async {
+    await _previewController?.pause();
+    await _previewController?.setVolume(0.0);
+  }
+
+  /// Called when the app goes to background (e.g. file picker opens, home press).
+  /// Pauses all media without changing the _isPlaying flag so resume can restart.
+  Future<void> handleAppPause() async {
+    await _previewController?.pause();
+    for (final p in _audioPlayers.values) {
+      await p.pause();
     }
-
-    // Check if we need to switch video controller
-    final needsSwitch = videoPath != null &&
-        (_activeFilePath != videoPath || _previewController == null);
-
-    if (needsSwitch) {
-      await _switchActivePreviewController(videoPath);
-    }
-
-    // Calculate the correct source position for this clip
-    final offsetWithinClip = _currentPosition - clip.startTime;
-    final sourcePosition = clip.sourceStart + offsetWithinClip;
-
-    final videoDuration = _previewController!.value.duration;
-
-    // Handle case where source position might exceed video duration after trimming
-    if (sourcePosition >= videoDuration) {
-      _previewController!.pause();
-      _previewController!.setVolume(0.0);
-      return;
-    }
-
-    // For reversed videos, the reversed file already has reversed content
-    // so we just play it normally from start to end
-    // No special position calculation needed - the reversed file IS the reversed content
-    Duration seekPosition = sourcePosition;
-
-    // Seek to the correct position - always seek to ensure consistency
-    const frameEps = Duration(milliseconds: 1);
-    final almostEnd =
-        videoDuration > frameEps ? videoDuration - frameEps : Duration.zero;
-    final clampedSource =
-        seekPosition >= videoDuration ? almostEnd : seekPosition;
-
-    // Check if the player is already near the target position (e.g. within 200ms).
-    // This prevents unneeded seeking and flushing of native video buffers
-    // when consecutively playing two segments of the exact same video file.
-    final currentPos = _previewController!.value.position;
-    if ((currentPos - clampedSource).inMilliseconds.abs() > 200) {
-      unawaited(_previewController!.seekTo(clampedSource));
-    }
-
-    unawaited(_applyPreviewVolumeForCurrentPosition());
-    unawaited(_applyClipPlaybackSpeed(clip));
-
-    if (_isPlaying) {
-      // Always ensure the video is playing when entering a new clip during playback
-      unawaited(_previewController!.play());
+    if (_isPlaying && _timelineTimer != null) {
+      _stopTimelineClock();
+      _timelinePausedForBackground = true;
     }
   }
 
-  void _leaveClip() async {
-    await _previewController!.setVolume(0.0);
+  /// Called when the app comes back to foreground.
+  /// Resets the timeline clock reference point (prevents position drift) and
+  /// restarts the video player if playback was active before going to background.
+  void handleAppResume() {
+    if (!_isPlaying) return;
+    _updateTimelineClock();
+    if (_timelinePausedForBackground) {
+      _timelinePausedForBackground = false;
+      _startTimelineClock();
+    }
+    unawaited(_restartCurrentClipPlayback());
+  }
+
+  /// Resumes video playback at the current timeline position if the player
+  /// was paused (e.g. by the OS when the app went to background mid-clip).
+  Future<void> _restartCurrentClipPlayback() async {
+    final clip = _clipAtTimeline(_currentPosition);
+    if (clip == null || clip.mediaType == MediaType.image) return;
+    if (_isPlaying) {
+      await _syncVideoToTimeline(clip);
+      unawaited(_syncAudioPlayback(force: true));
+    }
   }
 
   @override

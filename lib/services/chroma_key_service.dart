@@ -106,8 +106,6 @@ class ChromaKeyService {
         );
       }
 
-      print('ChromaKeyService: Running FFmpeg...');
-
       // Execute FFmpeg
       final session = await FFmpegKit.execute(command);
       await session.getReturnCode();
@@ -116,27 +114,59 @@ class ChromaKeyService {
       final outputFile = File(outputPath);
       if (await outputFile.exists()) {
         final fileSize = await outputFile.length();
-        print('ChromaKeyService: Output file size: $fileSize bytes');
-
         if (fileSize > 10000) {
-          // At least 10KB for valid video
           onProgress?.call(1.0);
           return ChromaKeyResult.success(outputPath);
         }
       }
 
-      // If we get here, something went wrong
       final logs = await session.getAllLogsAsString() ?? '';
-      const errorMsg = 'FFmpeg failed. Check logs.';
-      print('ChromaKeyService FFmpeg error: $logs');
-      return ChromaKeyResult.failure(errorMsg);
+      return ChromaKeyResult.failure('FFmpeg failed: $logs');
     } catch (e) {
-      print('ChromaKeyService error: $e');
       return ChromaKeyResult.failure('Error: $e');
     }
   }
 
-  /// Build command for video background - aggressive chroma key with complete spill suppression and shadow removal
+  /// Build the shared filter_complex string used by both video and image backgrounds.
+  ///
+  /// KEY DESIGN DECISIONS:
+  /// 1. chromakey receives raw YUV input — NOT format=rgba. The chromakey filter
+  ///    is a YUV-space filter; feeding it RGBA causes wrong color matching because
+  ///    FFmpeg then interprets R/G/B/A channels as Y/U/V/A instead of comparing
+  ///    them in the correct colorspace.
+  /// 2. Spill suppression (colorbalance/hue) is applied BEFORE chromakey so the
+  ///    green fringe is desaturated first, yielding a cleaner key without those
+  ///    filters accidentally touching the alpha channel produced by chromakey.
+  /// 3. format=yuv420p is added at the very end (after overlay) so the final
+  ///    H.264 encoder receives a format it can directly accept. H.264/MP4 has no
+  ///    alpha; the overlay filter composites the keyed foreground onto the
+  ///    background and the alpha is consumed there.
+  /// 4. -ss is placed BEFORE the corresponding -i flag (input seek) rather than
+  ///    after all inputs (output seek) for accurate, faster frame seeking.
+  static String _buildFilterComplex({
+    required String keyColor,
+    required double similarity,
+    required double blend,
+    required double scaleValue,
+    required Offset pos,
+  }) {
+    // Step A: apply light spill suppression on the raw YUV foreground
+    //         (reduces green contamination before keying)
+    // Step B: chromakey on the corrected YUV → produces YUVA (with alpha)
+    // Step C: scale the keyed foreground
+    // Step D: scale background to fill canvas
+    // Step E: overlay keyed foreground onto background → format=yuv420p
+    return '[0:v]'
+        'colorbalance=rs=0.1:gs=-0.15:bs=0.1,'  // mild spill suppression
+        'hue=s=0.9,'                              // slight desaturation of green
+        'chromakey=0x$keyColor:$similarity:$blend,'
+        'scale=iw*$scaleValue:ih*$scaleValue[ck_fg];'
+        '[1:v]scale=iw:ih[ck_bg];'
+        '[ck_bg][ck_fg]overlay=(W-w)*${pos.dx}:(H-h)*${pos.dy}:shortest=1,'
+        'format=yuv420p[outv]';
+  }
+
+  /// Build command for video background
   static String _buildVideoCommand({
     required String foregroundPath,
     required String backgroundPath,
@@ -151,34 +181,32 @@ class ChromaKeyService {
     Offset? position,
     double? scale,
   }) {
-    String audioMap = isMuted ? '-an' : '-map 0:a';
-    String audioFilter = '';
-    if (!isMuted && volume != 1.0) {
-      audioFilter = '-af volume=$volume';
-    }
-
+    final String audioMap = isMuted ? '-an' : '-map 0:a';
+    final String audioFilter =
+        (!isMuted && volume != 1.0) ? '-af volume=$volume' : '';
     final pos = position ?? const Offset(0.5, 0.5);
-    final scaleValue = scale ?? 1.0;
+    final double scaleValue = (scale ?? 1.0).clamp(0.1, 3.0);
 
-    // Aggressive chroma key with strong spill suppression using multiple filters
+    final String filterComplex = _buildFilterComplex(
+      keyColor: keyColor,
+      similarity: similarity,
+      blend: blend,
+      scaleValue: scaleValue,
+      pos: pos,
+    );
+
+    // -ss before -i for fast input seek
     return '-y '
-        '-i "$foregroundPath" '
+        '-ss $startSeconds -t $durationSeconds -i "$foregroundPath" '
         '-i "$backgroundPath" '
-        '-ss $startSeconds -t $durationSeconds '
-        '-filter_complex "[0:v]format=rgba,chromakey=0x$keyColor:$similarity:$blend,'
-        'colorbalance=rs=0.15:gs=-0.2:bs=0.15,' // Strong green spill reduction
-        'hue=s=0.85,' // Desaturate to reduce green tint
-        'eq=gamma_r=1.1:gamma_b=1.1:contrast=1.05,' // Enhance red/blue and contrast
-        'scale=iw*$scaleValue:ih*$scaleValue[fg];'
-        '[1:v]scale=iw:ih[bg];'
-        '[bg][fg]overlay=(W-w)*${pos.dx}:(H-h)*${pos.dy}:shortest=1[outv]" '
+        '-filter_complex "$filterComplex" '
         '-map "[outv]" $audioMap $audioFilter '
-        '-c:v libx264 -preset fast -crf 23 '
+        '-c:v libx264 -preset ultrafast -crf 23 -pix_fmt yuv420p '
         '-c:a aac -b:a 128k '
         '-shortest "$outputPath"';
   }
 
-  /// Build command for image background - aggressive chroma key with complete spill suppression and shadow removal
+  /// Build command for image background
   static String _buildImageCommand({
     required String foregroundPath,
     required String backgroundPath,
@@ -193,29 +221,27 @@ class ChromaKeyService {
     Offset? position,
     double? scale,
   }) {
-    String audioMap = isMuted ? '-an' : '-map 0:a';
-    String audioFilter = '';
-    if (!isMuted && volume != 1.0) {
-      audioFilter = '-af volume=$volume';
-    }
-
+    final String audioMap = isMuted ? '-an' : '-map 0:a';
+    final String audioFilter =
+        (!isMuted && volume != 1.0) ? '-af volume=$volume' : '';
     final pos = position ?? const Offset(0.5, 0.5);
-    final scaleValue = scale ?? 1.0;
+    final double scaleValue = (scale ?? 1.0).clamp(0.1, 3.0);
 
-    // Aggressive chroma key with strong spill suppression using multiple filters
+    final String filterComplex = _buildFilterComplex(
+      keyColor: keyColor,
+      similarity: similarity,
+      blend: blend,
+      scaleValue: scaleValue,
+      pos: pos,
+    );
+
+    // -loop 1 loops the still image; -t limits its duration
     return '-y '
-        '-i "$foregroundPath" '
-        '-loop 1 -i "$backgroundPath" '
-        '-ss $startSeconds -t $durationSeconds '
-        '-filter_complex "[0:v]format=rgba,chromakey=0x$keyColor:$similarity:$blend,'
-        'colorbalance=rs=0.15:gs=-0.2:bs=0.15,' // Strong green spill reduction
-        'hue=s=0.85,' // Desaturate to reduce green tint
-        'eq=gamma_r=1.1:gamma_b=1.1:contrast=1.05,' // Enhance red/blue and contrast
-        'scale=iw*$scaleValue:ih*$scaleValue[fg];'
-        '[1:v]scale=iw:ih[bg];'
-        '[bg][fg]overlay=(W-w)*${pos.dx}:(H-h)*${pos.dy}:shortest=1[outv]" '
+        '-ss $startSeconds -t $durationSeconds -i "$foregroundPath" '
+        '-loop 1 -t $durationSeconds -i "$backgroundPath" '
+        '-filter_complex "$filterComplex" '
         '-map "[outv]" $audioMap $audioFilter '
-        '-c:v libx264 -preset fast -crf 23 '
+        '-c:v libx264 -preset ultrafast -crf 23 -pix_fmt yuv420p '
         '-c:a aac -b:a 128k '
         '-shortest "$outputPath"';
   }

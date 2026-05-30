@@ -151,6 +151,40 @@ class _ChromaKeyEditorState extends State<ChromaKeyEditor> {
                       Container(height: 1, color: AppColors.border),
                       const SizedBox(height: 16),
 
+                      // ── Keying Parameters ─────────────────────────────────
+                      const Text(
+                        'Keying Parameters',
+                        style: TextStyle(
+                            color: AppColors.textTertiary, fontSize: 11),
+                      ),
+                      const SizedBox(height: 12),
+
+                      ModernSlider(
+                        value: settings?.similarity ?? 0.3,
+                        min: 0.0,
+                        max: 0.6,
+                        divisions: 60,
+                        label: 'Similarity  (how aggressively the key color is removed)',
+                        onChanged: (value) =>
+                            provider.updateChromaKeySettings(
+                                similarity: value),
+                      ),
+                      const SizedBox(height: 12),
+
+                      ModernSlider(
+                        value: settings?.blend ?? 0.05,
+                        min: 0.0,
+                        max: 0.5,
+                        divisions: 50,
+                        label: 'Blend  (edge softness / feathering)',
+                        onChanged: (value) =>
+                            provider.updateChromaKeySettings(blend: value),
+                      ),
+
+                      const SizedBox(height: 16),
+                      Container(height: 1, color: AppColors.border),
+                      const SizedBox(height: 16),
+
                       // ── Position & Scale ──────────────────────────────────
                       const Text(
                         'Position & Scale',
@@ -201,7 +235,7 @@ class _ChromaKeyEditorState extends State<ChromaKeyEditor> {
                       Container(height: 1, color: AppColors.border),
                       const SizedBox(height: 16),
 
-                      // ── Info note ─────────────────────────────────────────
+                      // ── Tips ──────────────────────────────────────────────
                       Container(
                         padding: const EdgeInsets.all(12),
                         decoration: BoxDecoration(
@@ -209,18 +243,34 @@ class _ChromaKeyEditorState extends State<ChromaKeyEditor> {
                           borderRadius: BorderRadius.circular(12),
                           border: Border.all(color: AppColors.border),
                         ),
-                        child: Row(
+                        child: Column(
+                          crossAxisAlignment: CrossAxisAlignment.start,
                           children: [
-                            Icon(Icons.info_outline,
-                                color: AppColors.textTertiary, size: 16),
-                            const SizedBox(width: 8),
-                            const Expanded(
-                              child: Text(
-                                'Preview shows background behind video. Green removal happens during export.',
-                                style: TextStyle(
-                                  color: AppColors.textTertiary,
-                                  fontSize: 11,
+                            Row(
+                              children: [
+                                const Icon(Icons.tips_and_updates_outlined,
+                                    color: AppColors.primary, size: 16),
+                                const SizedBox(width: 8),
+                                const Text(
+                                  'Tips for best results',
+                                  style: TextStyle(
+                                    color: AppColors.textSecondary,
+                                    fontSize: 11,
+                                    fontWeight: FontWeight.w600,
+                                  ),
                                 ),
+                              ],
+                            ),
+                            const SizedBox(height: 8),
+                            const Text(
+                              '• Start with Similarity ~0.30 and Blend ~0.05\n'
+                              '• Increase Similarity to remove more green\n'
+                              '• Increase Blend to soften harsh edges\n'
+                              '• Effect is applied at export time',
+                              style: TextStyle(
+                                color: AppColors.textTertiary,
+                                fontSize: 11,
+                                height: 1.5,
                               ),
                             ),
                           ],
