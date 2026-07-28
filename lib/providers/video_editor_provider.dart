@@ -45,6 +45,8 @@ class VideoEditorProvider extends ChangeNotifier {
   String? _activeTransitionId;
   DateTime _lastTransitionSeek = DateTime.fromMillisecondsSinceEpoch(0);
   bool _transitionOpInFlight = false;
+  final Set<String> _transitionPrewarmInFlight = {};
+  final Set<String> _transitionPrewarmedControllerKeys = {};
 
   bool _audioSyncInProgress = false;
   DateTime _lastAudioSync = DateTime.fromMillisecondsSinceEpoch(0);
@@ -61,7 +63,12 @@ class VideoEditorProvider extends ChangeNotifier {
   bool _previewSyncInFlight = false;
   int _seekSyncSerial = 0;
   Timer? _deferredSeekSyncTimer;
-  DateTime? _lastVideoResyncAttempt;
+  bool _playbackRecoveryInFlight = false;
+  int _playbackRecoverySerial = 0;
+
+  static const int _maxPlaybackSyncAttempts = 4;
+  static const Duration _playbackSyncRetryDelay = Duration(milliseconds: 120);
+  static const Duration _videoDriftTolerance = Duration(milliseconds: 350);
 
   final List<VideoProject> _undoStack = [];
   final List<VideoProject> _redoStack = [];
@@ -1374,6 +1381,8 @@ class VideoEditorProvider extends ChangeNotifier {
   Future<void> togglePlayback() async {
     if (_isPlaying) {
       _seekSyncSerial++;
+      _playbackRecoverySerial++;
+      _playbackRecoveryInFlight = false;
       _seekPauseTimer?.cancel();
       _deferredSeekSyncTimer?.cancel();
       await _pauseAllPreviewControllers();
@@ -1385,24 +1394,27 @@ class VideoEditorProvider extends ChangeNotifier {
         await p.pause();
       }
     } else {
-      _seekSyncSerial++;
+      final serial = ++_seekSyncSerial;
       _seekPauseTimer?.cancel();
       _deferredSeekSyncTimer?.cancel();
       _isPlaying = true;
+      var canStartTimeline = true;
 
       final clip = _clipAtTimeline(_currentPosition);
       if (clip != null) {
         if (clip.mediaType == MediaType.video && clip.videoFile != null) {
-          final synced = await _forceSyncPreviewToTimeline(
+          final synced = await _syncVideoForRequestedPlayback(
             clip,
-            play: true,
-            forceSeek: true,
+            serial: serial,
           );
+          if (serial != _seekSyncSerial) return;
           if (synced) {
             _activePreviewClipId = clip.id;
           } else {
             _isPlaying = false;
             _activePreviewClipId = null;
+            canStartTimeline = false;
+            await _pauseAllPreviewControllers();
           }
         } else {
           await _previewController?.pause();
@@ -1413,7 +1425,7 @@ class VideoEditorProvider extends ChangeNotifier {
         }
       }
 
-      if (_isPlaying) {
+      if (_isPlaying && canStartTimeline) {
         await _prepareAudioForPlayback();
         _startTimelineClock();
       }
@@ -1421,6 +1433,29 @@ class VideoEditorProvider extends ChangeNotifier {
     _startPositionListener();
     unawaited(_syncAudioPlayback());
     notifyListeners();
+  }
+
+  Future<bool> _syncVideoForRequestedPlayback(
+    VideoClip clip, {
+    required int serial,
+  }) async {
+    for (var attempt = 0; attempt < _maxPlaybackSyncAttempts; attempt++) {
+      if (serial != _seekSyncSerial || !_isPlaying) return false;
+
+      final synced = await _forceSyncPreviewToTimeline(
+        clip,
+        play: true,
+        forceSeek: true,
+        refreshController: Platform.isAndroid && attempt > 0,
+        isCurrent: () => serial == _seekSyncSerial && _isPlaying,
+      );
+      if (synced) return true;
+
+      if (attempt < _maxPlaybackSyncAttempts - 1) {
+        await Future<void>.delayed(_playbackSyncRetryDelay);
+      }
+    }
+    return false;
   }
 
   /// Pre-loads audio players and starts playback for active overlays
@@ -1463,49 +1498,6 @@ class VideoEditorProvider extends ChangeNotifier {
   void _videoPositionListener() {
     // Timeline position is driven by the wall clock only. The listener is kept
     // so the VideoPlayer widget repaints; do not write back to [_currentPosition].
-    if (!_isPlaying) return;
-    final clip = _clipAtTimeline(_currentPosition);
-    if (clip == null || clip.mediaType != MediaType.video) return;
-    unawaited(_preloadUpcomingTransitionControllers(_currentPosition));
-  }
-
-  Future<void> _preloadUpcomingTransitionControllers(Duration now) async {
-    final project = _currentProject;
-    if (project == null) return;
-    if (project.transitions.isEmpty) return;
-
-    // Preload clip2 controller slightly before transition begins to avoid jank.
-    const preloadWindow = Duration(milliseconds: 900);
-
-    for (final t in project.transitions) {
-      if (now <= t.startTime && (t.startTime - now) <= preloadWindow) {
-        VideoClip? clip2;
-        try {
-          clip2 = project.videoClips.firstWhere((c) => c.id == t.clipId2);
-        } catch (_) {
-          clip2 = null;
-        }
-        if (clip2 == null ||
-            clip2.mediaType != MediaType.video ||
-            clip2.videoFile == null) {
-          continue;
-        }
-        final path = clip2.videoFile!.path;
-
-        // Skip preloading if clip2 shares the same active file. Preloading
-        // would seek the currently active preview controller to 0 and loop the video!
-        if (path == _activeFilePath) continue;
-
-        final c2 = await ensurePreviewController(path);
-        if (c2 == null || !c2.value.isInitialized) continue;
-        // Seek to the trimmed source start so clip2 is ready during transition.
-        if ((c2.value.position - clip2.sourceStart).abs() >
-            const Duration(milliseconds: 40)) {
-          await c2.seekTo(clip2.sourceStart);
-        }
-        await c2.pause();
-      }
-    }
   }
 
   bool _isPositionInAnyClip(Duration position) {
@@ -1560,6 +1552,89 @@ class VideoEditorProvider extends ChangeNotifier {
         videoDuration > frameEps ? videoDuration - frameEps : Duration.zero;
     if (sourcePosition >= videoDuration) return lastFrame;
     return sourcePosition;
+  }
+
+  static Duration transitionPreviewVisualStart(
+    Transition transition,
+    VideoClip clip2,
+  ) {
+    return clip2.startTime;
+  }
+
+  static Duration transitionPreviewVisualEnd(
+    Transition transition,
+    VideoClip clip2,
+  ) {
+    return transitionPreviewVisualStart(transition, clip2) +
+        transition.duration;
+  }
+
+  static Duration transitionPreviewPrewarmStart(
+    Transition transition,
+    VideoClip clip1,
+    VideoClip clip2, {
+    Duration minimumLead = const Duration(milliseconds: 800),
+  }) {
+    final lead =
+        transition.duration > minimumLead ? transition.duration : minimumLead;
+    final visualStart = transitionPreviewVisualStart(transition, clip2);
+    var start = visualStart - lead;
+
+    if (start < clip1.startTime) start = clip1.startTime;
+    if (start > clip1.endTime) start = clip1.endTime;
+    if (start > visualStart) start = visualStart;
+    return start;
+  }
+
+  static double transitionPreviewProgress(
+    Duration position,
+    Transition transition,
+    VideoClip clip2,
+  ) {
+    final durationMs = transition.duration.inMilliseconds;
+    if (durationMs <= 0) return 1.0;
+
+    final start = transitionPreviewVisualStart(transition, clip2);
+    return ((position - start).inMilliseconds / durationMs).clamp(0.0, 1.0);
+  }
+
+  static bool isTransitionPreviewActiveAt(
+    Duration position,
+    Transition transition,
+    VideoClip clip2,
+  ) {
+    final start = transitionPreviewVisualStart(transition, clip2);
+    final end = transitionPreviewVisualEnd(transition, clip2);
+    return position >= start && position < end;
+  }
+
+  static bool isTransitionPreviewPrewarmAt(
+    Duration position,
+    Transition transition,
+    VideoClip clip1,
+    VideoClip clip2,
+  ) {
+    final start = transitionPreviewPrewarmStart(transition, clip1, clip2);
+    final end = transitionPreviewVisualEnd(transition, clip2);
+    return position >= start && position < end;
+  }
+
+  @visibleForTesting
+  static bool shouldHoldTimelineForVideoSync({
+    required bool isPlayingRequested,
+    required bool controllerInitialized,
+    required bool controllerPlaying,
+    required bool controllerBuffering,
+    required Duration controllerPosition,
+    required Duration expectedPosition,
+    Duration driftTolerance = _videoDriftTolerance,
+  }) {
+    if (!isPlayingRequested) return false;
+    if (!controllerInitialized) return true;
+
+    final drift = (controllerPosition - expectedPosition).abs();
+    if (!controllerPlaying && !controllerBuffering) return true;
+    return drift > driftTolerance;
   }
 
   String? _resolvePlaybackPath(VideoClip clip) {
@@ -1694,8 +1769,13 @@ class VideoEditorProvider extends ChangeNotifier {
     if (!play) return true;
 
     await controller.play();
-    await Future<void>.delayed(const Duration(milliseconds: 80));
+    final started = await _waitForControllerPlaybackStart(
+      controller,
+      target,
+      isCurrent: isCurrent,
+    );
     if (isCurrent != null && !isCurrent()) return false;
+    if (!started) return false;
 
     final value = controller.value;
     if (!value.isInitialized) return false;
@@ -1713,6 +1793,52 @@ class VideoEditorProvider extends ChangeNotifier {
     return true;
   }
 
+  Future<bool> _waitForControllerPlaybackStart(
+    VideoPlayerController controller,
+    Duration target, {
+    bool Function()? isCurrent,
+  }) async {
+    var lastPosition = controller.value.position;
+    final duration = controller.value.duration;
+    final targetNearEnd = duration > const Duration(milliseconds: 250) &&
+        target >= duration - const Duration(milliseconds: 250);
+
+    for (var i = 0; i < 8; i++) {
+      if (isCurrent != null && !isCurrent()) return false;
+      await Future<void>.delayed(const Duration(milliseconds: 75));
+      if (isCurrent != null && !isCurrent()) return false;
+
+      final value = controller.value;
+      if (!value.isInitialized) return false;
+      final drift = (value.position - target).abs();
+      final moved = (value.position - lastPosition).abs() >
+          const Duration(milliseconds: 20);
+
+      if (targetNearEnd &&
+          value.position >= duration - const Duration(milliseconds: 250)) {
+        return true;
+      }
+      if (value.isPlaying &&
+          !value.isBuffering &&
+          drift <= _videoDriftTolerance) {
+        return true;
+      }
+      if (value.isPlaying &&
+          moved &&
+          drift <= const Duration(milliseconds: 700)) {
+        return true;
+      }
+
+      lastPosition = value.position;
+    }
+
+    final value = controller.value;
+    return value.isInitialized &&
+        value.isPlaying &&
+        !value.isBuffering &&
+        (value.position - target).abs() <= _videoDriftTolerance;
+  }
+
   Future<void> seekTo(Duration position) async {
     final previousPosition = _currentPosition;
 
@@ -1728,6 +1854,7 @@ class VideoEditorProvider extends ChangeNotifier {
     _currentPosition = position;
     _updateTimelineClock();
     _activePreviewClipId = null;
+    _activeTransitionId = null;
 
     final serial = ++_seekSyncSerial;
     final resumeWhenSynced = _isPlaying;
@@ -1790,6 +1917,16 @@ class VideoEditorProvider extends ChangeNotifier {
     return null;
   }
 
+  VideoClip? _clipById(String clipId) {
+    final project = _currentProject;
+    if (project == null) return null;
+    try {
+      return project.videoClips.firstWhere((clip) => clip.id == clipId);
+    } catch (_) {
+      return null;
+    }
+  }
+
   VideoClip? _clipAtTimeline(Duration position) {
     if (_currentProject == null) return null;
     const eps = Duration(milliseconds: 5);
@@ -1812,6 +1949,7 @@ class VideoEditorProvider extends ChangeNotifier {
     int serial,
     Duration previousPosition, {
     required bool resumeWhenSynced,
+    int attempt = 0,
   }) {
     _deferredSeekSyncTimer?.cancel();
     _seekPauseTimer?.cancel();
@@ -1823,6 +1961,7 @@ class VideoEditorProvider extends ChangeNotifier {
         serial,
         previousPosition,
         resumeWhenSynced: resumeWhenSynced,
+        attempt: attempt,
       ));
     });
   }
@@ -1831,11 +1970,13 @@ class VideoEditorProvider extends ChangeNotifier {
     int serial,
     Duration previousPosition, {
     required bool resumeWhenSynced,
+    required int attempt,
   }) async {
     if (serial != _seekSyncSerial) return;
 
     final clip = _clipAtTimeline(_currentPosition);
-    var canResumeTimeline = true;
+    var needsVideoSync = false;
+    var videoSynced = false;
 
     if (clip == null) {
       await _previewController?.setVolume(0.0);
@@ -1844,28 +1985,42 @@ class VideoEditorProvider extends ChangeNotifier {
       await _pauseAllPreviewControllers();
       _activePreviewClipId = clip.id;
     } else if (clip.mediaType == MediaType.video && clip.videoFile != null) {
+      needsVideoSync = true;
       final isBackwardSeek = previousPosition - _currentPosition >
           const Duration(milliseconds: 500);
       final synced = await _forceSyncPreviewToTimeline(
         clip,
         play: _isPlaying,
         forceSeek: true,
-        refreshController: isBackwardSeek,
+        refreshController:
+            Platform.isAndroid && (isBackwardSeek || attempt > 1),
         isCurrent: () => serial == _seekSyncSerial,
       );
       if (serial != _seekSyncSerial) return;
       if (synced) {
         _activePreviewClipId = clip.id;
+        videoSynced = true;
       } else if (_isPlaying) {
-        _isPlaying = false;
         _activePreviewClipId = null;
-        canResumeTimeline = false;
+        if (attempt < _maxPlaybackSyncAttempts - 1) {
+          _scheduleDeferredSeekSync(
+            serial,
+            previousPosition,
+            resumeWhenSynced: resumeWhenSynced,
+            attempt: attempt + 1,
+          );
+          return;
+        }
         await _pauseAllPreviewControllers();
+        _isPlaying = false;
+        notifyListeners();
+        return;
       }
     }
 
     if (serial != _seekSyncSerial) return;
-    if (resumeWhenSynced && _isPlaying && canResumeTimeline) {
+    if (resumeWhenSynced && _isPlaying) {
+      if (needsVideoSync && !videoSynced) return;
       _startTimelineClock();
     }
     unawaited(_syncAudioPlayback(force: true));
@@ -3256,11 +3411,11 @@ class VideoEditorProvider extends ChangeNotifier {
 
   List<Transition> get currentTransitions {
     if (_currentProject == null) return [];
-    return _currentProject!.transitions
-        .where((t) =>
-            _currentPosition >= t.startTime &&
-            _currentPosition < t.startTime + t.duration)
-        .toList();
+    return _currentProject!.transitions.where((t) {
+      final clip2 = _clipById(t.clipId2);
+      return clip2 != null &&
+          isTransitionPreviewActiveAt(_currentPosition, t, clip2);
+    }).toList();
   }
 
   List<VideoEffect> get currentVideoEffects {
@@ -3276,6 +3431,7 @@ class VideoEditorProvider extends ChangeNotifier {
     if (_currentProject == null) return;
     recordUndo();
     _currentProject = _currentProject!.addTransition(transition);
+    _transitionPrewarmedControllerKeys.clear();
     _scheduleAutoSave();
     notifyListeners();
   }
@@ -3284,6 +3440,7 @@ class VideoEditorProvider extends ChangeNotifier {
     if (_currentProject == null) return;
     recordUndo();
     _currentProject = _currentProject!.updateTransition(transitionId, updated);
+    _transitionPrewarmedControllerKeys.clear();
     _scheduleAutoSave();
     notifyListeners();
   }
@@ -3292,6 +3449,7 @@ class VideoEditorProvider extends ChangeNotifier {
     if (_currentProject == null) return;
     recordUndo();
     _currentProject = _currentProject!.removeTransition(transitionId);
+    _transitionPrewarmedControllerKeys.clear();
     _scheduleAutoSave();
     notifyListeners();
   }
@@ -3348,6 +3506,10 @@ class VideoEditorProvider extends ChangeNotifier {
     _previewControllers.clear();
     _lruAccessList.clear(); // Clear LRU list too
     _isPlaying = false;
+    _playbackRecoverySerial++;
+    _playbackRecoveryInFlight = false;
+    _transitionPrewarmInFlight.clear();
+    _transitionPrewarmedControllerKeys.clear();
     _currentPosition = Duration.zero;
     _selectedTextOverlayId = null;
     _selectedAudioOverlayId = null;
@@ -3432,11 +3594,28 @@ class VideoEditorProvider extends ChangeNotifier {
       return;
     }
 
+    _prewarmUpcomingTransitionControllers(_currentPosition);
+
     // If we're inside a transition window, drive preview using clip2
     // to avoid running two decoders simultaneously (reduces lag).
     final activeTransition = _getActiveTransitionAt(_currentPosition);
     if (activeTransition != null) {
-      unawaited(_enterTransitionWindow(activeTransition));
+      final clip2 = _clipById(activeTransition.clipId2);
+      if (_isPlaying &&
+          clip2 != null &&
+          clip2.mediaType == MediaType.video &&
+          clip2.videoFile != null &&
+          _controllerNeedsTimelineHoldForClip(clip2)) {
+        _activeTransitionId = activeTransition.id;
+        _holdTimelineForVideoSync(clip2, forceSeek: true);
+        unawaited(_applyPreviewVolumeForCurrentPosition());
+        unawaited(_syncAudioPlayback());
+        return;
+      }
+
+      if (_transitionPreviewNeedsSync(activeTransition)) {
+        unawaited(_enterTransitionWindow(activeTransition));
+      }
       unawaited(_applyPreviewVolumeForCurrentPosition());
       unawaited(_syncAudioPlayback());
       return;
@@ -3447,51 +3626,135 @@ class VideoEditorProvider extends ChangeNotifier {
     final currentClip = _clipAtTimeline(_currentPosition);
 
     if (currentClip != null && currentClip.id != _activePreviewClipId) {
-      unawaited(_enterClip(currentClip));
+      if (_isPlaying &&
+          currentClip.mediaType == MediaType.video &&
+          currentClip.videoFile != null) {
+        _holdTimelineForVideoSync(currentClip, forceSeek: true);
+      } else {
+        unawaited(_enterClip(currentClip));
+      }
     } else if (currentClip == null && _activePreviewClipId != null) {
       _activePreviewClipId = null;
       unawaited(_leaveClip());
     } else if (_isPlaying &&
         currentClip != null &&
         currentClip.mediaType == MediaType.video) {
-      _maybeResyncStalledVideo(currentClip);
+      _maybeHoldForStalledVideo(currentClip);
     }
 
     unawaited(_applyPreviewVolumeForCurrentPosition());
     unawaited(_syncAudioPlayback());
   }
 
-  /// If the decoder stalls or drifts from the wall-clock timeline, re-seek at
-  /// most once per second. Android video_player can report playing while the
-  /// rendered frame is stale after replay/seek, so don't rely on isPlaying only.
-  void _maybeResyncStalledVideo(VideoClip clip) {
+  bool _controllerNeedsTimelineHoldForClip(VideoClip clip) {
+    final videoPath = _resolvePlaybackPath(clip);
     final controller = _previewController;
-    if (controller == null || !controller.value.isInitialized) return;
-    if (controller.value.isBuffering) return;
+    if (videoPath == null ||
+        _activeFilePath != videoPath ||
+        controller == null ||
+        !controller.value.isInitialized) {
+      return true;
+    }
 
     final expected = clampSourcePositionForVideo(
       calculateSourcePositionForTimeline(clip, _currentPosition),
       controller.value.duration,
     );
-    final driftMs = (controller.value.position - expected).inMilliseconds.abs();
-    final needsResync = !controller.value.isPlaying || driftMs > 350;
-    if (!needsResync) return;
+    return shouldHoldTimelineForVideoSync(
+      isPlayingRequested: _isPlaying,
+      controllerInitialized: controller.value.isInitialized,
+      controllerPlaying: controller.value.isPlaying,
+      controllerBuffering: controller.value.isBuffering,
+      controllerPosition: controller.value.position,
+      expectedPosition: expected,
+    );
+  }
 
-    final now = DateTime.now();
-    if (_lastVideoResyncAttempt != null &&
-        now.difference(_lastVideoResyncAttempt!) <
-            const Duration(milliseconds: 1000)) {
-      return;
+  /// If the decoder stalls or drifts from the wall-clock timeline, stop the
+  /// wall-clock until the active controller has actually resumed. This prevents
+  /// the playhead from running ahead while Android is still recovering from a
+  /// seek/flush.
+  void _maybeHoldForStalledVideo(VideoClip clip) {
+    if (!_controllerNeedsTimelineHoldForClip(clip)) return;
+    _holdTimelineForVideoSync(clip, forceSeek: true);
+  }
+
+  void _holdTimelineForVideoSync(
+    VideoClip clip, {
+    required bool forceSeek,
+  }) {
+    if (!_isPlaying || _playbackRecoveryInFlight) return;
+
+    _playbackRecoveryInFlight = true;
+    final recoverySerial = ++_playbackRecoverySerial;
+    final seekSerial = _seekSyncSerial;
+
+    _stopTimelineClock();
+    for (final p in _audioPlayers.values) {
+      unawaited(p.pause());
     }
-    _lastVideoResyncAttempt = now;
-    unawaited(_forceSyncPreviewToTimeline(
+
+    unawaited(_recoverVideoAndResumePlayback(
       clip,
-      play: true,
-      forceSeek: driftMs > 350,
-      allowControllerRecovery: true,
-    ).then((synced) {
-      if (synced) _activePreviewClipId = clip.id;
-    }));
+      recoverySerial: recoverySerial,
+      seekSerial: seekSerial,
+      forceSeek: forceSeek,
+    ));
+  }
+
+  Future<void> _recoverVideoAndResumePlayback(
+    VideoClip clip, {
+    required int recoverySerial,
+    required int seekSerial,
+    required bool forceSeek,
+  }) async {
+    var synced = false;
+
+    bool isCurrent() {
+      if (recoverySerial != _playbackRecoverySerial) return false;
+      if (seekSerial != _seekSyncSerial) return false;
+      if (!_isPlaying) return false;
+      return _clipAtTimeline(_currentPosition)?.id == clip.id;
+    }
+
+    try {
+      for (var attempt = 0; attempt < _maxPlaybackSyncAttempts; attempt++) {
+        if (!isCurrent()) return;
+        synced = await _forceSyncPreviewToTimeline(
+          clip,
+          play: true,
+          forceSeek: forceSeek || attempt > 0,
+          refreshController: Platform.isAndroid && attempt > 0,
+          allowControllerRecovery: true,
+          isCurrent: isCurrent,
+        );
+        if (synced) break;
+        if (attempt < _maxPlaybackSyncAttempts - 1) {
+          await Future<void>.delayed(_playbackSyncRetryDelay);
+        }
+      }
+
+      if (!isCurrent()) return;
+      if (synced) {
+        _activePreviewClipId = clip.id;
+        await _prepareAudioForPlayback();
+        if (isCurrent()) {
+          _startTimelineClock();
+        }
+      } else {
+        _isPlaying = false;
+        _activePreviewClipId = null;
+        await _pauseAllPreviewControllers();
+        for (final p in _audioPlayers.values) {
+          await p.pause();
+        }
+      }
+    } finally {
+      if (recoverySerial == _playbackRecoverySerial) {
+        _playbackRecoveryInFlight = false;
+      }
+      notifyListeners();
+    }
   }
 
   Future<void> _syncVideoToTimeline(VideoClip clip) async {
@@ -3503,73 +3766,142 @@ class VideoEditorProvider extends ChangeNotifier {
     if (synced) _activePreviewClipId = clip.id;
   }
 
+  void _prewarmUpcomingTransitionControllers(Duration now) {
+    final project = _currentProject;
+    if (project == null || project.transitions.isEmpty) return;
+
+    for (final transition in project.transitions) {
+      final clip1 = _clipById(transition.clipId1);
+      final clip2 = _clipById(transition.clipId2);
+      if (clip1 == null || clip2 == null) continue;
+      if (!isTransitionPreviewPrewarmAt(now, transition, clip1, clip2)) {
+        continue;
+      }
+      if (clip2.mediaType != MediaType.video || clip2.videoFile == null) {
+        continue;
+      }
+
+      final clip2Path = _resolvePlaybackPath(clip2);
+      if (clip2Path == null) continue;
+
+      final clip1Path = _resolvePlaybackPath(clip1);
+      if (clip2Path == _activeFilePath || clip2Path == clip1Path) {
+        continue;
+      }
+
+      final key =
+          '${transition.id}|$clip2Path|${clip2.sourceStart.inMilliseconds}';
+      if (_transitionPrewarmedControllerKeys.contains(key) ||
+          _transitionPrewarmInFlight.contains(key)) {
+        continue;
+      }
+
+      _transitionPrewarmInFlight.add(key);
+      unawaited(_prewarmTransitionController(clip2, clip2Path, key));
+    }
+  }
+
+  Future<void> _prewarmTransitionController(
+    VideoClip clip,
+    String videoPath,
+    String key,
+  ) async {
+    try {
+      final controller = await ensurePreviewController(videoPath);
+      if (controller == null || !controller.value.isInitialized) return;
+
+      await controller.setVolume(0.0);
+      final target = clampSourcePositionForVideo(
+        clip.sourceStart,
+        controller.value.duration,
+      );
+      if ((controller.value.position - target).abs() >
+          const Duration(milliseconds: 40)) {
+        await controller.seekTo(target);
+      }
+      await controller.pause();
+      _transitionPrewarmedControllerKeys.add(key);
+    } catch (_) {
+      // Prewarming is best effort; active playback sync still handles misses.
+    } finally {
+      _transitionPrewarmInFlight.remove(key);
+    }
+  }
+
   Transition? _getActiveTransitionAt(Duration now) {
     final project = _currentProject;
     if (project == null || project.transitions.isEmpty) return null;
     for (final t in project.transitions) {
-      if (now >= t.startTime && now < t.startTime + t.duration) {
+      final clip2 = _clipById(t.clipId2);
+      if (clip2 != null && isTransitionPreviewActiveAt(now, t, clip2)) {
         return t;
       }
     }
     return null;
   }
 
+  bool _transitionPreviewNeedsSync(Transition transition) {
+    if (_activeTransitionId != transition.id) return true;
+
+    final clip2 = _clipById(transition.clipId2);
+    if (clip2 == null) return false;
+    if (clip2.mediaType == MediaType.image) {
+      return _activePreviewClipId != clip2.id;
+    }
+    if (clip2.mediaType != MediaType.video || clip2.videoFile == null) {
+      return false;
+    }
+
+    final videoPath = _resolvePlaybackPath(clip2);
+    final controller = _previewController;
+    if (videoPath == null ||
+        _activeFilePath != videoPath ||
+        controller == null ||
+        !controller.value.isInitialized ||
+        _activePreviewClipId != clip2.id) {
+      return true;
+    }
+
+    if (_isPlaying &&
+        !controller.value.isPlaying &&
+        !controller.value.isBuffering) {
+      return true;
+    }
+
+    final expected = clampSourcePositionForVideo(
+      calculateSourcePositionForTimeline(clip2, _currentPosition),
+      controller.value.duration,
+    );
+    final driftMs = (controller.value.position - expected).inMilliseconds.abs();
+    return driftMs > 350;
+  }
+
   Future<void> _enterTransitionWindow(Transition t) async {
     if (_transitionOpInFlight) return;
     _transitionOpInFlight = true;
     try {
-      final project = _currentProject;
-      if (project == null) return;
-
-      VideoClip? clip1;
-      VideoClip? clip2;
-      try {
-        clip1 = project.videoClips.firstWhere((c) => c.id == t.clipId1);
-      } catch (_) {
-        clip1 = null;
-      }
-      try {
-        clip2 = project.videoClips.firstWhere((c) => c.id == t.clipId2);
-      } catch (_) {
-        clip2 = null;
-      }
-      if (clip1 == null ||
-          clip1.mediaType != MediaType.video ||
-          clip1.videoFile == null ||
-          clip2 == null ||
-          clip2.mediaType != MediaType.video ||
-          clip2.videoFile == null) {
-        return;
-      }
+      final clip2 = _clipById(t.clipId2);
+      if (clip2 == null) return;
 
       final isFirstEntry = _activeTransitionId != t.id;
-
       if (isFirstEntry) {
         _activeTransitionId = t.id;
+      }
 
+      if (clip2.mediaType == MediaType.video && clip2.videoFile != null) {
         final synced = await _forceSyncPreviewToTimeline(
-          clip1,
+          clip2,
           play: _isPlaying,
-          forceSeek: true,
+          forceSeek: isFirstEntry || _activePreviewClipId != clip2.id,
           allowControllerRecovery: true,
         );
         if (synced) {
-          _activePreviewClipId = clip1.id;
+          _activePreviewClipId = clip2.id;
         }
-
-        // Preload clip2 as the secondary overlay for the transition preview.
-        // Skip if clip2 shares the same file as clip1 — the UI will create
-        // a dedicated controller for that case to avoid conflicting seeks.
-        final clip2Path = clip2.videoFile!.path;
-        final sameFileTransition = (clip1.videoFile?.path == clip2Path);
-        if (!sameFileTransition) {
-          final c2 = await ensurePreviewController(clip2Path);
-          if (c2 != null && c2.value.isInitialized) {
-            await c2.pause();
-            await c2.setVolume(0.0);
-            await c2.seekTo(clip2.sourceStart);
-          }
-        }
+      } else if (clip2.mediaType == MediaType.image) {
+        await _previewController?.pause();
+        await _previewController?.setVolume(0.0);
+        _activePreviewClipId = clip2.id;
       }
     } finally {
       _transitionOpInFlight = false;

@@ -1,5 +1,4 @@
 import 'dart:io';
-import 'dart:typed_data';
 import 'dart:math' as math;
 import 'dart:ui' as ui;
 import 'package:flutter/material.dart';
@@ -219,6 +218,7 @@ class _VideoEditorScreenState extends State<VideoEditorScreen>
   // Fraction of total editor height for the bottom panel (timeline + toolbar).
   double _bottomPanelFraction = 0.60;
   static const double _dividerHeight = 10.0;
+  final Map<String, _TransitionFrameCacheEntry> _transitionFrameCache = {};
 
   String _normalizeMp4Path(String path) {
     if (path.toLowerCase().endsWith('.mp4')) return path;
@@ -1675,8 +1675,6 @@ class _VideoEditorScreenState extends State<VideoEditorScreen>
   }
 
   Widget _buildBottomPanel(VideoEditorProvider provider) {
-    print(
-        'DEBUG: _buildBottomPanel called, editorPanelMode = ${provider.editorPanelMode}');
     // Check chromaKey FIRST - highest priority (overrides other panels)
     if (provider.editorPanelMode == EditorPanelMode.chromaKey) {
       return const ChromaKeyEditor();
@@ -2567,6 +2565,158 @@ class _VideoEditorScreenState extends State<VideoEditorScreen>
     );
   }
 
+  _ResolvedTransitionPreview? _resolveTransitionPreview(
+      VideoEditorProvider provider) {
+    final project = provider.currentProject;
+    if (project == null || project.transitions.isEmpty) return null;
+
+    for (final transition in project.transitions) {
+      VideoClip? clip1;
+      VideoClip? clip2;
+      try {
+        clip1 = project.videoClips
+            .firstWhere((clip) => clip.id == transition.clipId1);
+        clip2 = project.videoClips
+            .firstWhere((clip) => clip.id == transition.clipId2);
+      } catch (_) {
+        continue;
+      }
+
+      final isPrewarm = VideoEditorProvider.isTransitionPreviewPrewarmAt(
+        provider.currentPosition,
+        transition,
+        clip1,
+        clip2,
+      );
+      if (!isPrewarm) continue;
+
+      final isActive = VideoEditorProvider.isTransitionPreviewActiveAt(
+        provider.currentPosition,
+        transition,
+        clip2,
+      );
+
+      return _ResolvedTransitionPreview(
+        transition: transition,
+        clip1: clip1,
+        clip2: clip2,
+        isActive: isActive,
+      );
+    }
+
+    return null;
+  }
+
+  String _transitionPreviewCacheKey(
+    Transition transition,
+    VideoClip clip1,
+    VideoClip clip2,
+  ) {
+    return '${transition.id}|${clip1.id}|${clip2.id}';
+  }
+
+  String? _transitionPlaybackPath(VideoClip clip) {
+    if (clip.mediaType != MediaType.video || clip.videoFile == null) {
+      return null;
+    }
+    if (clip.isReversed &&
+        clip.reversedFilePath != null &&
+        File(clip.reversedFilePath!).existsSync()) {
+      return clip.reversedFilePath!;
+    }
+    return clip.videoFile!.path;
+  }
+
+  int _transitionStaticFrameTimeMs(VideoClip clip, {required bool lastFrame}) {
+    final position = lastFrame
+        ? (clip.sourceEnd > clip.sourceStart
+            ? clip.sourceEnd - const Duration(milliseconds: 1)
+            : clip.sourceStart)
+        : clip.sourceStart;
+    return position.inMilliseconds < 0 ? 0 : position.inMilliseconds;
+  }
+
+  void _prewarmTransitionFrames(_ResolvedTransitionPreview preview) {
+    final cacheKey = _transitionPreviewCacheKey(
+      preview.transition,
+      preview.clip1,
+      preview.clip2,
+    );
+    final entry = _transitionFrameCache.putIfAbsent(
+      cacheKey,
+      () => _TransitionFrameCacheEntry(),
+    );
+
+    _queueTransitionFrameLoad(
+      cacheKey: cacheKey,
+      entry: entry,
+      clip: preview.clip1,
+      isClip1: true,
+      lastFrame: true,
+    );
+    _queueTransitionFrameLoad(
+      cacheKey: cacheKey,
+      entry: entry,
+      clip: preview.clip2,
+      isClip1: false,
+      lastFrame: false,
+    );
+  }
+
+  void _queueTransitionFrameLoad({
+    required String cacheKey,
+    required _TransitionFrameCacheEntry entry,
+    required VideoClip clip,
+    required bool isClip1,
+    required bool lastFrame,
+  }) {
+    final path = _transitionPlaybackPath(clip);
+    if (path == null) {
+      entry.markResolved(isClip1, null, null);
+      return;
+    }
+
+    final timeMs = _transitionStaticFrameTimeMs(clip, lastFrame: lastFrame);
+    final frameKey = '$path|$timeMs';
+    if (entry.hasFrameRequest(isClip1, frameKey)) return;
+
+    entry.markLoading(isClip1, frameKey);
+    unawaited(_loadTransitionFrame(
+      cacheKey: cacheKey,
+      frameKey: frameKey,
+      path: path,
+      timeMs: timeMs,
+      isClip1: isClip1,
+    ));
+  }
+
+  Future<void> _loadTransitionFrame({
+    required String cacheKey,
+    required String frameKey,
+    required String path,
+    required int timeMs,
+    required bool isClip1,
+  }) async {
+    Uint8List? bytes;
+    try {
+      bytes = await VideoThumbnail.thumbnailData(
+        video: path,
+        imageFormat: ImageFormat.PNG,
+        timeMs: timeMs,
+        quality: 75,
+      );
+    } catch (_) {
+      bytes = null;
+    }
+
+    if (!mounted) return;
+    final entry = _transitionFrameCache[cacheKey];
+    if (entry == null || !entry.matchesFrameKey(isClip1, frameKey)) return;
+    setState(() {
+      entry.markResolved(isClip1, frameKey, bytes);
+    });
+  }
+
   Widget _buildFilteredMedia(VideoEditorProvider provider,
       {bool isPreviewMode = false}) {
     // Use per-clip filter if available, otherwise fall back to project-wide filter
@@ -2603,7 +2753,43 @@ class _VideoEditorScreenState extends State<VideoEditorScreen>
       return Container(color: AppColors.background);
     }
 
-    if (currentClip.mediaType == MediaType.image &&
+    final transitionPreview = _resolveTransitionPreview(provider);
+    if (transitionPreview != null) {
+      _prewarmTransitionFrames(transitionPreview);
+    }
+
+    if (transitionPreview != null && transitionPreview.isActive) {
+      final outputRes =
+          provider.currentProject?.outputResolution ?? const Size(1920, 1080);
+      final transitionAspectRatio = outputRes.height == 0
+          ? 16.0 / 9.0
+          : outputRes.width / outputRes.height;
+      final cacheKey = _transitionPreviewCacheKey(
+        transitionPreview.transition,
+        transitionPreview.clip1,
+        transitionPreview.clip2,
+      );
+      final frameCache = _transitionFrameCache[cacheKey];
+
+      mediaWidget = Center(
+        child: AspectRatio(
+          aspectRatio: transitionAspectRatio,
+          child: _TransitionPreview(
+            provider: provider,
+            transition: transitionPreview.transition,
+            clip1: transitionPreview.clip1,
+            clip2: transitionPreview.clip2,
+            clip1FrameBytes: frameCache?.clip1FrameBytes,
+            clip2FrameBytes: frameCache?.clip2FrameBytes,
+            progress: VideoEditorProvider.transitionPreviewProgress(
+              provider.currentPosition,
+              transitionPreview.transition,
+              transitionPreview.clip2,
+            ),
+          ),
+        ),
+      );
+    } else if (currentClip.mediaType == MediaType.image &&
         currentClip.imageFile != null) {
       final outputRes =
           provider.currentProject?.outputResolution ?? const Size(1080, 1920);
@@ -2632,30 +2818,13 @@ class _VideoEditorScreenState extends State<VideoEditorScreen>
         videoAspectRatio = 1 / videoAspectRatio;
       }
 
-      final Transition? activeTransition =
-          provider.currentTransitions.isNotEmpty
-              ? provider.currentTransitions.first
-              : null;
-
       mediaWidget = Center(
         child: AspectRatio(
           aspectRatio: videoAspectRatio,
-          // Show transition overlay whenever we're inside a transition window.
-          // The provider may switch the active preview controller to clip2, so we
-          // cannot rely on currentClip.id == clipId1 here.
-          child: (activeTransition != null &&
-                  currentClip.mediaType == MediaType.video &&
-                  currentClip.videoFile != null)
-              ? _TransitionPreview(
-                  provider: provider,
-                  transition: activeTransition,
-                  clip1: currentClip,
-                  project: provider.currentProject,
-                )
-              : VideoPlayer(
-                  provider.previewController!,
-                  key: ValueKey(provider.previewController),
-                ),
+          child: VideoPlayer(
+            provider.previewController!,
+            key: ValueKey(provider.previewController),
+          ),
         ),
       );
     }
@@ -3311,244 +3480,202 @@ class GridPainter extends CustomPainter {
   bool shouldRepaint(CustomPainter oldDelegate) => false;
 }
 
-class _TransitionPreview extends StatefulWidget {
+class _ResolvedTransitionPreview {
+  final Transition transition;
+  final VideoClip clip1;
+  final VideoClip clip2;
+  final bool isActive;
+
+  const _ResolvedTransitionPreview({
+    required this.transition,
+    required this.clip1,
+    required this.clip2,
+    required this.isActive,
+  });
+}
+
+class _TransitionFrameCacheEntry {
+  Uint8List? clip1FrameBytes;
+  Uint8List? clip2FrameBytes;
+  String? clip1FrameKey;
+  String? clip2FrameKey;
+  bool clip1Loading = false;
+  bool clip2Loading = false;
+  bool clip1Resolved = false;
+  bool clip2Resolved = false;
+
+  bool hasFrameRequest(bool isClip1, String frameKey) {
+    if (isClip1) {
+      return clip1FrameKey == frameKey && (clip1Loading || clip1Resolved);
+    }
+    return clip2FrameKey == frameKey && (clip2Loading || clip2Resolved);
+  }
+
+  bool matchesFrameKey(bool isClip1, String frameKey) {
+    return isClip1 ? clip1FrameKey == frameKey : clip2FrameKey == frameKey;
+  }
+
+  void markLoading(bool isClip1, String frameKey) {
+    if (isClip1) {
+      clip1FrameKey = frameKey;
+      clip1FrameBytes = null;
+      clip1Loading = true;
+      clip1Resolved = false;
+    } else {
+      clip2FrameKey = frameKey;
+      clip2FrameBytes = null;
+      clip2Loading = true;
+      clip2Resolved = false;
+    }
+  }
+
+  void markResolved(bool isClip1, String? frameKey, Uint8List? bytes) {
+    if (isClip1) {
+      clip1FrameKey = frameKey;
+      clip1FrameBytes = bytes;
+      clip1Loading = false;
+      clip1Resolved = true;
+    } else {
+      clip2FrameKey = frameKey;
+      clip2FrameBytes = bytes;
+      clip2Loading = false;
+      clip2Resolved = true;
+    }
+  }
+}
+
+class _TransitionPreview extends StatelessWidget {
   final VideoEditorProvider provider;
   final Transition transition;
   final VideoClip clip1;
-  final VideoProject? project;
+  final VideoClip clip2;
+  final Uint8List? clip1FrameBytes;
+  final Uint8List? clip2FrameBytes;
+  final double progress;
 
   const _TransitionPreview({
     required this.provider,
     required this.transition,
     required this.clip1,
-    required this.project,
+    required this.clip2,
+    required this.clip1FrameBytes,
+    required this.clip2FrameBytes,
+    required this.progress,
   });
 
-  @override
-  State<_TransitionPreview> createState() => _TransitionPreviewState();
-}
-
-class _TransitionPreviewState extends State<_TransitionPreview> {
-  VideoPlayerController? _clip2Controller;
-  String? _clip2Path;
-  VideoClip? _resolvedClip2;
-  // Dedicated controller for when clip2 shares the same file as clip1
-  VideoPlayerController? _dedicatedClip2Controller;
-  bool _usesDedicatedController = false;
-  DateTime? _lastClip2SyncAt;
-
-  @override
-  void initState() {
-    super.initState();
-    _resolveClip2();
-    _ensureClip2Controller();
-  }
-
-  @override
-  void didUpdateWidget(covariant _TransitionPreview oldWidget) {
-    super.didUpdateWidget(oldWidget);
-    if (oldWidget.transition.id != widget.transition.id ||
-        oldWidget.transition.clipId2 != widget.transition.clipId2 ||
-        oldWidget.clip1.id != widget.clip1.id) {
-      _lastClip2SyncAt = null;
-      _resolveClip2();
-      _ensureClip2Controller();
+  String? _playbackPath(VideoClip clip) {
+    if (clip.mediaType != MediaType.video || clip.videoFile == null) {
+      return null;
     }
-  }
-
-  @override
-  void dispose() {
-    // Dispose the dedicated controller if we created one
-    _dedicatedClip2Controller?.dispose();
-    _dedicatedClip2Controller = null;
-    super.dispose();
-  }
-
-  void _resolveClip2() {
-    final project = widget.project;
-    if (project == null) return;
-    try {
-      _resolvedClip2 = project.videoClips
-          .firstWhere((c) => c.id == widget.transition.clipId2);
-    } catch (_) {
-      _resolvedClip2 = null;
+    if (clip.isReversed &&
+        clip.reversedFilePath != null &&
+        File(clip.reversedFilePath!).existsSync()) {
+      return clip.reversedFilePath!;
     }
+    return clip.videoFile!.path;
   }
 
-  Future<void> _ensureClip2Controller() async {
-    final clip2 = _resolvedClip2;
-    if (clip2 == null ||
-        clip2.mediaType != MediaType.video ||
-        clip2.videoFile == null) {
-      return;
+  bool _isProviderShowingClip(VideoClip clip) {
+    final path = _playbackPath(clip);
+    final controller = provider.previewController;
+    return path != null &&
+        provider.activeFilePath == path &&
+        controller != null &&
+        controller.value.isInitialized;
+  }
+
+  bool _clipReady(VideoClip clip, {required bool isClip1}) {
+    if (clip.mediaType == MediaType.image) {
+      return clip.imageFile != null;
+    }
+    if (!isClip1 && _isProviderShowingClip(clip)) return true;
+    return isClip1 ? clip1FrameBytes != null : clip2FrameBytes != null;
+  }
+
+  Widget _buildClipChild(VideoClip clip, {required bool isClip1}) {
+    if (clip.mediaType == MediaType.image && clip.imageFile != null) {
+      return ColoredBox(
+        color: Colors.black,
+        child: Center(
+          child: Image.file(
+            clip.imageFile!,
+            fit: BoxFit.contain,
+            width: double.infinity,
+            height: double.infinity,
+            alignment: Alignment.center,
+            key: ValueKey(clip.id),
+          ),
+        ),
+      );
     }
 
-    final clip2FilePath = clip2.videoFile!.path;
-
-    // Check if clip1 and clip2 share the same video file
-    final clip1FilePath = widget.clip1.videoFile?.path;
-    final sameFile = clip1FilePath != null && clip1FilePath == clip2FilePath;
-
-    if (sameFile) {
-      // Same file: we need a DEDICATED controller for clip2 so it can seek
-      // independently of clip1's controller.
-      if (_clip2Path == clip2FilePath &&
-          _dedicatedClip2Controller != null &&
-          _usesDedicatedController) return;
-
-      // Dispose old dedicated controller if any
-      _dedicatedClip2Controller?.dispose();
-      _dedicatedClip2Controller = null;
-
-      _clip2Path = clip2FilePath;
-      _usesDedicatedController = true;
-
-      try {
-        final controller = VideoPlayerController.file(
-          File(clip2FilePath),
-          videoPlayerOptions: VideoPlayerOptions(mixWithOthers: true),
-        );
-        await controller.initialize();
-        await controller.setVolume(0.0);
-        await controller.seekTo(clip2.sourceStart);
-        await controller.pause();
-        _dedicatedClip2Controller = controller;
-        if (!mounted) {
-          controller.dispose();
-          return;
-        }
-        setState(() {
-          _clip2Controller = controller;
-        });
-      } catch (e) {
-        // Fallback to shared controller
-        _usesDedicatedController = false;
-        final controller =
-            await widget.provider.ensurePreviewController(clip2FilePath);
-        if (!mounted) return;
-        setState(() {
-          _clip2Controller = controller;
-        });
+    if (!isClip1 && clip.mediaType == MediaType.video) {
+      final controller = provider.previewController;
+      if (_isProviderShowingClip(clip) && controller != null) {
+        return _buildVideoPlayer(controller);
       }
-    } else {
-      // Different files: safe to use the shared cached controller
-      if (_clip2Path == clip2FilePath &&
-          _clip2Controller != null &&
-          !_usesDedicatedController) return;
-
-      // Dispose old dedicated controller if switching from same-file to different-file
-      _dedicatedClip2Controller?.dispose();
-      _dedicatedClip2Controller = null;
-      _usesDedicatedController = false;
-
-      _clip2Path = clip2FilePath;
-      final controller =
-          await widget.provider.ensurePreviewController(clip2FilePath);
-      if (!mounted) return;
-      setState(() {
-        _clip2Controller = controller;
-      });
     }
+
+    final bytes = isClip1 ? clip1FrameBytes : clip2FrameBytes;
+    if (clip.mediaType == MediaType.video && bytes != null) {
+      return ColoredBox(
+        color: Colors.black,
+        child: Center(
+          child: Image.memory(
+            bytes,
+            fit: BoxFit.contain,
+            width: double.infinity,
+            height: double.infinity,
+            alignment: Alignment.center,
+            gaplessPlayback: true,
+          ),
+        ),
+      );
+    }
+
+    return Container(color: AppColors.background);
   }
 
-  Duration _clip2TransitionTarget(
-    VideoClip clip2,
-    VideoPlayerController controller,
-  ) {
-    final elapsed =
-        widget.provider.currentPosition - widget.transition.startTime;
-    var target = clip2.sourceStart + elapsed;
-    if (target < clip2.sourceStart) target = clip2.sourceStart;
-
-    final clipEnd = clip2.sourceEnd;
-    if (clipEnd > clip2.sourceStart && target >= clipEnd) {
-      target = clipEnd - const Duration(milliseconds: 1);
-    }
-
-    final videoDuration = controller.value.duration;
-    if (videoDuration <= Duration.zero || target <= Duration.zero) {
-      return Duration.zero;
-    }
-    const frameEps = Duration(milliseconds: 1);
-    final lastFrame =
-        videoDuration > frameEps ? videoDuration - frameEps : Duration.zero;
-    if (target >= videoDuration) return lastFrame;
-    return target;
-  }
-
-  Future<void> _syncClip2ToTransition(
-    VideoPlayerController controller,
-  ) async {
-    final clip2 = _resolvedClip2;
-    if (clip2 == null || !controller.value.isInitialized) return;
-
-    if (!widget.provider.isPlaying && controller.value.isPlaying) {
-      await controller.pause();
-      return;
-    }
-
-    final now = DateTime.now();
-    if (_lastClip2SyncAt != null &&
-        now.difference(_lastClip2SyncAt!) < const Duration(milliseconds: 16)) {
-      return;
-    }
-    _lastClip2SyncAt = now;
-
-    final target = _clip2TransitionTarget(clip2, controller);
-    final driftMs = (controller.value.position - target).inMilliseconds.abs();
-    if (driftMs > 140) {
-      await controller.seekTo(target);
-    }
-    await controller.setVolume(0.0);
-    if (clip2.playbackSpeed != controller.value.playbackSpeed) {
-      await controller.setPlaybackSpeed(clip2.playbackSpeed);
-    }
-
-    if (widget.provider.isPlaying) {
-      if (!controller.value.isPlaying) {
-        await controller.play();
+  Widget _buildVideoPlayer(VideoPlayerController controller) {
+    if (controller.value.isInitialized) {
+      var aspectRatio = controller.value.aspectRatio;
+      final rotationDeg = controller.value.rotationCorrection;
+      if ((rotationDeg % 180) != 0) {
+        aspectRatio = 1 / aspectRatio;
       }
-    } else if (controller.value.isPlaying) {
-      await controller.pause();
+      return ColoredBox(
+        color: Colors.black,
+        child: Center(
+          child: AspectRatio(
+            aspectRatio: aspectRatio,
+            child: VideoPlayer(controller, key: ValueKey(controller)),
+          ),
+        ),
+      );
     }
+    return Container(color: AppColors.background);
   }
 
   @override
   Widget build(BuildContext context) {
-    final c1 = widget.provider.previewController; // currently playing clip1
-    final c2 = _clip2Controller; // clip2 controller (dedicated or shared)
-
-    if (c1 == null || !c1.value.isInitialized) {
-      return Container(color: AppColors.background);
-    }
-    if (c2 == null || !c2.value.isInitialized) {
-      return RepaintBoundary(
-        child: VideoPlayer(c1, key: ValueKey(c1)),
-      );
-    }
-    unawaited(_syncClip2ToTransition(c2));
-
-    // Calculate normalised progress t ∈ [0, 1]
-    final now = widget.provider.currentPosition;
-    final start = widget.transition.startTime;
-    final dur = widget.transition.duration;
-    final linearT = dur.inMilliseconds <= 0
-        ? 1.0
-        : ((now - start).inMilliseconds / dur.inMilliseconds);
-
-    // Wrap video players in RepaintBoundary to reduce repaint cost
     final childA = RepaintBoundary(
-      child: VideoPlayer(c1, key: ValueKey(c1)),
+      child: _buildClipChild(clip1, isClip1: true),
     );
     final childB = RepaintBoundary(
-      child: VideoPlayer(c2, key: ValueKey(c2)),
+      child: _buildClipChild(clip2, isClip1: false),
     );
+
+    final aReady = _clipReady(clip1, isClip1: true);
+    final bReady = _clipReady(clip2, isClip1: false);
+    if (!aReady || !bReady) {
+      return aReady ? childA : Container(color: AppColors.background);
+    }
 
     // Delegate to the modular transition engine.
     // The factory applies easeInOut by default for smooth 60 FPS playback.
     return TransitionFactory.buildWithCurve(
-      type: widget.transition.type,
-      linearT: linearT,
+      type: transition.type,
+      linearT: progress,
       childA: childA,
       childB: childB,
       curve: Curves.easeInOut,

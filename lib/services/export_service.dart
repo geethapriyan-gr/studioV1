@@ -511,7 +511,7 @@ class ExportService {
 
     // Background: scale to fill the full canvas
     parts.add('[1:v]scale=w=$targetWidth:h=$targetHeight'
-        ':force_original_aspect_ratio=cover'
+        ':force_original_aspect_ratio=increase'
         ',crop=$targetWidth:$targetHeight[ck_bg]');
 
     // Composite: background under keyed foreground, then convert to yuv420p
