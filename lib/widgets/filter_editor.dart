@@ -127,11 +127,38 @@ class _FilterEditorState extends State<FilterEditor> {
   Widget build(BuildContext context) {
     return Consumer<VideoEditorProvider>(
       builder: (context, provider, child) {
+        final selectedClipId = provider.selectedVideoClipId;
+        if (selectedClipId == null) {
+          return Container(
+            color: AppColors.surface,
+            padding: const EdgeInsets.symmetric(vertical: 36, horizontal: 16),
+            child: const Center(
+              child: Column(
+                mainAxisSize: MainAxisSize.min,
+                children: [
+                  Icon(
+                    Icons.touch_app_outlined,
+                    color: AppColors.textTertiary,
+                    size: 32,
+                  ),
+                  SizedBox(height: 12),
+                  Text(
+                    'Select a clip first',
+                    style: TextStyle(
+                      color: AppColors.textSecondary,
+                      fontSize: 14,
+                      fontWeight: FontWeight.w500,
+                    ),
+                  ),
+                ],
+              ),
+            ),
+          );
+        }
+
         if (provider.currentProject != null) {
           // Read per-clip filter if a clip is selected, otherwise default
-          final selectedClipId = provider.selectedVideoClipId;
-          if (selectedClipId != null &&
-              provider.clipColorFilters.containsKey(selectedClipId)) {
+          if (provider.clipColorFilters.containsKey(selectedClipId)) {
             _currentFilter = provider.clipColorFilters[selectedClipId]!;
           } else {
             _currentFilter = const ColorFilter();

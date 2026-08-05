@@ -452,23 +452,71 @@ class _VideoEditorScreenState extends State<VideoEditorScreen>
     final hasProject = context.select<VideoEditorProvider, bool>(
       (provider) => provider.hasProject,
     );
+    final isReversing = context.select<VideoEditorProvider, bool>(
+      (provider) => provider.isReversing,
+    );
     final isLandscape =
         MediaQuery.of(context).orientation == Orientation.landscape;
 
-    return Scaffold(
-      backgroundColor: Colors.transparent,
-      resizeToAvoidBottomInset: false,
-      appBar: isLandscape || !hasProject ? null : _buildAppBar(),
-      body: _buildScreenBackground(
-        Consumer<VideoEditorProvider>(
-          builder: (context, provider, child) {
-            if (!provider.hasProject) {
-              return _buildWelcomeView();
-            }
-            return _buildEditorView(provider, isLandscape);
-          },
+    return Stack(
+      children: [
+        Scaffold(
+          backgroundColor: Colors.transparent,
+          resizeToAvoidBottomInset: false,
+          appBar: isLandscape || !hasProject ? null : _buildAppBar(),
+          body: _buildScreenBackground(
+            Consumer<VideoEditorProvider>(
+              builder: (context, provider, child) {
+                if (!provider.hasProject) {
+                  return _buildWelcomeView();
+                }
+                return _buildEditorView(provider, isLandscape);
+              },
+            ),
+          ),
         ),
-      ),
+        if (isReversing)
+          Positioned.fill(
+            child: GestureDetector(
+              onTap: () {}, // Blocks interactions
+              behavior: HitTestBehavior.opaque,
+              child: Container(
+                color: Colors.black.withOpacity(0.65),
+                child: const Center(
+                  child: Column(
+                    mainAxisAlignment: MainAxisAlignment.center,
+                    children: [
+                      CircularProgressIndicator(
+                        color: AppColors.primary,
+                        strokeWidth: 3,
+                      ),
+                      SizedBox(height: 20),
+                      Text(
+                        'Reversing Video...',
+                        style: TextStyle(
+                          color: Colors.white,
+                          fontSize: 16,
+                          fontWeight: FontWeight.w600,
+                          decoration: TextDecoration.none,
+                        ),
+                      ),
+                      SizedBox(height: 8),
+                      Text(
+                        'Please wait, applying effect',
+                        style: TextStyle(
+                          color: Colors.white70,
+                          fontSize: 13,
+                          fontWeight: FontWeight.w400,
+                          decoration: TextDecoration.none,
+                        ),
+                      ),
+                    ],
+                  ),
+                ),
+              ),
+            ),
+          ),
+      ],
     );
   }
 
@@ -509,6 +557,10 @@ class _VideoEditorScreenState extends State<VideoEditorScreen>
                     );
                   }
                 },
+              ),
+              _buildCompactIconButton(
+                icon: Icons.equalizer_outlined,
+                onPressed: () => TimelineWidget.showMixerDialog(context, provider),
               ),
             ],
           );
@@ -1362,8 +1414,6 @@ class _VideoEditorScreenState extends State<VideoEditorScreen>
                         child: _buildPlaybackControls(provider),
                       ),
                     ),
-                    // Tool Bar
-                    _buildToolBar(provider),
                     // Panel Content
                     Expanded(
                       child: (provider.showTimeline ||
@@ -1378,6 +1428,8 @@ class _VideoEditorScreenState extends State<VideoEditorScreen>
                           ? _buildBottomPanel(provider)
                           : const SizedBox.shrink(),
                     ),
+                    // Tool Bar
+                    _buildToolBar(provider),
                   ],
                 ),
               ),
@@ -1424,114 +1476,119 @@ class _VideoEditorScreenState extends State<VideoEditorScreen>
   }
 
   Widget _buildToolBar(VideoEditorProvider provider) {
-    return Container(
-      height: 44,
-      padding: const EdgeInsets.symmetric(horizontal: 8),
-      child: SingleChildScrollView(
-        scrollDirection: Axis.horizontal,
-        child: Row(
-          mainAxisSize: MainAxisSize.min,
-          children: [
-            _buildToolButton(
-              icon: provider.showTimeline
-                  ? Icons.timeline
-                  : Icons.timeline_outlined,
-              isActive: provider.showTimeline,
-              onPressed: provider.toggleTimeline,
-            ),
-            _buildToolButton(
-              icon: provider.showFilters ? Icons.tune : Icons.tune_outlined,
-              isActive: provider.showFilters,
-              onPressed: provider.toggleFilters,
-            ),
-            _buildToolButton(
-              icon: provider.showTextEditor
-                  ? Icons.text_fields
-                  : Icons.text_fields_outlined,
-              isActive: provider.showTextEditor,
-              onPressed: provider.toggleTextEditor,
-            ),
-            _buildToolButton(
-              icon: provider.showAudioEditor
-                  ? Icons.audiotrack
-                  : Icons.audiotrack_outlined,
-              isActive: provider.showAudioEditor,
-              onPressed: provider.toggleAudioEditor,
-            ),
-            _buildToolButton(
-              icon: provider.showStickerPanel
-                  ? Icons.emoji_emotions
-                  : Icons.emoji_emotions_outlined,
-              isActive: provider.showStickerPanel,
-              onPressed: provider.toggleStickerPanel,
-            ),
-            _buildToolButton(
-              icon: provider.showCropEditor ? Icons.crop : Icons.crop_outlined,
-              isActive: provider.showCropEditor,
-              onPressed: () {
-                if (provider.selectedVideoClipId == null) {
-                  ScaffoldMessenger.of(context).showSnackBar(
-                    const SnackBar(content: Text('Select a clip first')),
-                  );
-                  return;
-                }
-                provider.toggleCropEditor();
-              },
-            ),
-            _buildToolButton(
-              icon: provider.selectedVideoClipId != null &&
-                      provider.currentProject!.videoClips.any((c) =>
-                          c.id == provider.selectedVideoClipId && c.isReversed)
-                  ? Icons.replay
-                  : Icons.replay_outlined,
-              isActive: provider.selectedVideoClipId != null &&
-                  provider.currentProject!.videoClips.any((c) =>
-                      c.id == provider.selectedVideoClipId && c.isReversed),
-              onPressed: provider.selectedVideoClipId != null
-                  ? () => provider
-                      .toggleVideoClipReverse(provider.selectedVideoClipId!)
-                  : null,
-            ),
-            const SizedBox(width: 4),
-            _buildTrimButton(provider),
-            const SizedBox(width: 4),
-            _buildChromaKeyButton(provider),
-          ],
+    return SafeArea(
+      top: false,
+      left: false,
+      right: false,
+      bottom: true,
+      child: Container(
+        height: 84,
+        decoration: const BoxDecoration(
+          color: AppColors.surface,
+          border: Border(top: BorderSide(color: AppColors.border, width: 1)),
+        ),
+        child: SingleChildScrollView(
+          scrollDirection: Axis.horizontal,
+          padding: const EdgeInsets.symmetric(horizontal: 10, vertical: 8),
+          child: Row(
+            mainAxisSize: MainAxisSize.min,
+            crossAxisAlignment: CrossAxisAlignment.center,
+            children: [
+              _buildToolButton(
+                icon: provider.showTimeline
+                    ? Icons.timeline
+                    : Icons.timeline_outlined,
+                label: 'Timeline',
+                isActive: provider.showTimeline,
+                onPressed: provider.toggleTimeline,
+              ),
+              const SizedBox(width: 6),
+              _buildToolButton(
+                icon: provider.showFilters ? Icons.tune : Icons.tune_outlined,
+                label: 'Filter',
+                isActive: provider.showFilters,
+                onPressed: provider.toggleFilters,
+              ),
+              const SizedBox(width: 6),
+              _buildToolButton(
+                icon: provider.showTextEditor
+                    ? Icons.text_fields
+                    : Icons.text_fields_outlined,
+                label: 'Text',
+                isActive: provider.showTextEditor,
+                onPressed: provider.toggleTextEditor,
+              ),
+              const SizedBox(width: 6),
+              _buildToolButton(
+                icon: provider.showAudioEditor
+                    ? Icons.audiotrack
+                    : Icons.audiotrack_outlined,
+                label: 'Music',
+                isActive: provider.showAudioEditor,
+                onPressed: provider.toggleAudioEditor,
+              ),
+              const SizedBox(width: 6),
+              _buildToolButton(
+                icon: provider.showStickerPanel
+                    ? Icons.emoji_emotions
+                    : Icons.emoji_emotions_outlined,
+                label: 'Sticker',
+                isActive: provider.showStickerPanel,
+                onPressed: provider.toggleStickerPanel,
+              ),
+              const SizedBox(width: 6),
+              _buildToolButton(
+                icon: provider.showCropEditor ? Icons.crop : Icons.crop_outlined,
+                label: 'Crop',
+                isActive: provider.showCropEditor,
+                onPressed: () {
+                  if (provider.selectedVideoClipId == null) {
+                    ScaffoldMessenger.of(context).showSnackBar(
+                      const SnackBar(content: Text('Select a clip first')),
+                    );
+                    return;
+                  }
+                  provider.toggleCropEditor();
+                },
+              ),
+              const SizedBox(width: 6),
+              _buildToolButton(
+                icon: provider.selectedVideoClipId != null &&
+                        provider.currentProject!.videoClips.any((c) =>
+                            c.id == provider.selectedVideoClipId && c.isReversed)
+                    ? Icons.replay
+                    : Icons.replay_outlined,
+                label: 'Reverse',
+                isActive: provider.selectedVideoClipId != null &&
+                    provider.currentProject!.videoClips.any((c) =>
+                        c.id == provider.selectedVideoClipId && c.isReversed),
+                onPressed: provider.selectedVideoClipId != null
+                    ? () => provider
+                        .toggleVideoClipReverse(provider.selectedVideoClipId!)
+                    : null,
+              ),
+              const SizedBox(width: 6),
+              _buildTrimButton(provider),
+              const SizedBox(width: 6),
+              _buildChromaKeyButton(provider),
+            ],
+          ),
         ),
       ),
     );
   }
 
   Widget _buildChromaKeyButton(VideoEditorProvider provider) {
-    return IconButton(
-      icon: Stack(
-        children: [
-          Icon(
-            provider.editorPanelMode == EditorPanelMode.chromaKey
-                ? Icons.filter_vintage
-                : Icons.filter_vintage_outlined,
-            size: 20,
-            color: provider.editorPanelMode == EditorPanelMode.chromaKey
-                ? AppColors.primary
-                : AppColors.textSecondary,
-          ),
-          // Badge for enabled chroma key
-          if (provider.isChromaKeyEnabled)
-            Positioned(
-              right: 0,
-              top: 0,
-              child: Container(
-                width: 8,
-                height: 8,
-                decoration: const BoxDecoration(
-                  color: Colors.green,
-                  shape: BoxShape.circle,
-                ),
-              ),
-            ),
-        ],
-      ),
-      onPressed: () {
+    final isActive = provider.editorPanelMode == EditorPanelMode.chromaKey;
+    final iconColor = isActive ? AppColors.primary : AppColors.textSecondary;
+    final bgColor = isActive
+        ? AppColors.primary.withOpacity(0.12)
+        : AppColors.surfaceLight;
+    final borderColor =
+        isActive ? AppColors.primary.withOpacity(0.5) : AppColors.border;
+
+    return GestureDetector(
+      onTap: () {
         print('DEBUG: Chroma key button pressed');
         print('DEBUG: selectedVideoClipId = ${provider.selectedVideoClipId}');
         if (provider.selectedVideoClipId == null) {
@@ -1546,8 +1603,55 @@ class _VideoEditorScreenState extends State<VideoEditorScreen>
         print(
             'DEBUG: After toggleChromaKeyEditor, editorPanelMode = ${provider.editorPanelMode}');
       },
-      padding: const EdgeInsets.all(8),
-      constraints: const BoxConstraints(minWidth: 40, minHeight: 40),
+      child: Container(
+        width: 64,
+        height: 64,
+        decoration: BoxDecoration(
+          color: bgColor,
+          borderRadius: BorderRadius.circular(10),
+          border: Border.all(color: borderColor, width: 1),
+        ),
+        child: Column(
+          mainAxisAlignment: MainAxisAlignment.center,
+          children: [
+            Stack(
+              clipBehavior: Clip.none,
+              children: [
+                Icon(
+                  isActive
+                      ? Icons.filter_vintage
+                      : Icons.filter_vintage_outlined,
+                  size: 22,
+                  color: iconColor,
+                ),
+                if (provider.isChromaKeyEnabled)
+                  Positioned(
+                    right: -3,
+                    top: -3,
+                    child: Container(
+                      width: 7,
+                      height: 7,
+                      decoration: const BoxDecoration(
+                        color: Colors.green,
+                        shape: BoxShape.circle,
+                      ),
+                    ),
+                  ),
+              ],
+            ),
+            const SizedBox(height: 4),
+            Text(
+              'Chroma',
+              style: TextStyle(
+                color: iconColor,
+                fontSize: 11,
+                fontWeight: isActive ? FontWeight.w600 : FontWeight.w400,
+                letterSpacing: 0.2,
+              ),
+            ),
+          ],
+        ),
+      ),
     );
   }
 
@@ -1610,36 +1714,78 @@ class _VideoEditorScreenState extends State<VideoEditorScreen>
         borderRadius: BorderRadius.circular(8),
         side: const BorderSide(color: AppColors.border),
       ),
-      child: Container(
-        padding: const EdgeInsets.all(8),
-        child: Icon(
-          provider.showTrimEditor
-              ? Icons.content_cut
-              : Icons.content_cut_outlined,
-          size: 20,
-          color: provider.showTrimEditor
-              ? AppColors.primary
-              : AppColors.textSecondary,
-        ),
+      child: _buildPremiumToolBox(
+        icon: provider.showTrimEditor
+            ? Icons.content_cut
+            : Icons.content_cut_outlined,
+        label: 'Trim',
+        isActive: provider.showTrimEditor,
+        isEnabled: true,
       ),
     );
   }
 
   Widget _buildToolButton({
     required IconData icon,
+    required String label,
     bool isActive = false,
     required VoidCallback? onPressed,
   }) {
-    return IconButton(
-      icon: Icon(icon, size: 20),
-      onPressed: onPressed,
-      padding: const EdgeInsets.all(8),
-      constraints: const BoxConstraints(minWidth: 40, minHeight: 40),
-      color: isActive
-          ? AppColors.primary
-          : (onPressed == null
-              ? AppColors.textTertiary
-              : AppColors.textSecondary),
+    return _buildPremiumToolBox(
+      icon: icon,
+      label: label,
+      isActive: isActive,
+      isEnabled: onPressed != null,
+      onTap: onPressed,
+    );
+  }
+
+  Widget _buildPremiumToolBox({
+    required IconData icon,
+    required String label,
+    bool isActive = false,
+    bool isEnabled = true,
+    VoidCallback? onTap,
+  }) {
+    final iconColor = isActive
+        ? AppColors.primary
+        : isEnabled
+            ? AppColors.textSecondary
+            : AppColors.textTertiary;
+    final bgColor = isActive
+        ? AppColors.primary.withOpacity(0.12)
+        : AppColors.surfaceLight;
+    final borderColor = isActive
+        ? AppColors.primary.withOpacity(0.5)
+        : AppColors.border;
+
+    return GestureDetector(
+      onTap: onTap,
+      child: Container(
+        width: 64,
+        height: 64,
+        decoration: BoxDecoration(
+          color: bgColor,
+          borderRadius: BorderRadius.circular(10),
+          border: Border.all(color: borderColor, width: 1),
+        ),
+        child: Column(
+          mainAxisAlignment: MainAxisAlignment.center,
+          children: [
+            Icon(icon, size: 22, color: iconColor),
+            const SizedBox(height: 4),
+            Text(
+              label,
+              style: TextStyle(
+                color: iconColor,
+                fontSize: 11,
+                fontWeight: isActive ? FontWeight.w600 : FontWeight.w400,
+                letterSpacing: 0.2,
+              ),
+            ),
+          ],
+        ),
+      ),
     );
   }
 
@@ -1655,11 +1801,11 @@ class _VideoEditorScreenState extends State<VideoEditorScreen>
                   ? Icons.pause_rounded
                   : Icons.play_arrow_rounded,
               color: AppColors.textPrimary,
-              size: 16,
+              size: 22,
             ),
             onPressed: provider.togglePlayback,
             padding: const EdgeInsets.all(4),
-            constraints: const BoxConstraints(minWidth: 28, minHeight: 28),
+            constraints: const BoxConstraints(minWidth: 36, minHeight: 36),
           ),
           Text(
             _formatDuration(provider.currentPosition),

@@ -209,6 +209,7 @@ class _TextOverlayEditorState extends State<TextOverlayEditor> {
                           _updateSelectedOverlay(provider);
                           provider.selectTextOverlay(null);
                           FocusScope.of(context).unfocus();
+                          provider.toggleTimeline();
                         },
                       ),
                       const SizedBox(width: 6),
@@ -561,6 +562,7 @@ class _TextOverlayEditorState extends State<TextOverlayEditor> {
     );
     _textController.clear();
     provider.clearTextPreview();
+    provider.toggleTimeline();
   }
 
   Future<void> _updateSelectedOverlay(VideoEditorProvider provider) async {

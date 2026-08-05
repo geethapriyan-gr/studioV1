@@ -22,6 +22,104 @@ class OverlayClipDragData {
 class TimelineWidget extends StatefulWidget {
   const TimelineWidget({super.key});
 
+  static void showMixerDialog(BuildContext context, VideoEditorProvider provider) {
+    final dialogWidth = math.min(ResponsiveUtil.screenWidth * 0.85, 320.0);
+    showDialog(
+      context: context,
+      builder: (context) {
+        double videoVol = provider.videoMasterVolume;
+        double audioVol = provider.audioMasterVolume;
+        return StatefulBuilder(
+          builder: (context, setState) {
+            return AlertDialog(
+              backgroundColor: AppColors.surface,
+              shape: RoundedRectangleBorder(
+                borderRadius: BorderRadius.circular(12),
+                side: const BorderSide(color: AppColors.border),
+              ),
+              title: const Text('Audio Mixer',
+                  style: TextStyle(color: AppColors.textPrimary)),
+              content: SizedBox(
+                width: dialogWidth,
+                child: Column(
+                  mainAxisSize: MainAxisSize.min,
+                  children: [
+                    _buildMixerSlider(
+                      label: 'Video Master',
+                      value: videoVol,
+                      onChanged: (v) {
+                        setState(() => videoVol = v);
+                        provider.setVideoMasterVolume(v);
+                      },
+                    ),
+                    SizedBox(height: ResponsiveUtil.spacingLarge),
+                    _buildMixerSlider(
+                      label: 'Audio Master',
+                      value: audioVol,
+                      onChanged: (v) {
+                        setState(() => audioVol = v);
+                        provider.setAudioMasterVolume(v);
+                      },
+                    ),
+                  ],
+                ),
+              ),
+              actions: [
+                TextButton(
+                  onPressed: () => Navigator.of(context).pop(),
+                  child: const Text('Close'),
+                ),
+              ],
+            );
+          },
+        );
+      },
+    );
+  }
+
+  static Widget _buildMixerSlider({
+    required String label,
+    required double value,
+    required ValueChanged<double> onChanged,
+  }) {
+    return Column(
+      crossAxisAlignment: CrossAxisAlignment.start,
+      children: [
+        Row(
+          mainAxisAlignment: MainAxisAlignment.spaceBetween,
+          children: [
+            Text(label,
+                style: TextStyle(
+                    color: AppColors.textPrimary,
+                    fontWeight: FontWeight.w500,
+                    fontSize: ResponsiveUtil.fontSizeSmall)),
+            Text('${(value * 100).round()}%',
+                style: TextStyle(
+                    color: AppColors.textSecondary,
+                    fontSize: ResponsiveUtil.fontSizeTiny)),
+          ],
+        ),
+        SizedBox(height: ResponsiveUtil.spacingMedium),
+        SliderTheme(
+          data: SliderThemeData(
+            trackHeight: 3,
+            activeTrackColor: AppColors.primary,
+            inactiveTrackColor: AppColors.border,
+            thumbColor: AppColors.textPrimary,
+            overlayColor: AppColors.primary.withOpacity(0.15),
+          ),
+          child: Slider(
+            value: value.clamp(0.0, 1.0),
+            onChanged: onChanged,
+            min: 0.0,
+            max: 1.0,
+            divisions: 100,
+          ),
+        ),
+      ],
+    );
+  }
+
   @override
   State<TimelineWidget> createState() => _TimelineWidgetState();
 }
@@ -34,6 +132,7 @@ class _TimelineWidgetState extends State<TimelineWidget>
   final GlobalKey _timelineContentKey = GlobalKey();
   final GlobalKey _videoTrackKey = GlobalKey();
   final GlobalKey _textTrackKey = GlobalKey();
+  final GlobalKey _stickerTrackKey = GlobalKey();
 
   // Centered playhead state
   double _viewportWidth = 0;
@@ -329,104 +428,6 @@ class _TimelineWidgetState extends State<TimelineWidget>
     }
   }
 
-  void _showMixerDialog(BuildContext context, VideoEditorProvider provider) {
-    final dialogWidth = math.min(ResponsiveUtil.screenWidth * 0.85, 320.0);
-    showDialog(
-      context: context,
-      builder: (context) {
-        double videoVol = provider.videoMasterVolume;
-        double audioVol = provider.audioMasterVolume;
-        return StatefulBuilder(
-          builder: (context, setState) {
-            return AlertDialog(
-              backgroundColor: AppColors.surface,
-              shape: RoundedRectangleBorder(
-                borderRadius: BorderRadius.circular(12),
-                side: const BorderSide(color: AppColors.border),
-              ),
-              title: const Text('Audio Mixer',
-                  style: TextStyle(color: AppColors.textPrimary)),
-              content: SizedBox(
-                width: dialogWidth,
-                child: Column(
-                  mainAxisSize: MainAxisSize.min,
-                  children: [
-                    _buildMixerSlider(
-                      label: 'Video Master',
-                      value: videoVol,
-                      onChanged: (v) {
-                        setState(() => videoVol = v);
-                        provider.setVideoMasterVolume(v);
-                      },
-                    ),
-                    SizedBox(height: ResponsiveUtil.spacingLarge),
-                    _buildMixerSlider(
-                      label: 'Audio Master',
-                      value: audioVol,
-                      onChanged: (v) {
-                        setState(() => audioVol = v);
-                        provider.setAudioMasterVolume(v);
-                      },
-                    ),
-                  ],
-                ),
-              ),
-              actions: [
-                TextButton(
-                  onPressed: () => Navigator.of(context).pop(),
-                  child: const Text('Close'),
-                ),
-              ],
-            );
-          },
-        );
-      },
-    );
-  }
-
-  Widget _buildMixerSlider({
-    required String label,
-    required double value,
-    required ValueChanged<double> onChanged,
-  }) {
-    return Column(
-      crossAxisAlignment: CrossAxisAlignment.start,
-      children: [
-        Row(
-          mainAxisAlignment: MainAxisAlignment.spaceBetween,
-          children: [
-            Text(label,
-                style: TextStyle(
-                    color: AppColors.textPrimary,
-                    fontWeight: FontWeight.w500,
-                    fontSize: ResponsiveUtil.fontSizeSmall)),
-            Text('${(value * 100).round()}%',
-                style: TextStyle(
-                    color: AppColors.textSecondary,
-                    fontSize: ResponsiveUtil.fontSizeTiny)),
-          ],
-        ),
-        SizedBox(height: ResponsiveUtil.spacingMedium),
-        SliderTheme(
-          data: SliderThemeData(
-            trackHeight: 3,
-            activeTrackColor: AppColors.primary,
-            inactiveTrackColor: AppColors.border,
-            thumbColor: AppColors.textPrimary,
-            overlayColor: AppColors.primary.withOpacity(0.15),
-          ),
-          child: Slider(
-            value: value.clamp(0.0, 1.0),
-            onChanged: onChanged,
-            min: 0.0,
-            max: 1.0,
-            divisions: 100,
-          ),
-        ),
-      ],
-    );
-  }
-
   @override
   Widget build(BuildContext context) {
     return Consumer<VideoEditorProvider>(
@@ -457,7 +458,7 @@ class _TimelineWidgetState extends State<TimelineWidget>
 
             return Column(
               children: [
-                if (showHeader) _buildTimelineHeader(provider),
+                if (!isCompact) _buildTimelineControls(provider),
                 Expanded(
                   child: Listener(
                     onPointerDown: _onPointerDown,
@@ -503,11 +504,35 @@ class _TimelineWidgetState extends State<TimelineWidget>
                                               i < provider.overlayTrackCount;
                                               i++)
                                             _buildOverlayTrack(provider, i),
+                                          // Spacer for "+ Overlay" button row
+                                          Container(
+                                            height: _trackHeight,
+                                            decoration: BoxDecoration(
+                                              border: Border(
+                                                bottom: BorderSide(
+                                                    color: AppColors.border
+                                                        .withOpacity(0.5),
+                                                    width: 1),
+                                              ),
+                                            ),
+                                          ),
                                           for (int i = 0;
                                               i < provider.audioTrackCount;
                                               i++)
                                             _buildAudioOverlayTrack(
                                                 provider, i),
+                                          // Spacer for "+ Music" button row
+                                          Container(
+                                            height: _trackHeight,
+                                            decoration: BoxDecoration(
+                                              border: Border(
+                                                bottom: BorderSide(
+                                                    color: AppColors.border
+                                                        .withOpacity(0.5),
+                                                    width: 1),
+                                              ),
+                                            ),
+                                          ),
                                         ],
                                       ),
                                     ),
@@ -529,7 +554,6 @@ class _TimelineWidgetState extends State<TimelineWidget>
                     ),
                   ),
                 ),
-                if (!isCompact) _buildTimelineControls(provider),
               ],
             );
           },
@@ -587,124 +611,16 @@ class _TimelineWidgetState extends State<TimelineWidget>
         color: AppColors.surface,
         border: Border(bottom: BorderSide(color: AppColors.border, width: 1)),
       ),
-      child: SingleChildScrollView(
-        scrollDirection: Axis.horizontal,
-        child: Row(
-          mainAxisSize: MainAxisSize.min,
-          children: [
-            Padding(
-              padding: EdgeInsets.symmetric(
-                  horizontal: ResponsiveUtil.paddingMedium),
-              child: Text(
-                'Timeline',
-                style: TextStyle(
-                  color: AppColors.textPrimary,
-                  fontSize: ResponsiveUtil.fontSizeSmall,
-                  fontWeight: FontWeight.w600,
-                ),
-              ),
-            ),
-            SizedBox(width: ResponsiveUtil.spacingMedium),
-            _buildAddNewOverlayTimelineButton(provider),
-            SizedBox(width: ResponsiveUtil.spacingMedium),
-            _buildAddNewAudioTimelineButton(provider),
-            SizedBox(width: ResponsiveUtil.spacingMedium),
-            _buildHeaderIconButton(
-              icon: Icons.equalizer_outlined,
-              onPressed: () => _showMixerDialog(context, provider),
-              tooltip: 'Mixer',
-            ),
-            SizedBox(width: ResponsiveUtil.spacingSmall),
-          ],
-        ),
-      ),
-    );
-  }
-
-  Widget _buildHeaderIconButton({
-    required IconData icon,
-    required VoidCallback onPressed,
-    required String tooltip,
-  }) {
-    return IconButton(
-      icon: Icon(icon, size: ResponsiveUtil.iconSizeNormal),
-      onPressed: onPressed,
-      tooltip: tooltip,
-      padding: EdgeInsets.all(ResponsiveUtil.paddingSmall),
-      constraints: BoxConstraints(
-          minWidth: ResponsiveUtil.minTouchTarget,
-          minHeight: ResponsiveUtil.minTouchTarget),
-      color: AppColors.textSecondary,
-    );
-  }
-
-  Widget _buildAddNewOverlayTimelineButton(VideoEditorProvider provider) {
-    return Material(
-      color: Colors.transparent,
-      child: InkWell(
-        onTap: () => provider.addOverlayTrack(),
-        borderRadius: BorderRadius.circular(16),
-        child: Container(
-          padding: EdgeInsets.symmetric(
-              horizontal: ResponsiveUtil.paddingSmall,
-              vertical: ResponsiveUtil.spacingSmall),
-          decoration: BoxDecoration(
-            color: AppColors.primary.withOpacity(0.12),
-            borderRadius: BorderRadius.circular(16),
-            border: Border.all(color: AppColors.primary.withOpacity(0.28)),
-          ),
-          child: Row(
-            mainAxisSize: MainAxisSize.min,
-            children: [
-              Icon(Icons.add_to_photos,
-                  color: AppColors.primary, size: ResponsiveUtil.iconSizeSmall),
-              SizedBox(width: ResponsiveUtil.spacingSmall),
-              Text(
-                'Add New Overlay Timeline',
-                style: TextStyle(
-                  color: AppColors.primary,
-                  fontSize: ResponsiveUtil.fontSizeTiny,
-                  fontWeight: FontWeight.w600,
-                ),
-              ),
-            ],
-          ),
-        ),
-      ),
-    );
-  }
-
-  Widget _buildAddNewAudioTimelineButton(VideoEditorProvider provider) {
-    return Material(
-      color: Colors.transparent,
-      child: InkWell(
-        onTap: () => provider.addAudioTrack(),
-        borderRadius: BorderRadius.circular(16),
-        child: Container(
-          padding: EdgeInsets.symmetric(
-              horizontal: ResponsiveUtil.paddingSmall,
-              vertical: ResponsiveUtil.spacingSmall),
-          decoration: BoxDecoration(
-            color: AppColors.audioTrack.withOpacity(0.12),
-            borderRadius: BorderRadius.circular(16),
-            border: Border.all(color: AppColors.audioTrack.withOpacity(0.28)),
-          ),
-          child: Row(
-            mainAxisSize: MainAxisSize.min,
-            children: [
-              Icon(Icons.queue_music,
-                  color: AppColors.audioTrack,
-                  size: ResponsiveUtil.iconSizeSmall),
-              SizedBox(width: ResponsiveUtil.spacingSmall),
-              Text(
-                'Add New Music Timeline',
-                style: TextStyle(
-                  color: AppColors.audioTrack,
-                  fontSize: ResponsiveUtil.fontSizeTiny,
-                  fontWeight: FontWeight.w600,
-                ),
-              ),
-            ],
+      alignment: Alignment.centerLeft,
+      child: Padding(
+        padding: EdgeInsets.symmetric(
+            horizontal: ResponsiveUtil.paddingMedium),
+        child: Text(
+          'Timeline',
+          style: TextStyle(
+            color: AppColors.textPrimary,
+            fontSize: ResponsiveUtil.fontSizeSmall,
+            fontWeight: FontWeight.w600,
           ),
         ),
       ),
@@ -741,20 +657,22 @@ class _TimelineWidgetState extends State<TimelineWidget>
           _buildTrackControlPanel('Video', Icons.videocam_outlined,
               () => _openMainVideoPicker(provider)),
           for (int i = 0; i < provider.overlayTrackCount; i++)
-            _buildTrackControlPanel('Overlay ${i + 1}', Icons.layers,
-                () => _openOverlayPicker(provider, trackIndex: i)),
+            _buildTrackControlPanel('Overlay ${i + 1}', Icons.layers, null),
+          _buildTrackControlPanel('+ Overlay', Icons.add_to_photos, () {
+            provider.addOverlayTrack();
+          }),
           for (int i = 0; i < provider.audioTrackCount; i++)
-            _buildTrackControlPanel('Audio ${i + 1}', Icons.music_note, () {
-              provider.selectAudioTrack(i);
-              _openAudioEditor(provider, trackIndex: i);
-            }),
+            _buildTrackControlPanel('Audio ${i + 1}', Icons.music_note, null),
+          _buildTrackControlPanel('+ Music', Icons.queue_music, () {
+            provider.addAudioTrack();
+          }),
         ],
       ),
     );
   }
 
   Widget _buildTrackControlPanel(
-      String title, IconData icon, VoidCallback onAdd) {
+      String title, IconData icon, VoidCallback? onAdd) {
     return Container(
       height: _trackHeight,
       width: double.infinity,
@@ -781,20 +699,22 @@ class _TimelineWidgetState extends State<TimelineWidget>
                   fontWeight: FontWeight.w500,
                 ),
               ),
-              const SizedBox(height: 4),
-              Container(
-                width: 16,
-                height: 16,
-                decoration: BoxDecoration(
-                  color: AppColors.primary.withOpacity(0.2),
-                  shape: BoxShape.circle,
+              if (onAdd != null) ...[
+                const SizedBox(height: 4),
+                Container(
+                  width: 16,
+                  height: 16,
+                  decoration: BoxDecoration(
+                    color: AppColors.primary.withOpacity(0.2),
+                    shape: BoxShape.circle,
+                  ),
+                  child: const Icon(
+                    Icons.add,
+                    size: 12,
+                    color: AppColors.primary,
+                  ),
                 ),
-                child: const Icon(
-                  Icons.add,
-                  size: 12,
-                  color: AppColors.primary,
-                ),
-              ),
+              ],
             ],
           ),
         ),
@@ -854,37 +774,31 @@ class _TimelineWidgetState extends State<TimelineWidget>
   }
 
   Widget _buildCanvaPlusButton({required VoidCallback onTap, String? tooltip}) {
-    final button = Material(
-      color: Colors.transparent,
-      child: InkWell(
-        customBorder: const CircleBorder(),
-        onTap: onTap,
-        child: Container(
-          width: ResponsiveUtil.getHeight(36),
-          height: ResponsiveUtil.getHeight(36),
-          decoration: BoxDecoration(
-            shape: BoxShape.circle,
-            gradient: const LinearGradient(
-              begin: Alignment.topLeft,
-              end: Alignment.bottomRight,
-              colors: [
-                AppColors.primary,
-                AppColors.primaryLight,
-              ],
-            ),
-            boxShadow: [
-              BoxShadow(
-                color: AppColors.primary.withOpacity(0.3),
-                blurRadius: 8,
-                offset: const Offset(0, 2),
-              ),
+    final button = GestureDetector(
+      onTap: onTap,
+      child: Container(
+        width: 48,
+        height: 48,
+        decoration: BoxDecoration(
+          borderRadius: BorderRadius.circular(10),
+          gradient: const LinearGradient(
+            begin: Alignment.topLeft,
+            end: Alignment.bottomRight,
+            colors: [
+              AppColors.primary,
+              AppColors.primaryLight,
             ],
           ),
-          child: Center(
-            child: Icon(Icons.add,
-                color: AppColors.textPrimary,
-                size: ResponsiveUtil.iconSizeNormal),
-          ),
+          boxShadow: [
+            BoxShadow(
+              color: AppColors.primary.withOpacity(0.3),
+              blurRadius: 6,
+              offset: const Offset(0, 2),
+            ),
+          ],
+        ),
+        child: const Center(
+          child: Icon(Icons.add, color: AppColors.textPrimary, size: 20),
         ),
       ),
     );
@@ -1120,6 +1034,55 @@ class _TimelineWidgetState extends State<TimelineWidget>
           trackColor = AppColors.surface;
         }
 
+        return GestureDetector(
+          behavior: HitTestBehavior.translucent,
+          onTap: () => _openOverlayPicker(provider, trackIndex: trackIndex),
+          child: Container(
+            height: _trackHeight,
+            color: trackColor,
+            child: Stack(
+              children: [
+                Container(
+                  width: double.infinity,
+                  height: _trackHeight,
+                  decoration: BoxDecoration(
+                    border: Border(
+                      bottom: BorderSide(
+                          color: AppColors.border.withOpacity(0.5), width: 1),
+                    ),
+                  ),
+                  child: const SizedBox.shrink(),
+                ),
+                ...provider.currentProject!.overlayClips
+                    .where((clip) => clip.trackIndex == trackIndex)
+                    .map((clip) => _buildOverlayClipWidget(clip, provider)),
+              ],
+            ),
+          ),
+        );
+      },
+    );
+  }
+
+  Widget _buildStickerTrack(VideoEditorProvider provider) {
+    return DragTarget<StickerModel>(
+      key: _stickerTrackKey,
+      onWillAcceptWithDetails: (_) => true,
+      onAcceptWithDetails: (details) {
+        final dropTime =
+            _calculateDropTime(details.offset, provider.totalDuration);
+        provider.moveSticker(details.data.id, dropTime);
+      },
+      builder: (context, candidateData, rejectedData) {
+        Color trackColor;
+        if (rejectedData.isNotEmpty) {
+          trackColor = AppColors.error.withOpacity(0.15);
+        } else if (candidateData.isNotEmpty) {
+          trackColor = AppColors.primary.withOpacity(0.15);
+        } else {
+          trackColor = AppColors.surface;
+        }
+
         return Container(
           height: _trackHeight,
           color: trackColor,
@@ -1136,37 +1099,12 @@ class _TimelineWidgetState extends State<TimelineWidget>
                 ),
                 child: const SizedBox.shrink(),
               ),
-              ...provider.currentProject!.overlayClips
-                  .where((clip) => clip.trackIndex == trackIndex)
-                  .map((clip) => _buildOverlayClipWidget(clip, provider)),
+              ...provider.currentProject!.stickers
+                  .map((sticker) => _buildStickerWidget(sticker, provider)),
             ],
           ),
         );
       },
-    );
-  }
-
-  Widget _buildStickerTrack(VideoEditorProvider provider) {
-    return Container(
-      height: _trackHeight,
-      color: AppColors.surface,
-      child: Stack(
-        children: [
-          Container(
-            width: double.infinity,
-            height: _trackHeight,
-            decoration: BoxDecoration(
-              border: Border(
-                bottom: BorderSide(
-                    color: AppColors.border.withOpacity(0.5), width: 1),
-              ),
-            ),
-            child: const SizedBox.shrink(),
-          ),
-          ...provider.currentProject!.stickers
-              .map((sticker) => _buildStickerWidget(sticker, provider)),
-        ],
-      ),
     );
   }
 
@@ -1337,27 +1275,34 @@ class _TimelineWidgetState extends State<TimelineWidget>
           trackColor = AppColors.surface;
         }
 
-        return Container(
-          height: _trackHeight,
-          color: trackColor,
-          child: Stack(
-            children: [
-              Container(
-                width: double.infinity,
-                height: _trackHeight,
-                decoration: BoxDecoration(
-                  border: Border(
-                    bottom: BorderSide(
-                        color: AppColors.border.withOpacity(0.5), width: 1),
+        return GestureDetector(
+          behavior: HitTestBehavior.translucent,
+          onTap: () {
+            provider.selectAudioTrack(trackIndex);
+            _openAudioEditor(provider, trackIndex: trackIndex);
+          },
+          child: Container(
+            height: _trackHeight,
+            color: trackColor,
+            child: Stack(
+              children: [
+                Container(
+                  width: double.infinity,
+                  height: _trackHeight,
+                  decoration: BoxDecoration(
+                    border: Border(
+                      bottom: BorderSide(
+                          color: AppColors.border.withOpacity(0.5), width: 1),
+                    ),
                   ),
+                  child: const SizedBox.shrink(),
                 ),
-                child: const SizedBox.shrink(),
-              ),
-              ...provider.currentProject!.audioOverlays
-                  .where((overlay) => overlay.trackIndex == trackIndex)
-                  .map(
-                      (overlay) => _buildAudioOverlayWidget(overlay, provider)),
-            ],
+                ...provider.currentProject!.audioOverlays
+                    .where((overlay) => overlay.trackIndex == trackIndex)
+                    .map(
+                        (overlay) => _buildAudioOverlayWidget(overlay, provider)),
+              ],
+            ),
           ),
         );
       },
@@ -1534,13 +1479,23 @@ class _TimelineWidgetState extends State<TimelineWidget>
                 onHorizontalDragUpdate: (details) {
                   final deltaMs = (details.delta.dx / _timelineScale).round();
                   final delta = Duration(milliseconds: deltaMs);
-                  final newTrimStart = clip.trimStart + delta;
-                  if (newTrimStart < clip.sourceStart ||
-                      newTrimStart >=
-                          clip.trimEnd - const Duration(milliseconds: 100)) {
-                    return;
+                  final isImage = clip.mediaType == MediaType.image || clip.imageFile != null;
+                  
+                  if (isImage) {
+                    final newStartTime = clip.startTime + delta;
+                    if (newStartTime < Duration.zero ||
+                        newStartTime >= clip.endTime - const Duration(milliseconds: 100)) {
+                      return;
+                    }
+                    provider.trimOverlayClip(clip.id, delta, clip.trimEnd);
+                  } else {
+                    final newTrimStart = clip.trimStart + delta;
+                    if (newTrimStart < clip.sourceStart ||
+                        newTrimStart >= clip.trimEnd - const Duration(milliseconds: 100)) {
+                      return;
+                    }
+                    provider.trimOverlayClip(clip.id, newTrimStart, clip.trimEnd);
                   }
-                  provider.trimOverlayClip(clip.id, newTrimStart, clip.trimEnd);
                 },
                 child: Container(
                   width: 8,
@@ -1565,10 +1520,13 @@ class _TimelineWidgetState extends State<TimelineWidget>
                 onHorizontalDragUpdate: (details) {
                   final deltaMs = (details.delta.dx / _timelineScale).round();
                   final delta = Duration(milliseconds: deltaMs);
+                  final isImage = clip.mediaType == MediaType.image || clip.imageFile != null;
+                  
                   final newTrimEnd = clip.trimEnd + delta;
-                  if (newTrimEnd <=
-                          clip.trimStart + const Duration(milliseconds: 100) ||
-                      newTrimEnd > clip.sourceEnd) {
+                  if (newTrimEnd <= clip.trimStart + const Duration(milliseconds: 100)) {
+                    return;
+                  }
+                  if (!isImage && newTrimEnd > clip.sourceEnd) {
                     return;
                   }
                   provider.trimOverlayClip(clip.id, clip.trimStart, newTrimEnd);
@@ -2806,21 +2764,20 @@ class _TimelineWidgetState extends State<TimelineWidget>
     }
 
     return Container(
-      height: ResponsiveUtil.getHeight(48) + 20,
-      padding: const EdgeInsets.only(bottom: 20),
+      height: 60,
       decoration: const BoxDecoration(
         color: AppColors.surface,
-        border: Border(top: BorderSide(color: AppColors.border, width: 1)),
+        border: Border(bottom: BorderSide(color: AppColors.border, width: 1)),
       ),
+      padding: const EdgeInsets.symmetric(horizontal: 16),
       child: Row(
-        mainAxisAlignment: MainAxisAlignment.center,
+        mainAxisAlignment: MainAxisAlignment.spaceEvenly,
         children: [
           _buildControlButton(
             icon: Icons.undo,
             onPressed: provider.canUndo ? () => provider.undo() : null,
             tooltip: 'Undo',
           ),
-          SizedBox(width: ResponsiveUtil.spacingMedium),
           _buildControlButton(
             icon: Icons.content_cut_outlined,
             onPressed: (provider.selectedVideoClipId != null ||
@@ -2839,30 +2796,27 @@ class _TimelineWidgetState extends State<TimelineWidget>
                 : null,
             tooltip: 'Cut',
           ),
-          SizedBox(width: ResponsiveUtil.spacingMedium),
           _buildCanvaPlusButton(
             onTap: _importMediaFromTimeline,
             tooltip: 'Add Media',
           ),
-          SizedBox(width: ResponsiveUtil.spacingMedium),
           _buildControlButton(
             icon: Icons.delete_outline,
             onPressed: (provider.selectedVideoClipId != null ||
                     provider.selectedAudioOverlayId != null ||
                     provider.selectedStickerId != null ||
-                    provider.selectedTextOverlayId != null)
+                    provider.selectedTextOverlayId != null ||
+                    provider.selectedOverlayClipId != null)
                 ? () => _showDeleteDialog(context, provider)
                 : null,
             tooltip: 'Delete',
           ),
-          SizedBox(width: ResponsiveUtil.spacingMedium),
           _buildControlButton(
             icon: Icons.redo,
             onPressed: provider.canRedo ? () => provider.redo() : null,
             tooltip: 'Redo',
           ),
           if (hasVideoSelection) ...[
-            SizedBox(width: ResponsiveUtil.spacingMedium),
             _buildControlButton(
               icon: isClipMuted
                   ? Icons.volume_off_outlined
@@ -2884,17 +2838,30 @@ class _TimelineWidgetState extends State<TimelineWidget>
     required String tooltip,
     Color? color,
   }) {
-    return IconButton(
-      onPressed: onPressed,
-      icon: Icon(icon, size: ResponsiveUtil.iconSizeNormal),
-      tooltip: tooltip,
-      padding: EdgeInsets.all(ResponsiveUtil.paddingSmall),
-      constraints: BoxConstraints(
-          minWidth: ResponsiveUtil.minTouchTarget,
-          minHeight: ResponsiveUtil.minTouchTarget),
-      color: onPressed == null
-          ? AppColors.textTertiary
-          : (color ?? AppColors.textSecondary),
+    final isEnabled = onPressed != null;
+    final iconColor = isEnabled ? (color ?? AppColors.textSecondary) : AppColors.textTertiary;
+    return Tooltip(
+      message: tooltip,
+      child: GestureDetector(
+        onTap: onPressed,
+        child: Container(
+          width: 48,
+          height: 48,
+          decoration: BoxDecoration(
+            color: isEnabled
+                ? AppColors.surfaceLight
+                : AppColors.surfaceLight.withOpacity(0.5),
+            borderRadius: BorderRadius.circular(10),
+            border: Border.all(
+              color: isEnabled
+                  ? AppColors.border
+                  : AppColors.border.withOpacity(0.4),
+              width: 1,
+            ),
+          ),
+          child: Icon(icon, size: 20, color: iconColor),
+        ),
+      ),
     );
   }
 
@@ -3176,6 +3143,8 @@ class _TimelineWidgetState extends State<TimelineWidget>
                 provider.removeSticker(provider.selectedStickerId!);
               } else if (provider.selectedTextOverlayId != null) {
                 provider.removeTextOverlay(provider.selectedTextOverlayId!);
+              } else if (provider.selectedOverlayClipId != null) {
+                provider.removeOverlayClip(provider.selectedOverlayClipId!);
               }
             },
             style: TextButton.styleFrom(foregroundColor: AppColors.error),
@@ -3200,62 +3169,113 @@ class TimeRulerPainter extends CustomPainter {
 
   @override
   void paint(Canvas canvas, Size size) {
-    final paint = Paint()
+    final double pxPerMs = scale;
+
+    // Available time intervals for major ticks (in milliseconds)
+    final List<int> majorIntervals = [
+      60000, // 1 min
+      30000, // 30s
+      10000, // 10s
+      5000,  // 5s
+      2000,  // 2s
+      1000,  // 1s
+      500,   // 500ms
+      200,   // 200ms
+      100,   // 100ms
+      50,    // 50ms
+      20,    // 20ms
+      10,    // 10ms
+      5,     // 5ms
+      2,     // 2ms
+      1,     // 1ms
+    ];
+
+    // Find the smallest major interval that is >= 60 pixels wide
+    int majorMs = 60000;
+    for (final ms in majorIntervals) {
+      if (ms * pxPerMs >= 60.0) {
+        majorMs = ms;
+      } else {
+        break;
+      }
+    }
+
+    // Determine sub-division divisor for minor ticks
+    int divisor = 1;
+    if ((majorMs / 10) * pxPerMs >= 4.0) {
+      divisor = 10;
+    } else if ((majorMs / 5) * pxPerMs >= 4.0) {
+      divisor = 5;
+    } else if ((majorMs / 2) * pxPerMs >= 4.0) {
+      divisor = 2;
+    }
+
+    final double minorMs = majorMs / divisor;
+    final int totalMs = duration.inMilliseconds;
+
+    final Paint majorPaint = Paint()
       ..color = AppColors.textTertiary
-      ..strokeWidth = 1;
+      ..strokeWidth = 1.2;
+
+    final Paint minorPaint = Paint()
+      ..color = AppColors.textTertiary.withOpacity(0.4)
+      ..strokeWidth = 0.8;
 
     final textPainter = TextPainter(
       textDirection: TextDirection.ltr,
     );
 
-    final totalSeconds = duration.inSeconds;
-    final pixelsPerSecond = totalSeconds > 0 ? size.width / totalSeconds : 0;
+    // Draw ticks
+    for (double ms = 0; ms <= totalMs; ms += minorMs) {
+      final double x = ms * pxPerMs;
+      final int msInt = ms.round();
+      final bool isMajor = msInt % majorMs == 0;
+      final bool isMedium = divisor == 10 && (msInt % (majorMs ~/ 2) == 0) && !isMajor;
 
-    int labelInterval;
-    if (pixelsPerSecond > 50) {
-      labelInterval = 5;
-    } else if (pixelsPerSecond > 20) {
-      labelInterval = 10;
-    } else if (pixelsPerSecond > 5) {
-      labelInterval = 30;
-    } else if (pixelsPerSecond > 1) {
-      labelInterval = 60;
-    } else if (pixelsPerSecond > 0.2) {
-      labelInterval = 300;
-    } else {
-      labelInterval = 600;
-    }
+      if (isMajor) {
+        canvas.drawLine(
+          Offset(x, size.height - 12),
+          Offset(x, size.height),
+          majorPaint,
+        );
 
-    for (int i = 0; i <= totalSeconds; i += labelInterval) {
-      final x = (i * pixelsPerSecond).toDouble();
+        final minutes = msInt ~/ 60000;
+        final seconds = (msInt % 60000) ~/ 1000;
+        final remainingMs = msInt % 1000;
 
-      canvas.drawLine(
-        Offset(x, size.height - 8),
-        Offset(x, size.height),
-        paint,
-      );
+        String timeText;
+        if (majorMs < 1000) {
+          timeText = '${minutes.toString().padLeft(2, '0')}:${seconds.toString().padLeft(2, '0')}.${remainingMs.toString().padLeft(3, '0')}';
+        } else if (remainingMs > 0) {
+          timeText = '${seconds.toString()}.${(remainingMs ~/ 100).toString()}s';
+        } else {
+          timeText = '${minutes.toString().padLeft(2, '0')}:${seconds.toString().padLeft(2, '0')}';
+        }
 
-      final minutes = i ~/ 60;
-      final seconds = i % 60;
-      final timeText =
-          '${minutes.toString().padLeft(2, '0')}:${seconds.toString().padLeft(2, '0')}';
+        textPainter.text = TextSpan(
+          text: timeText,
+          style: const TextStyle(
+            color: AppColors.textTertiary,
+            fontSize: 9,
+            fontWeight: FontWeight.w500,
+          ),
+        );
+        textPainter.layout();
 
-      textPainter.text = TextSpan(
-        text: timeText,
-        style: const TextStyle(
-          color: AppColors.textTertiary,
-          fontSize: 9,
-          fontWeight: FontWeight.w500,
-        ),
-      );
-      textPainter.layout();
-
-      final labelX = (x - textPainter.width / 2)
-          .clamp(0.0, size.width - textPainter.width);
-      textPainter.paint(
-        canvas,
-        Offset(labelX, size.height - 22),
-      );
+        final labelX = (x - textPainter.width / 2)
+            .clamp(0.0, size.width - textPainter.width);
+        textPainter.paint(
+          canvas,
+          Offset(labelX, size.height - 24),
+        );
+      } else {
+        final double tickHeight = isMedium ? 8 : 5;
+        canvas.drawLine(
+          Offset(x, size.height - tickHeight),
+          Offset(x, size.height),
+          minorPaint,
+        );
+      }
     }
   }
 

@@ -75,6 +75,7 @@ class VideoEditorProvider extends ChangeNotifier {
   static const int _maxHistory = 50;
 
   bool _isExporting = false;
+  bool _isReversing = false;
   double _exportProgress = 0.0;
   String? _exportError;
 
@@ -148,11 +149,37 @@ class VideoEditorProvider extends ChangeNotifier {
       Map.unmodifiable(_clipColorFilters);
 
   // Track management for multiple overlay and audio tracks
-  int _overlayTrackCount = 1;
+  int _overlayTrackCount = 2;
   int _audioTrackCount = 1;
 
   int get overlayTrackCount => _overlayTrackCount;
   int get audioTrackCount => _audioTrackCount;
+
+  void _updateTrackCountsFromProject() {
+    if (_currentProject == null) {
+      _overlayTrackCount = 2;
+      _audioTrackCount = 1;
+      return;
+    }
+    
+    // Find maximum track index used by existing overlay clips
+    int maxOverlayIndex = 1; // Default to 2 tracks (index 0 and 1)
+    for (final clip in _currentProject!.overlayClips) {
+      if (clip.trackIndex > maxOverlayIndex) {
+        maxOverlayIndex = clip.trackIndex;
+      }
+    }
+    _overlayTrackCount = maxOverlayIndex + 1;
+
+    // Find maximum track index used by existing audio overlays
+    int maxAudioIndex = 0; // Default to 1 track (index 0)
+    for (final audio in _currentProject!.audioOverlays) {
+      if (audio.trackIndex > maxAudioIndex) {
+        maxAudioIndex = audio.trackIndex;
+      }
+    }
+    _audioTrackCount = maxAudioIndex + 1;
+  }
 
   void addOverlayTrack() {
     _overlayTrackCount++;
@@ -176,6 +203,7 @@ class VideoEditorProvider extends ChangeNotifier {
   bool get isExporting => _isExporting;
   double get exportProgress => _exportProgress;
   String? get exportError => _exportError;
+  bool get isReversing => _isReversing;
   bool get isAutoSaving => _isAutoSaving;
   DateTime? get lastAutoSaved => _lastAutoSaved;
 
@@ -740,41 +768,74 @@ class VideoEditorProvider extends ChangeNotifier {
     if (clipIndex == -1) return;
 
     final originalClip = _currentProject!.overlayClips[clipIndex];
+    final isImage = originalClip.mediaType == MediaType.image || originalClip.imageFile != null;
 
-    // Enforce the same boundaries as the main video trim helper
-    if (startTrim < originalClip.sourceStart ||
-        startTrim >=
-            originalClip.sourceEnd - const Duration(milliseconds: 100) ||
-        endTrim <=
-            originalClip.sourceStart + const Duration(milliseconds: 100) ||
-        endTrim > originalClip.sourceEnd) {
+    VideoClip updatedClip;
+
+    if (startTrim != originalClip.trimStart) {
+      // Left-edge drag
+      final delta = startTrim - originalClip.trimStart;
+      final newStartTime = originalClip.startTime + delta;
+
+      if (isImage) {
+        if (newStartTime < Duration.zero || newStartTime >= originalClip.endTime - const Duration(milliseconds: 100)) {
+          return;
+        }
+        final newDuration = originalClip.endTime - newStartTime;
+        updatedClip = originalClip.copyWith(
+          startTime: newStartTime,
+          endTime: originalClip.endTime,
+          trimStart: Duration.zero,
+          trimEnd: newDuration,
+          sourceEnd: newDuration,
+        );
+      } else {
+        // Video overlay
+        if (startTrim < originalClip.sourceStart ||
+            startTrim >= originalClip.trimEnd - const Duration(milliseconds: 100)) {
+          return;
+        }
+        final newDuration = originalClip.trimEnd - startTrim;
+        updatedClip = originalClip.copyWith(
+          startTime: newStartTime,
+          trimStart: startTrim,
+          endTime: newStartTime + newDuration,
+        );
+      }
+    } else if (endTrim != originalClip.trimEnd) {
+      // Right-edge drag
+      if (isImage) {
+        final delta = endTrim - originalClip.trimEnd;
+        final newEndTime = originalClip.endTime + delta;
+        if (newEndTime <= originalClip.startTime + const Duration(milliseconds: 100)) {
+          return;
+        }
+        final newDuration = newEndTime - originalClip.startTime;
+        updatedClip = originalClip.copyWith(
+          startTime: originalClip.startTime,
+          endTime: newEndTime,
+          trimStart: Duration.zero,
+          trimEnd: newDuration,
+          sourceEnd: newDuration,
+        );
+      } else {
+        // Video overlay
+        if (endTrim <= originalClip.trimStart + const Duration(milliseconds: 100) ||
+            endTrim > originalClip.sourceEnd) {
+          return;
+        }
+        final newDuration = endTrim - originalClip.trimStart;
+        updatedClip = originalClip.copyWith(
+          trimEnd: endTrim,
+          endTime: originalClip.startTime + newDuration,
+        );
+      }
+    } else {
       return;
     }
 
-    if (startTrim >= endTrim) {
-      return;
-    }
-
-    final oldDuration = originalClip.trimEnd - originalClip.trimStart;
-    final newDuration = endTrim - startTrim;
-
-    final updatedClip = originalClip.copyWith(
-      trimStart: startTrim,
-      trimEnd: endTrim,
-      endTime: originalClip.startTime + newDuration,
-    );
-
-    final durationDiff = newDuration - oldDuration;
     final updatedClips = List<VideoClip>.from(_currentProject!.overlayClips);
     updatedClips[clipIndex] = updatedClip;
-
-    for (int i = clipIndex + 1; i < updatedClips.length; i++) {
-      final c = updatedClips[i];
-      updatedClips[i] = c.copyWith(
-        startTime: c.startTime + durationDiff,
-        endTime: c.endTime + durationDiff,
-      );
-    }
 
     recordUndo();
     _currentProject = _currentProject!.copyWith(overlayClips: updatedClips);
@@ -1054,6 +1115,8 @@ class VideoEditorProvider extends ChangeNotifier {
       id: _uuid.v4(),
       name: name,
     );
+    _overlayTrackCount = 2;
+    _audioTrackCount = 1;
     _resetControllers();
     _undoStack.clear();
     _redoStack.clear();
@@ -1068,6 +1131,8 @@ class VideoEditorProvider extends ChangeNotifier {
     _currentPosition = Duration.zero;
     _undoStack.clear();
     _redoStack.clear();
+    _overlayTrackCount = 2;
+    _audioTrackCount = 1;
     notifyListeners();
   }
 
@@ -1390,9 +1455,7 @@ class VideoEditorProvider extends ChangeNotifier {
       _stopTimelineClock();
       _activePreviewClipId = null;
       _activeTransitionId = null;
-      for (final p in _audioPlayers.values) {
-        await p.pause();
-      }
+      await _pauseAllAudioPlayers();
     } else {
       final serial = ++_seekSyncSerial;
       _seekPauseTimer?.cancel();
@@ -1426,12 +1489,12 @@ class VideoEditorProvider extends ChangeNotifier {
       }
 
       if (_isPlaying && canStartTimeline) {
-        await _prepareAudioForPlayback();
+        await _syncAudioPlayback(force: true);
         _startTimelineClock();
       }
     }
     _startPositionListener();
-    unawaited(_syncAudioPlayback());
+    unawaited(_syncAudioPlayback(force: true));
     notifyListeners();
   }
 
@@ -2096,49 +2159,54 @@ class VideoEditorProvider extends ChangeNotifier {
     if (clipIndex == -1) return;
     final clip = _currentProject!.videoClips[clipIndex];
 
-    // If already reversed, just toggle the flag (keep the reversed file)
-    if (clip.isReversed) {
-      final updatedClip = clip.copyWith(isReversed: false);
-      recordUndo();
-      _currentProject = _currentProject!.updateVideoClip(clipId, updatedClip);
-      _scheduleAutoSave();
+    _isReversing = true;
+    notifyListeners();
+
+    try {
+      // If already reversed, just toggle the flag (keep the reversed file)
+      if (clip.isReversed) {
+        final updatedClip = clip.copyWith(isReversed: false);
+        recordUndo();
+        _currentProject = _currentProject!.updateVideoClip(clipId, updatedClip);
+        _scheduleAutoSave();
+        return;
+      }
+
+      // If there's already a reversed file, use it
+      if (clip.reversedFilePath != null &&
+          File(clip.reversedFilePath!).existsSync()) {
+        final updatedClip = clip.copyWith(isReversed: true);
+        recordUndo();
+        _currentProject = _currentProject!.updateVideoClip(clipId, updatedClip);
+        _scheduleAutoSave();
+        return;
+      }
+
+      // Need to process the video with FFmpeg
+      final reversedPath =
+          await processVideoReverse(clipId, onProgress: onProgress);
+      if (reversedPath != null) {
+        // Update the clip with reversed file info
+        final updatedClip = clip.copyWith(
+          isReversed: true,
+          reversedFilePath: reversedPath,
+        );
+        recordUndo();
+        _currentProject = _currentProject!.updateVideoClip(clipId, updatedClip);
+
+        // Clear any cached controller for this clip to ensure fresh start
+        // This prevents jerky playback when playing the reversed video immediately
+        _previewControllers.remove(reversedPath);
+        _lruAccessList.remove(reversedPath);
+
+        _scheduleAutoSave();
+        print('toggleVideoClipReverse: Successfully set reversed flag');
+      } else {
+        print('toggleVideoClipReverse: FFmpeg processing failed!');
+      }
+    } finally {
+      _isReversing = false;
       notifyListeners();
-      return;
-    }
-
-    // If there's already a reversed file, use it
-    if (clip.reversedFilePath != null &&
-        File(clip.reversedFilePath!).existsSync()) {
-      final updatedClip = clip.copyWith(isReversed: true);
-      recordUndo();
-      _currentProject = _currentProject!.updateVideoClip(clipId, updatedClip);
-      _scheduleAutoSave();
-      notifyListeners();
-      return;
-    }
-
-    // Need to process the video with FFmpeg
-    final reversedPath =
-        await processVideoReverse(clipId, onProgress: onProgress);
-    if (reversedPath != null) {
-      // Update the clip with reversed file info
-      final updatedClip = clip.copyWith(
-        isReversed: true,
-        reversedFilePath: reversedPath,
-      );
-      recordUndo();
-      _currentProject = _currentProject!.updateVideoClip(clipId, updatedClip);
-
-      // Clear any cached controller for this clip to ensure fresh start
-      // This prevents jerky playback when playing the reversed video immediately
-      _previewControllers.remove(reversedPath);
-      _lruAccessList.remove(reversedPath);
-
-      _scheduleAutoSave();
-      notifyListeners();
-      print('toggleVideoClipReverse: Successfully set reversed flag');
-    } else {
-      print('toggleVideoClipReverse: FFmpeg processing failed!');
     }
   }
 
@@ -2472,7 +2540,21 @@ class VideoEditorProvider extends ChangeNotifier {
     if (_currentProject == null) return;
 
     // Use selected audio track index if provided, otherwise use the provider's selected track or default to 0
-    final int finalTrackIndex = trackIndex ?? _selectedAudioTrackIndex ?? 0;
+    int finalTrackIndex = trackIndex ?? _selectedAudioTrackIndex ?? 0;
+
+    // Check if there's already a clip in the target track at the same time range
+    bool hasOverlap = _currentProject!.audioOverlays
+        .where((audio) => audio.trackIndex == finalTrackIndex)
+        .any((audio) => _audioOverlaps(audio, startTime, endTime - startTime));
+
+    // If there's an overlap, create a new track
+    if (hasOverlap) {
+      finalTrackIndex = _findAvailableAudioTrackIndex();
+      // Increase track count if needed
+      if (finalTrackIndex >= _audioTrackCount) {
+        _audioTrackCount = finalTrackIndex + 1;
+      }
+    }
 
     // Debug print to verify track index
     print('Adding audio overlay to track index: $finalTrackIndex');
@@ -2537,6 +2619,7 @@ class VideoEditorProvider extends ChangeNotifier {
 
   Future<void> updateAudioOverlay(
     String overlayId, {
+    File? audioFile,
     Duration? startTime,
     Duration? endTime,
     Duration? audioStartOffset,
@@ -2547,7 +2630,22 @@ class VideoEditorProvider extends ChangeNotifier {
     if (_currentProject == null) return;
     final overlay =
         _currentProject!.audioOverlays.firstWhere((o) => o.id == overlayId);
+
+    File? savedAudioFile;
+    if (audioFile != null) {
+      savedAudioFile = await _importFileToAppDocs(audioFile);
+      final oldPlayer = _audioPlayers.remove(overlayId);
+      if (oldPlayer != null) {
+        try {
+          await oldPlayer.dispose();
+        } catch (_) {}
+      }
+      _waveformCache.remove(overlayId);
+      _lastSetOverlayVolume.remove(overlayId);
+    }
+
     final updatedOverlay = overlay.copyWith(
+      audioFile: savedAudioFile ?? overlay.audioFile,
       startTime: startTime,
       endTime: endTime,
       audioStartOffset: audioStartOffset,
@@ -2564,8 +2662,10 @@ class VideoEditorProvider extends ChangeNotifier {
         await player.setVolume((volume * _audioMasterVolume).clamp(0.0, 1.0));
       }
       if (_isPlaying) {
-        unawaited(_syncAudioPlayback());
+        unawaited(_syncAudioPlayback(force: true));
       }
+    } else if (_isPlaying) {
+      unawaited(_syncAudioPlayback(force: true));
     }
     _scheduleAutoSave();
     notifyListeners();
@@ -2807,67 +2907,62 @@ class VideoEditorProvider extends ChangeNotifier {
   }
 
   void toggleTimeline() {
-    _showTimeline = !_showTimeline;
-    if (_showTimeline) {
-      _closeStickerAndChromaPanels();
-      _showFilters = false;
-      _showTextEditor = false;
-      _showAudioEditor = false;
-      _showCropEditor = false;
-      _showRotateEditor = false;
-    }
+    if (_showTimeline) return;
+    _showTimeline = true;
+    _closeStickerAndChromaPanels();
+    _showFilters = false;
+    _showTextEditor = false;
+    _showAudioEditor = false;
+    _showCropEditor = false;
+    _showRotateEditor = false;
     notifyListeners();
   }
 
   void toggleFilters() {
-    _showFilters = !_showFilters;
-    if (_showFilters) {
-      _closeStickerAndChromaPanels();
-      _showTimeline = false;
-      _showTextEditor = false;
-      _showAudioEditor = false;
-      _showCropEditor = false;
-      _showRotateEditor = false;
-    }
+    if (_showFilters) return;
+    _showFilters = true;
+    _closeStickerAndChromaPanels();
+    _showTimeline = false;
+    _showTextEditor = false;
+    _showAudioEditor = false;
+    _showCropEditor = false;
+    _showRotateEditor = false;
     notifyListeners();
   }
 
   void toggleTextEditor() {
-    _showTextEditor = !_showTextEditor;
-    if (_showTextEditor) {
-      _closeStickerAndChromaPanels();
-      _showTimeline = false;
-      _showFilters = false;
-      _showAudioEditor = false;
-      _showCropEditor = false;
-      _showRotateEditor = false;
-    }
+    if (_showTextEditor) return;
+    _showTextEditor = true;
+    _closeStickerAndChromaPanels();
+    _showTimeline = false;
+    _showFilters = false;
+    _showAudioEditor = false;
+    _showCropEditor = false;
+    _showRotateEditor = false;
     notifyListeners();
   }
 
   void toggleAudioEditor() {
-    _showAudioEditor = !_showAudioEditor;
-    if (_showAudioEditor) {
-      _closeStickerAndChromaPanels();
-      _showTimeline = false;
-      _showFilters = false;
-      _showTextEditor = false;
-      _showCropEditor = false;
-      _showRotateEditor = false;
-    }
+    if (_showAudioEditor) return;
+    _showAudioEditor = true;
+    _closeStickerAndChromaPanels();
+    _showTimeline = false;
+    _showFilters = false;
+    _showTextEditor = false;
+    _showCropEditor = false;
+    _showRotateEditor = false;
     notifyListeners();
   }
 
   void toggleCropEditor() {
-    _showCropEditor = !_showCropEditor;
-    if (_showCropEditor) {
-      _closeStickerAndChromaPanels();
-      _showTimeline = false;
-      _showFilters = false;
-      _showTextEditor = false;
-      _showAudioEditor = false;
-      _showRotateEditor = false;
-    }
+    if (_showCropEditor) return;
+    _showCropEditor = true;
+    _closeStickerAndChromaPanels();
+    _showTimeline = false;
+    _showFilters = false;
+    _showTextEditor = false;
+    _showAudioEditor = false;
+    _showRotateEditor = false;
     notifyListeners();
   }
 
@@ -2903,19 +2998,18 @@ class VideoEditorProvider extends ChangeNotifier {
   }
 
   void toggleStickerPanel() {
-    _showStickerPanel = !_showStickerPanel;
-    if (_showStickerPanel) {
-      if (_editorPanelMode == EditorPanelMode.chromaKey) {
-        _editorPanelMode = EditorPanelMode.none;
-      }
-      _showTimeline = false;
-      _showFilters = false;
-      _showTextEditor = false;
-      _showAudioEditor = false;
-      _showCropEditor = false;
-      _showRotateEditor = false;
-      _showTrimEditor = false;
+    if (_showStickerPanel) return;
+    _showStickerPanel = true;
+    if (_editorPanelMode == EditorPanelMode.chromaKey) {
+      _editorPanelMode = EditorPanelMode.none;
     }
+    _showTimeline = false;
+    _showFilters = false;
+    _showTextEditor = false;
+    _showAudioEditor = false;
+    _showCropEditor = false;
+    _showRotateEditor = false;
+    _showTrimEditor = false;
     notifyListeners();
   }
 
@@ -3307,12 +3401,20 @@ class VideoEditorProvider extends ChangeNotifier {
 
   void selectTextOverlay(String? overlayId) {
     _selectedTextOverlayId = overlayId;
-    notifyListeners();
+    if (overlayId != null) {
+      toggleTextEditor();
+    } else {
+      notifyListeners();
+    }
   }
 
   void selectAudioOverlay(String? overlayId) {
     _selectedAudioOverlayId = overlayId;
-    notifyListeners();
+    if (overlayId != null) {
+      toggleAudioEditor();
+    } else {
+      notifyListeners();
+    }
   }
 
   void selectVideoClip(String? clipId) {
@@ -3377,6 +3479,39 @@ class VideoEditorProvider extends ChangeNotifier {
       startTime: startTime,
       endTime: endTime,
       opacity: opacity,
+    );
+    recordUndo();
+    _currentProject = _currentProject!.updateSticker(stickerId, updatedSticker);
+    _scheduleAutoSave();
+    notifyListeners();
+  }
+
+  Future<void> moveSticker(String stickerId, Duration newStartTime) async {
+    if (_currentProject == null) return;
+    final stickerIndex =
+        _currentProject!.stickers.indexWhere((s) => s.id == stickerId);
+    if (stickerIndex == -1) return;
+    final sticker = _currentProject!.stickers[stickerIndex];
+    final duration = sticker.endTime - sticker.startTime;
+    final maxVideoDuration = totalDuration;
+
+    // Clamp start time to keep sticker within bounds
+    Duration clampedStart = newStartTime;
+    if (clampedStart < Duration.zero) clampedStart = Duration.zero;
+
+    if (maxVideoDuration > Duration.zero) {
+      final maxStart = maxVideoDuration - duration;
+      if (maxStart > Duration.zero && clampedStart > maxStart) {
+        clampedStart = maxStart;
+      } else if (maxStart <= Duration.zero) {
+        clampedStart = Duration.zero;
+      }
+    }
+
+    final clampedEndTime = clampedStart + duration;
+    final updatedSticker = sticker.copyWith(
+      startTime: clampedStart,
+      endTime: clampedEndTime,
     );
     recordUndo();
     _currentProject = _currentProject!.updateSticker(stickerId, updatedSticker);
@@ -4029,6 +4164,7 @@ class VideoEditorProvider extends ChangeNotifier {
 
       _undoStack.clear();
       _redoStack.clear();
+      _updateTrackCountsFromProject();
 
       if (_currentProject!.videoClips.isNotEmpty) {
         final firstClip = _currentProject!.videoClips.firstWhere(
@@ -4108,6 +4244,17 @@ class VideoEditorProvider extends ChangeNotifier {
     notifyListeners();
   }
 
+  Future<void> _pauseAllAudioPlayers() async {
+    if (_audioPlayers.isEmpty) return;
+    await Future.wait(_audioPlayers.values.map((player) async {
+      try {
+        if (player.playing) {
+          await player.pause();
+        }
+      } catch (_) {}
+    }));
+  }
+
   Future<void> _syncAudioPlayback({bool force = false}) async {
     if (_currentProject == null) return;
     final nowTs = DateTime.now();
@@ -4123,7 +4270,31 @@ class VideoEditorProvider extends ChangeNotifier {
     _audioSyncInProgress = true;
     try {
       final now = _currentPosition;
-      for (final overlay in _currentProject!.audioOverlays) {
+      final overlays = _currentProject!.audioOverlays;
+
+      if (!_isPlaying) {
+        // Guarantee all players are paused concurrently when playback is stopped
+        await _pauseAllAudioPlayers();
+
+        if (force) {
+          await Future.wait(overlays.map((overlay) async {
+            final active = now >= overlay.startTime && now < overlay.endTime;
+            if (!active) return;
+            final player = _audioPlayers[overlay.id];
+            if (player != null) {
+              final elapsed = now - overlay.startTime;
+              final audioPos = overlay.audioStartOffset + elapsed;
+              try {
+                await player.seek(audioPos);
+              } catch (_) {}
+            }
+          }));
+        }
+        return;
+      }
+
+      // Process all audio overlays concurrently to prevent one player from blocking others
+      await Future.wait(overlays.map((overlay) async {
         final active = now >= overlay.startTime && now < overlay.endTime;
         final id = overlay.id;
         var player = _audioPlayers[id];
@@ -4133,10 +4304,10 @@ class VideoEditorProvider extends ChangeNotifier {
             _audioPlayers[id] = player;
             await player.setFilePath(overlay.audioFile.path);
           } catch (e) {
-            // Failed to load audio file - skip this overlay
-            continue;
+            return;
           }
         }
+
         final effectiveOverlayVolume =
             (overlay.volume * _audioMasterVolume).clamp(0.0, 1.0);
         final lastVol = _lastSetOverlayVolume[id];
@@ -4145,36 +4316,38 @@ class VideoEditorProvider extends ChangeNotifier {
           await player.setVolume(effectiveOverlayVolume);
           _lastSetOverlayVolume[id] = effectiveOverlayVolume;
         }
+
         final elapsedInOverlay = now - overlay.startTime;
         final audioPos = overlay.audioStartOffset + elapsedInOverlay;
-        if (!_isPlaying) {
-          if (active) {
-            if (force) {
-              await player.seek(audioPos);
-            }
-          }
-          if (player.playing) {
-            await player.pause();
-          }
-          continue;
-        }
-        const tolerance = Duration(milliseconds: 20);
-        final pos = player.position;
+
         if (active) {
-          if (!player.playing || (pos - audioPos).abs() > tolerance) {
+          // Increase tolerance from 20ms to 250ms to prevent continuous re-seeking during normal playback
+          const driftTolerance = Duration(milliseconds: 250);
+          final pos = player.position;
+          final isPlayingNow = player.playing;
+          final drift = (pos - audioPos).abs();
+
+          if (!isPlayingNow || drift > driftTolerance) {
             await player.seek(audioPos);
-            await player.play();
+            if (_isPlaying) {
+              await player.play();
+            } else {
+              await player.pause();
+            }
           }
         } else {
           if (player.playing) {
             await player.pause();
           }
         }
-      }
-      final validIds = _currentProject!.audioOverlays.map((o) => o.id).toSet();
+      }));
+
+      final validIds = overlays.map((o) => o.id).toSet();
       for (final entry in _audioPlayers.entries.toList()) {
         if (!validIds.contains(entry.key)) {
-          await entry.value.dispose();
+          try {
+            await entry.value.dispose();
+          } catch (_) {}
           _audioPlayers.remove(entry.key);
           _lastSetOverlayVolume.remove(entry.key);
         }

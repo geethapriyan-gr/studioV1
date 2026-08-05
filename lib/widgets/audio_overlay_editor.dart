@@ -77,8 +77,10 @@ class _AudioOverlayEditorState extends State<AudioOverlayEditor> {
                 _buildHeader(provider),
                 const SizedBox(height: 16),
                 _buildAudioSelector(provider),
-                const SizedBox(height: 16),
-                _buildVolumeSliderContainer(),
+                if (selectedId != null) ...[
+                  const SizedBox(height: 16),
+                  _buildVolumeSliderContainer(provider),
+                ],
               ],
             ),
           ),
@@ -95,6 +97,27 @@ class _AudioOverlayEditorState extends State<AudioOverlayEditor> {
     _fadeOut = overlay.fadeOut;
     _startTimeController.text = _formatDuration(overlay.startTime);
     _endTimeController.text = _formatDuration(overlay.endTime);
+  }
+
+  void _autoUpdate(VideoEditorProvider provider) {
+    final id = provider.selectedAudioOverlayId;
+    if (id == null) return;
+
+    final start = _parseDuration(_startTimeController.text);
+    final end = _parseDuration(_endTimeController.text);
+
+    if (start >= end) return;
+
+    provider.updateAudioOverlay(
+      id,
+      audioFile: _selectedAudioFile,
+      startTime: start,
+      endTime: end,
+      audioStartOffset: _audioStartOffset,
+      volume: _volume,
+      fadeIn: _fadeIn,
+      fadeOut: _fadeOut,
+    );
   }
 
   Widget _buildHeader(VideoEditorProvider provider) {
@@ -122,19 +145,18 @@ class _AudioOverlayEditorState extends State<AudioOverlayEditor> {
                 padding: const EdgeInsets.all(6),
                 constraints: const BoxConstraints(minWidth: 32, minHeight: 32),
               ),
-            const SizedBox(width: 6),
-            ElevatedButton(
-              onPressed: isEditing
-                  ? () => _updateSelectedOverlay(provider)
-                  : () => _addAudioOverlay(provider),
-              style: ElevatedButton.styleFrom(
-                padding:
-                    const EdgeInsets.symmetric(horizontal: 14, vertical: 8),
-                minimumSize: const Size(0, 32),
+            if (!isEditing) ...[
+              const SizedBox(width: 6),
+              ElevatedButton(
+                onPressed: () => _addAudioOverlay(provider),
+                style: ElevatedButton.styleFrom(
+                  padding:
+                      const EdgeInsets.symmetric(horizontal: 14, vertical: 8),
+                  minimumSize: const Size(0, 32),
+                ),
+                child: const Text('Add', style: TextStyle(fontSize: 12)),
               ),
-              child: Text(isEditing ? 'Update' : 'Add',
-                  style: const TextStyle(fontSize: 12)),
-            ),
+            ],
           ],
         )
       ],
@@ -163,7 +185,7 @@ class _AudioOverlayEditorState extends State<AudioOverlayEditor> {
                 iconColor: const Color(0xFFC4A1FF),
                 iconBgColor: const Color(0xFFC4A1FF).withOpacity(0.15),
                 label: 'Select Track',
-                onTap: _selectAudioFile,
+                onTap: () => _selectAudioFile(provider),
               ),
             ),
             const SizedBox(width: 12),
@@ -173,7 +195,7 @@ class _AudioOverlayEditorState extends State<AudioOverlayEditor> {
                 iconColor: const Color(0xFFFF8FA3),
                 iconBgColor: const Color(0xFFFF8FA3).withOpacity(0.15),
                 label: 'Record Audio',
-                onTap: _showAudioRecorder,
+                onTap: () => _showAudioRecorder(provider),
               ),
             ),
           ],
@@ -251,14 +273,15 @@ class _AudioOverlayEditorState extends State<AudioOverlayEditor> {
     );
   }
 
-  void _showAudioRecorder() {
+  void _showAudioRecorder(VideoEditorProvider provider) {
     showAudioRecorderSheet(
       context,
-      onRecordingComplete: (File recordedFile) {
+      onRecordingComplete: (File recordedFile) async {
         setState(() => _selectedAudioFile = recordedFile);
 
         // Get audio duration and set end time
-        _getAudioDuration(recordedFile.path);
+        await _getAudioDuration(recordedFile.path);
+        _autoUpdate(provider);
       },
     );
   }
@@ -270,8 +293,9 @@ class _AudioOverlayEditorState extends State<AudioOverlayEditor> {
       if (player.duration != null) {
         final audioDuration = player.duration!;
 
-        // Always place new audio at the beginning of the timeline
-        final start = Duration.zero;
+        final start = _startTimeController.text.isNotEmpty
+            ? _parseDuration(_startTimeController.text)
+            : Duration.zero;
         final end = start + audioDuration;
 
         setState(() {
@@ -285,7 +309,7 @@ class _AudioOverlayEditorState extends State<AudioOverlayEditor> {
     }
   }
 
-  Widget _buildTimeField(String label, TextEditingController controller) {
+  Widget _buildTimeField(String label, TextEditingController controller, VideoEditorProvider provider) {
     return Column(
       crossAxisAlignment: CrossAxisAlignment.start,
       children: [
@@ -296,6 +320,7 @@ class _AudioOverlayEditorState extends State<AudioOverlayEditor> {
         const SizedBox(height: 4),
         TextField(
           controller: controller,
+          onChanged: (_) => _autoUpdate(provider),
           style: const TextStyle(color: AppColors.textPrimary, fontSize: 12),
           keyboardType: TextInputType.datetime,
           decoration: InputDecoration(
@@ -317,7 +342,7 @@ class _AudioOverlayEditorState extends State<AudioOverlayEditor> {
     );
   }
 
-  Widget _buildOffsetSlider() {
+  Widget _buildOffsetSlider(VideoEditorProvider provider) {
     return SliderTheme(
       data: SliderThemeData(
         trackHeight: 2,
@@ -332,13 +357,15 @@ class _AudioOverlayEditorState extends State<AudioOverlayEditor> {
         value: _audioStartOffset.inSeconds.toDouble(),
         min: 0,
         max: 60,
-        onChanged: (v) =>
-            setState(() => _audioStartOffset = Duration(seconds: v.toInt())),
+        onChanged: (v) {
+          setState(() => _audioStartOffset = Duration(seconds: v.toInt()));
+          _autoUpdate(provider);
+        },
       ),
     );
   }
 
-  Widget _buildVolumeSliderContainer() {
+  Widget _buildVolumeSliderContainer(VideoEditorProvider provider) {
     return Container(
       padding: const EdgeInsets.symmetric(horizontal: 16, vertical: 16),
       decoration: BoxDecoration(
@@ -386,7 +413,10 @@ class _AudioOverlayEditorState extends State<AudioOverlayEditor> {
               value: _volume,
               min: 0.0,
               max: 2.0,
-              onChanged: (v) => setState(() => _volume = v),
+              onChanged: (v) {
+                setState(() => _volume = v);
+                _autoUpdate(provider);
+              },
             ),
           ),
         ],
@@ -394,12 +424,18 @@ class _AudioOverlayEditorState extends State<AudioOverlayEditor> {
     );
   }
 
-  Widget _buildFadeControls() {
+  Widget _buildFadeControls(VideoEditorProvider provider) {
     return Row(
       children: [
-        _buildToggle('Fade In', _fadeIn, (v) => setState(() => _fadeIn = v)),
+        _buildToggle('Fade In', _fadeIn, (v) {
+          setState(() => _fadeIn = v);
+          _autoUpdate(provider);
+        }),
         const SizedBox(width: 12),
-        _buildToggle('Fade Out', _fadeOut, (v) => setState(() => _fadeOut = v)),
+        _buildToggle('Fade Out', _fadeOut, (v) {
+          setState(() => _fadeOut = v);
+          _autoUpdate(provider);
+        }),
       ],
     );
   }
@@ -441,15 +477,13 @@ class _AudioOverlayEditorState extends State<AudioOverlayEditor> {
     );
   }
 
-  Future<void> _selectAudioFile() async {
+  Future<void> _selectAudioFile(VideoEditorProvider provider) async {
     try {
       final result = await FilePicker.platform.pickFiles(type: FileType.audio);
       if (result != null && result.files.single.path != null) {
         setState(() => _selectedAudioFile = File(result.files.single.path!));
-
-        if (_endTimeController.text.isEmpty) {
-          await _getAudioDuration(_selectedAudioFile!.path);
-        }
+        await _getAudioDuration(_selectedAudioFile!.path);
+        _autoUpdate(provider);
       }
     } catch (e) {
       _showErrorDialog('Failed to select file: $e');
@@ -498,7 +532,7 @@ class _AudioOverlayEditorState extends State<AudioOverlayEditor> {
     );
 
     _clearFields();
-    provider.toggleAudioEditor();
+    provider.toggleTimeline();
   }
 
   Future<void> _updateSelectedOverlay(VideoEditorProvider provider) async {
@@ -515,6 +549,7 @@ class _AudioOverlayEditorState extends State<AudioOverlayEditor> {
 
     await provider.updateAudioOverlay(
       id,
+      audioFile: _selectedAudioFile,
       startTime: start,
       endTime: end,
       audioStartOffset: _audioStartOffset,

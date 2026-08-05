@@ -152,13 +152,6 @@ class _StickerPanelState extends State<StickerPanel> {
               color: AppColors.textPrimary,
             ),
           ),
-          const Spacer(),
-          IconButton(
-            icon: const Icon(Icons.close, color: AppColors.textSecondary),
-            onPressed: () {
-              _closeStickerPanel();
-            },
-          ),
         ],
       ),
     );
@@ -209,6 +202,6 @@ class _StickerPanelState extends State<StickerPanel> {
 
   void _closeStickerPanel() {
     final provider = Provider.of<VideoEditorProvider>(context, listen: false);
-    provider.toggleStickerPanel();
+    provider.toggleTimeline();
   }
 }
