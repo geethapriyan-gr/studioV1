@@ -149,7 +149,7 @@ class VideoEditorProvider extends ChangeNotifier {
       Map.unmodifiable(_clipColorFilters);
 
   // Track management for multiple overlay and audio tracks
-  int _overlayTrackCount = 2;
+  int _overlayTrackCount = 1;
   int _audioTrackCount = 1;
 
   int get overlayTrackCount => _overlayTrackCount;
@@ -157,13 +157,13 @@ class VideoEditorProvider extends ChangeNotifier {
 
   void _updateTrackCountsFromProject() {
     if (_currentProject == null) {
-      _overlayTrackCount = 2;
+      _overlayTrackCount = 1;
       _audioTrackCount = 1;
       return;
     }
     
     // Find maximum track index used by existing overlay clips
-    int maxOverlayIndex = 1; // Default to 2 tracks (index 0 and 1)
+    int maxOverlayIndex = 0; // Default to 1 track (index 0)
     for (final clip in _currentProject!.overlayClips) {
       if (clip.trackIndex > maxOverlayIndex) {
         maxOverlayIndex = clip.trackIndex;
@@ -1115,7 +1115,7 @@ class VideoEditorProvider extends ChangeNotifier {
       id: _uuid.v4(),
       name: name,
     );
-    _overlayTrackCount = 2;
+    _overlayTrackCount = 1;
     _audioTrackCount = 1;
     _resetControllers();
     _undoStack.clear();
@@ -1131,7 +1131,7 @@ class VideoEditorProvider extends ChangeNotifier {
     _currentPosition = Duration.zero;
     _undoStack.clear();
     _redoStack.clear();
-    _overlayTrackCount = 2;
+    _overlayTrackCount = 1;
     _audioTrackCount = 1;
     notifyListeners();
   }
@@ -1551,8 +1551,11 @@ class VideoEditorProvider extends ChangeNotifier {
       final elapsedInOverlay = now - overlay.startTime;
       final audioPos = overlay.audioStartOffset + elapsedInOverlay;
 
-      await player.seek(audioPos);
-      if (!player.playing) {
+      const driftTolerance = Duration(milliseconds: 250);
+      if (!player.playing || (player.position - audioPos).abs() > driftTolerance) {
+        await player.seek(audioPos);
+      }
+      if (_isPlaying && !player.playing) {
         await player.play();
       }
     }
@@ -3825,9 +3828,7 @@ class VideoEditorProvider extends ChangeNotifier {
     final seekSerial = _seekSyncSerial;
 
     _stopTimelineClock();
-    for (final p in _audioPlayers.values) {
-      unawaited(p.pause());
-    }
+    unawaited(_syncAudioPlayback());
 
     unawaited(_recoverVideoAndResumePlayback(
       clip,
