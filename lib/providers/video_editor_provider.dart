@@ -140,6 +140,33 @@ class VideoEditorProvider extends ChangeNotifier {
   final Map<String, AudioPlayer> _audioPlayers = {};
   final Map<String, double> _lastSetOverlayVolume = {};
   final Map<String, List<double>> _waveformCache = {};
+  final Map<String, String> _audioSourceConfigCache = {};
+
+  Future<void> _configureAudioPlayerSource(
+      AudioPlayer player, AudioOverlay overlay) async {
+    final clipStart = overlay.audioStartOffset;
+    final clipDuration = overlay.endTime - overlay.startTime;
+    final clipEnd = clipStart +
+        (clipDuration < Duration.zero ? Duration.zero : clipDuration);
+    final cacheKey =
+        '${overlay.audioFile.path}|${clipStart.inMilliseconds}|${clipEnd.inMilliseconds}';
+
+    if (_audioSourceConfigCache[overlay.id] == cacheKey) {
+      return;
+    }
+
+    try {
+      final clippingSource = ClippingAudioSource(
+        child: AudioSource.file(overlay.audioFile.path),
+        start: clipStart,
+        end: clipEnd,
+      );
+      await player.setAudioSource(clippingSource);
+      _audioSourceConfigCache[overlay.id] = cacheKey;
+    } catch (e) {
+      debugPrint('Error setting clipping audio source for ${overlay.id}: $e');
+    }
+  }
 
   // Per-clip color filters: key is clipId, value is the filter for that clip
   final Map<String, ColorFilter> _clipColorFilters = {};
@@ -1450,17 +1477,28 @@ class VideoEditorProvider extends ChangeNotifier {
       _playbackRecoveryInFlight = false;
       _seekPauseTimer?.cancel();
       _deferredSeekSyncTimer?.cancel();
-      await _pauseAllPreviewControllers();
       _isPlaying = false;
       _stopTimelineClock();
       _activePreviewClipId = null;
       _activeTransitionId = null;
+      notifyListeners();
+      await _pauseAllPreviewControllers();
       await _pauseAllAudioPlayers();
     } else {
       final serial = ++_seekSyncSerial;
       _seekPauseTimer?.cancel();
       _deferredSeekSyncTimer?.cancel();
+
+      // Reset position to zero if at the end of the timeline
+      final maxDuration = totalDuration;
+      if (_currentPosition >= maxDuration && maxDuration > Duration.zero) {
+        _currentPosition = Duration.zero;
+        _updateTimelineClock();
+      }
+
       _isPlaying = true;
+      notifyListeners();
+
       var canStartTimeline = true;
 
       final clip = _clipAtTimeline(_currentPosition);
@@ -1478,6 +1516,9 @@ class VideoEditorProvider extends ChangeNotifier {
             _activePreviewClipId = null;
             canStartTimeline = false;
             await _pauseAllPreviewControllers();
+            await _pauseAllAudioPlayers();
+            notifyListeners();
+            return;
           }
         } else {
           await _previewController?.pause();
@@ -1489,8 +1530,8 @@ class VideoEditorProvider extends ChangeNotifier {
       }
 
       if (_isPlaying && canStartTimeline) {
-        await _syncAudioPlayback(force: true);
         _startTimelineClock();
+        unawaited(_syncAudioPlayback(force: true));
       }
     }
     _startPositionListener();
@@ -1527,36 +1568,48 @@ class VideoEditorProvider extends ChangeNotifier {
 
     final now = _currentPosition;
     for (final overlay in _currentProject!.audioOverlays) {
-      final active = now >= overlay.startTime && now < overlay.endTime;
-      if (!active) continue;
+      try {
+        final active = now >= overlay.startTime && now < overlay.endTime;
+        if (!active) continue;
 
-      var player = _audioPlayers[overlay.id];
-      if (player == null) {
-        try {
-          player = AudioPlayer();
-          _audioPlayers[overlay.id] = player;
-          await player.setFilePath(overlay.audioFile.path);
-        } catch (e) {
-          // Skip if failed to load
+        var player = _audioPlayers[overlay.id];
+        if (player == null) {
+          try {
+            player = AudioPlayer();
+            _audioPlayers[overlay.id] = player;
+          } catch (e) {
+            continue;
+          }
+        }
+        await _configureAudioPlayerSource(player, overlay);
+
+        // Set volume
+        final effectiveVolume =
+            (overlay.volume * _audioMasterVolume).clamp(0.0, 1.0);
+        await player.setVolume(effectiveVolume);
+
+        // Calculate position and play
+        final elapsedInOverlay = now - overlay.startTime;
+
+        final playerDur = player.duration;
+        if (playerDur != null && elapsedInOverlay >= playerDur) {
+          if (player.playing) {
+            await player.pause();
+          }
           continue;
         }
-      }
 
-      // Set volume
-      final effectiveVolume =
-          (overlay.volume * _audioMasterVolume).clamp(0.0, 1.0);
-      await player.setVolume(effectiveVolume);
+        final clampedPos = elapsedInOverlay < Duration.zero ? Duration.zero : elapsedInOverlay;
 
-      // Calculate position and play
-      final elapsedInOverlay = now - overlay.startTime;
-      final audioPos = overlay.audioStartOffset + elapsedInOverlay;
-
-      const driftTolerance = Duration(milliseconds: 250);
-      if (!player.playing || (player.position - audioPos).abs() > driftTolerance) {
-        await player.seek(audioPos);
-      }
-      if (_isPlaying && !player.playing) {
-        await player.play();
+        const driftTolerance = Duration(milliseconds: 350);
+        if (!player.playing || (player.position - clampedPos).abs() > driftTolerance) {
+          await player.seek(clampedPos);
+        }
+        if (_isPlaying && !player.playing) {
+          await player.play();
+        }
+      } catch (e) {
+        debugPrint('Error preparing audio overlay ${overlay.id}: $e');
       }
     }
   }
@@ -1693,13 +1746,13 @@ class VideoEditorProvider extends ChangeNotifier {
     required bool controllerBuffering,
     required Duration controllerPosition,
     required Duration expectedPosition,
-    Duration driftTolerance = _videoDriftTolerance,
+    Duration driftTolerance = const Duration(milliseconds: 1200),
   }) {
     if (!isPlayingRequested) return false;
     if (!controllerInitialized) return true;
 
-    final drift = (controllerPosition - expectedPosition).abs();
     if (!controllerPlaying && !controllerBuffering) return true;
+    final drift = (controllerPosition - expectedPosition).abs();
     return drift > driftTolerance;
   }
 
@@ -2640,11 +2693,13 @@ class VideoEditorProvider extends ChangeNotifier {
       final oldPlayer = _audioPlayers.remove(overlayId);
       if (oldPlayer != null) {
         try {
+          await oldPlayer.stop();
           await oldPlayer.dispose();
         } catch (_) {}
       }
       _waveformCache.remove(overlayId);
       _lastSetOverlayVolume.remove(overlayId);
+      _audioSourceConfigCache.remove(overlayId);
     }
 
     final updatedOverlay = overlay.copyWith(
@@ -2656,6 +2711,7 @@ class VideoEditorProvider extends ChangeNotifier {
       fadeIn: fadeIn,
       fadeOut: fadeOut,
     );
+    _audioSourceConfigCache.remove(overlayId);
     recordUndo();
     _currentProject =
         _currentProject!.updateAudioOverlay(overlayId, updatedOverlay);
@@ -2682,8 +2738,18 @@ class VideoEditorProvider extends ChangeNotifier {
       _selectedAudioOverlayId = null;
     }
     final player = _audioPlayers.remove(overlayId);
-    await player?.dispose();
+    if (player != null) {
+      try {
+        await player.stop();
+        await player.dispose();
+      } catch (_) {}
+    }
     _waveformCache.remove(overlayId);
+    _lastSetOverlayVolume.remove(overlayId);
+    _audioSourceConfigCache.remove(overlayId);
+    if (_isPlaying) {
+      unawaited(_syncAudioPlayback(force: true));
+    }
     _scheduleAutoSave();
     notifyListeners();
   }
@@ -2728,9 +2794,19 @@ class VideoEditorProvider extends ChangeNotifier {
     _currentProject = _currentProject!.copyWith(audioOverlays: overlays);
     _selectedAudioOverlayId = secondPart.id;
     final oldPlayer = _audioPlayers.remove(overlayId);
-    unawaited(oldPlayer?.dispose());
+    if (oldPlayer != null) {
+      unawaited(() async {
+        try {
+          await oldPlayer.stop();
+          await oldPlayer.dispose();
+        } catch (_) {}
+      }());
+    }
+    _audioSourceConfigCache.remove(overlayId);
+    _lastSetOverlayVolume.remove(overlayId);
+    _waveformCache.remove(overlayId);
     if (_isPlaying) {
-      unawaited(_syncAudioPlayback());
+      unawaited(_syncAudioPlayback(force: true));
     }
     _scheduleAutoSave();
     notifyListeners();
@@ -3873,7 +3949,11 @@ class VideoEditorProvider extends ChangeNotifier {
       if (!isCurrent()) return;
       if (synced) {
         _activePreviewClipId = clip.id;
-        await _prepareAudioForPlayback();
+        try {
+          await _prepareAudioForPlayback();
+        } catch (e) {
+          debugPrint('Error preparing audio in recovery: $e');
+        }
         if (isCurrent()) {
           _startTimelineClock();
         }
@@ -3881,9 +3961,12 @@ class VideoEditorProvider extends ChangeNotifier {
         _isPlaying = false;
         _activePreviewClipId = null;
         await _pauseAllPreviewControllers();
-        for (final p in _audioPlayers.values) {
-          await p.pause();
-        }
+        await _pauseAllAudioPlayers();
+      }
+    } catch (e) {
+      debugPrint('Error in _recoverVideoAndResumePlayback: $e');
+      if (isCurrent()) {
+        _startTimelineClock();
       }
     } finally {
       if (recoverySerial == _playbackRecoverySerial) {
@@ -4123,6 +4206,10 @@ class VideoEditorProvider extends ChangeNotifier {
       _redoStack.add(_currentProject!);
     }
     _currentProject = _undoStack.removeLast();
+    _audioSourceConfigCache.clear();
+    if (_isPlaying) {
+      unawaited(_syncAudioPlayback(force: true));
+    }
     _scheduleAutoSave();
     notifyListeners();
   }
@@ -4133,6 +4220,10 @@ class VideoEditorProvider extends ChangeNotifier {
       _undoStack.add(_currentProject!);
     }
     _currentProject = _redoStack.removeLast();
+    _audioSourceConfigCache.clear();
+    if (_isPlaying) {
+      unawaited(_syncAudioPlayback(force: true));
+    }
     _scheduleAutoSave();
     notifyListeners();
   }
@@ -4194,7 +4285,7 @@ class VideoEditorProvider extends ChangeNotifier {
       try {
         final player = AudioPlayer();
         _audioPlayers[overlay.id] = player;
-        await player.setFilePath(overlay.audioFile.path);
+        await _configureAudioPlayerSource(player, overlay);
         // Set initial volume
         final effectiveVolume =
             (overlay.volume * _audioMasterVolume).clamp(0.0, 1.0);
@@ -4280,15 +4371,25 @@ class VideoEditorProvider extends ChangeNotifier {
         if (force) {
           await Future.wait(overlays.map((overlay) async {
             final active = now >= overlay.startTime && now < overlay.endTime;
-            if (!active) return;
             final player = _audioPlayers[overlay.id];
-            if (player != null) {
-              final elapsed = now - overlay.startTime;
-              final audioPos = overlay.audioStartOffset + elapsed;
-              try {
-                await player.seek(audioPos);
-              } catch (_) {}
+            if (player == null) return;
+            if (!active) {
+              if (player.playing) {
+                try {
+                  await player.pause();
+                } catch (_) {}
+              }
+              return;
             }
+            await _configureAudioPlayerSource(player, overlay);
+            final elapsed = now - overlay.startTime;
+            try {
+              final playerDur = player.duration;
+              final clampedPos = (playerDur != null && elapsed > playerDur)
+                  ? playerDur
+                  : (elapsed < Duration.zero ? Duration.zero : elapsed);
+              await player.seek(clampedPos);
+            } catch (_) {}
           }));
         }
         return;
@@ -4296,50 +4397,63 @@ class VideoEditorProvider extends ChangeNotifier {
 
       // Process all audio overlays concurrently to prevent one player from blocking others
       await Future.wait(overlays.map((overlay) async {
-        final active = now >= overlay.startTime && now < overlay.endTime;
-        final id = overlay.id;
-        var player = _audioPlayers[id];
-        if (player == null) {
-          try {
-            player = AudioPlayer();
-            _audioPlayers[id] = player;
-            await player.setFilePath(overlay.audioFile.path);
-          } catch (e) {
-            return;
+        try {
+          final active = now >= overlay.startTime && now < overlay.endTime;
+          final id = overlay.id;
+          var player = _audioPlayers[id];
+          if (player == null) {
+            try {
+              player = AudioPlayer();
+              _audioPlayers[id] = player;
+            } catch (e) {
+              return;
+            }
           }
-        }
+          await _configureAudioPlayerSource(player, overlay);
 
-        final effectiveOverlayVolume =
-            (overlay.volume * _audioMasterVolume).clamp(0.0, 1.0);
-        final lastVol = _lastSetOverlayVolume[id];
-        if (lastVol == null ||
-            (lastVol - effectiveOverlayVolume).abs() > 0.01) {
-          await player.setVolume(effectiveOverlayVolume);
-          _lastSetOverlayVolume[id] = effectiveOverlayVolume;
-        }
+          final effectiveOverlayVolume =
+              (overlay.volume * _audioMasterVolume).clamp(0.0, 1.0);
+          final lastVol = _lastSetOverlayVolume[id];
+          if (lastVol == null ||
+              (lastVol - effectiveOverlayVolume).abs() > 0.01) {
+            await player.setVolume(effectiveOverlayVolume);
+            _lastSetOverlayVolume[id] = effectiveOverlayVolume;
+          }
 
-        final elapsedInOverlay = now - overlay.startTime;
-        final audioPos = overlay.audioStartOffset + elapsedInOverlay;
+          final elapsedInOverlay = now - overlay.startTime;
 
-        if (active) {
-          // Increase tolerance from 20ms to 250ms to prevent continuous re-seeking during normal playback
-          const driftTolerance = Duration(milliseconds: 250);
-          final pos = player.position;
-          final isPlayingNow = player.playing;
-          final drift = (pos - audioPos).abs();
+          if (active) {
+            final playerDur = player.duration;
+            if (playerDur != null && elapsedInOverlay >= playerDur) {
+              if (player.playing) {
+                await player.pause();
+              }
+              return;
+            }
 
-          if (!isPlayingNow || drift > driftTolerance) {
-            await player.seek(audioPos);
-            if (_isPlaying) {
-              await player.play();
-            } else {
+            final clampedPos =
+                elapsedInOverlay < Duration.zero ? Duration.zero : elapsedInOverlay;
+
+            const driftTolerance = Duration(milliseconds: 350);
+            final pos = player.position;
+            final isPlayingNow = player.playing;
+            final drift = (pos - clampedPos).abs();
+
+            if (!isPlayingNow || drift > driftTolerance) {
+              await player.seek(clampedPos);
+              if (_isPlaying) {
+                await player.play();
+              } else {
+                await player.pause();
+              }
+            }
+          } else {
+            if (player.playing) {
               await player.pause();
             }
           }
-        } else {
-          if (player.playing) {
-            await player.pause();
-          }
+        } catch (e) {
+          debugPrint('Error syncing audio overlay ${overlay.id}: $e');
         }
       }));
 
@@ -4347,12 +4461,16 @@ class VideoEditorProvider extends ChangeNotifier {
       for (final entry in _audioPlayers.entries.toList()) {
         if (!validIds.contains(entry.key)) {
           try {
+            await entry.value.stop();
             await entry.value.dispose();
           } catch (_) {}
           _audioPlayers.remove(entry.key);
           _lastSetOverlayVolume.remove(entry.key);
+          _audioSourceConfigCache.remove(entry.key);
         }
       }
+    } catch (e) {
+      debugPrint('Error in _syncAudioPlayback: $e');
     } finally {
       _lastAudioSync = DateTime.now();
       _audioSyncInProgress = false;
