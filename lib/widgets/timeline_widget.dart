@@ -11,6 +11,7 @@ import '../services/video_thumbnail_service.dart';
 import '../services/media_picker_service.dart';
 import 'waveform_painter.dart';
 import '../utils/responsive.dart';
+import '../utils/track_allocation.dart';
 
 /// Wrapper class to distinguish overlay clip drags from main video clip drags.
 /// This prevents cross-track drag-and-drop interference.
@@ -456,6 +457,34 @@ class _TimelineWidgetState extends State<TimelineWidget>
               });
             }
 
+            final textAllocation = computeTrackAllocation<TextOverlay>(
+              items: provider.currentProject?.textOverlays ?? [],
+              getId: (t) => t.id,
+              getStartTime: (t) => t.startTime,
+              getEndTime: (t) => t.endTime,
+            );
+
+            final stickerAllocation = computeTrackAllocation<StickerModel>(
+              items: provider.currentProject?.stickers ?? [],
+              getId: (s) => s.id,
+              getStartTime: (s) => s.startTime,
+              getEndTime: (s) => s.endTime,
+            );
+
+            final overlayAllocation = computeTrackAllocation<VideoClip>(
+              items: provider.currentProject?.overlayClips ?? [],
+              getId: (c) => c.id,
+              getStartTime: (c) => c.startTime,
+              getEndTime: (c) => c.endTime,
+            );
+
+            final audioAllocation = computeTrackAllocation<AudioOverlay>(
+              items: provider.currentProject?.audioOverlays ?? [],
+              getId: (a) => a.id,
+              getStartTime: (a) => a.startTime,
+              getEndTime: (a) => a.endTime,
+            );
+
             return Column(
               children: [
                 if (!isCompact) _buildTimelineControls(provider),
@@ -497,42 +526,27 @@ class _TimelineWidgetState extends State<TimelineWidget>
                                         mainAxisSize: MainAxisSize.min,
                                         children: [
                                           _buildTimeRuler(provider),
-                                          _buildTextOverlayTrack(provider),
-                                          _buildStickerTrack(provider),
+                                          for (int i = 0;
+                                              i < textAllocation.trackCount;
+                                              i++)
+                                            _buildTextOverlayTrack(
+                                                provider, i, textAllocation),
+                                          for (int i = 0;
+                                              i < stickerAllocation.trackCount;
+                                              i++)
+                                            _buildStickerTrack(
+                                                provider, i, stickerAllocation),
                                           _buildVideoTracks(provider),
                                           for (int i = 0;
-                                              i < provider.overlayTrackCount;
+                                              i < overlayAllocation.trackCount;
                                               i++)
-                                            _buildOverlayTrack(provider, i),
-                                          // Spacer for "+ Overlay" button row
-                                          Container(
-                                            height: _trackHeight,
-                                            decoration: BoxDecoration(
-                                              border: Border(
-                                                bottom: BorderSide(
-                                                    color: AppColors.border
-                                                        .withOpacity(0.5),
-                                                    width: 1),
-                                              ),
-                                            ),
-                                          ),
+                                            _buildOverlayTrack(
+                                                provider, i, overlayAllocation),
                                           for (int i = 0;
-                                              i < provider.audioTrackCount;
+                                              i < audioAllocation.trackCount;
                                               i++)
                                             _buildAudioOverlayTrack(
-                                                provider, i),
-                                          // Spacer for "+ Music" button row
-                                          Container(
-                                            height: _trackHeight,
-                                            decoration: BoxDecoration(
-                                              border: Border(
-                                                bottom: BorderSide(
-                                                    color: AppColors.border
-                                                        .withOpacity(0.5),
-                                                    width: 1),
-                                              ),
-                                            ),
-                                          ),
+                                                provider, i, audioAllocation),
                                         ],
                                       ),
                                     ),
@@ -544,7 +558,11 @@ class _TimelineWidgetState extends State<TimelineWidget>
                                 top: 0,
                                 bottom: 0,
                                 child: _buildFixedLeftTrackControlsColumn(
-                                    provider),
+                                    provider,
+                                    textAllocation,
+                                    stickerAllocation,
+                                    overlayAllocation,
+                                    audioAllocation),
                               ),
                             ],
                           ),
@@ -627,7 +645,12 @@ class _TimelineWidgetState extends State<TimelineWidget>
     );
   }
 
-  Widget _buildFixedLeftTrackControlsColumn(VideoEditorProvider provider) {
+  Widget _buildFixedLeftTrackControlsColumn(
+      VideoEditorProvider provider,
+      TrackAllocationResult textAllocation,
+      TrackAllocationResult stickerAllocation,
+      TrackAllocationResult overlayAllocation,
+      TrackAllocationResult audioAllocation) {
     return Container(
       width: 56,
       decoration: BoxDecoration(
@@ -650,22 +673,32 @@ class _TimelineWidgetState extends State<TimelineWidget>
                   Border(bottom: BorderSide(color: AppColors.border, width: 1)),
             ),
           ),
-          _buildTrackControlPanel(
-              'Text', Icons.text_fields, () => _openTextEditor(provider)),
-          _buildTrackControlPanel('Stickers', Icons.emoji_emotions,
-              () => _openStickerPanel(provider)),
+          for (int i = 0; i < textAllocation.trackCount; i++)
+            _buildTrackControlPanel(
+              textAllocation.trackCount > 1 ? 'Text ${i + 1}' : 'Text',
+              Icons.text_fields,
+              () => _openTextEditor(provider),
+            ),
+          for (int i = 0; i < stickerAllocation.trackCount; i++)
+            _buildTrackControlPanel(
+              stickerAllocation.trackCount > 1 ? 'Sticker ${i + 1}' : 'Stickers',
+              Icons.emoji_emotions,
+              () => _openStickerPanel(provider),
+            ),
           _buildTrackControlPanel('Video', Icons.videocam_outlined,
               () => _openMainVideoPicker(provider)),
-          for (int i = 0; i < provider.overlayTrackCount; i++)
-            _buildTrackControlPanel('Overlay ${i + 1}', Icons.layers, null),
-          _buildTrackControlPanel('+ Overlay', Icons.add_to_photos, () {
-            provider.addOverlayTrack();
-          }),
-          for (int i = 0; i < provider.audioTrackCount; i++)
-            _buildTrackControlPanel('Audio ${i + 1}', Icons.music_note, null),
-          _buildTrackControlPanel('+ Music', Icons.queue_music, () {
-            provider.addAudioTrack();
-          }),
+          for (int i = 0; i < overlayAllocation.trackCount; i++)
+            _buildTrackControlPanel(
+              overlayAllocation.trackCount > 1 ? 'Overlay ${i + 1}' : 'Overlay',
+              Icons.layers,
+              () => _openOverlayPicker(provider),
+            ),
+          for (int i = 0; i < audioAllocation.trackCount; i++)
+            _buildTrackControlPanel(
+              audioAllocation.trackCount > 1 ? 'Audio ${i + 1}' : 'Audio',
+              Icons.music_note,
+              () => _openAudioEditor(provider),
+            ),
         ],
       ),
     );
@@ -966,9 +999,10 @@ class _TimelineWidgetState extends State<TimelineWidget>
     return indicators;
   }
 
-  Widget _buildTextOverlayTrack(VideoEditorProvider provider) {
+  Widget _buildTextOverlayTrack(
+      VideoEditorProvider provider, int trackIndex, TrackAllocationResult textAllocation) {
     return DragTarget<TextOverlay>(
-      key: _textTrackKey,
+      key: ValueKey('text_track_$trackIndex'),
       onWillAcceptWithDetails: (_) => true,
       onAcceptWithDetails: (details) {
         final dropTime =
@@ -986,6 +1020,11 @@ class _TimelineWidgetState extends State<TimelineWidget>
           trackColor = AppColors.surface;
         }
 
+        final trackOverlays = (provider.currentProject?.textOverlays ?? [])
+            .where((overlay) =>
+                (textAllocation.itemToTrackMap[overlay.id] ?? 0) == trackIndex)
+            .toList();
+
         return Container(
           height: _trackHeight,
           color: trackColor,
@@ -1002,7 +1041,7 @@ class _TimelineWidgetState extends State<TimelineWidget>
                 ),
                 child: const SizedBox.shrink(),
               ),
-              ...provider.currentProject!.textOverlays
+              ...trackOverlays
                   .map((overlay) => _buildTextOverlayWidget(overlay, provider)),
             ],
           ),
@@ -1011,7 +1050,8 @@ class _TimelineWidgetState extends State<TimelineWidget>
     );
   }
 
-  Widget _buildOverlayTrack(VideoEditorProvider provider, int trackIndex) {
+  Widget _buildOverlayTrack(
+      VideoEditorProvider provider, int trackIndex, TrackAllocationResult overlayAllocation) {
     return DragTarget<OverlayClipDragData>(
       key: ValueKey('overlay_track_$trackIndex'),
       onWillAcceptWithDetails: (_) => true,
@@ -1020,8 +1060,7 @@ class _TimelineWidgetState extends State<TimelineWidget>
         // Simply move the overlay clip to the drop position (free positioning like text/audio)
         final dropTime =
             _calculateDropTime(details.offset, provider.totalDuration);
-        provider.moveOverlayClip(draggedClip.id, dropTime,
-            trackIndex: trackIndex);
+        provider.moveOverlayClip(draggedClip.id, dropTime);
       },
       builder: (context, candidateData, rejectedData) {
         // Determine track color based on drag state
@@ -1034,9 +1073,14 @@ class _TimelineWidgetState extends State<TimelineWidget>
           trackColor = AppColors.surface;
         }
 
+        final trackClips = (provider.currentProject?.overlayClips ?? [])
+            .where((clip) =>
+                (overlayAllocation.itemToTrackMap[clip.id] ?? 0) == trackIndex)
+            .toList();
+
         return GestureDetector(
           behavior: HitTestBehavior.translucent,
-          onTap: () => _openOverlayPicker(provider, trackIndex: trackIndex),
+          onTap: () => _openOverlayPicker(provider),
           child: Container(
             height: _trackHeight,
             color: trackColor,
@@ -1053,8 +1097,7 @@ class _TimelineWidgetState extends State<TimelineWidget>
                   ),
                   child: const SizedBox.shrink(),
                 ),
-                ...provider.currentProject!.overlayClips
-                    .where((clip) => clip.trackIndex == trackIndex)
+                ...trackClips
                     .map((clip) => _buildOverlayClipWidget(clip, provider)),
               ],
             ),
@@ -1064,9 +1107,10 @@ class _TimelineWidgetState extends State<TimelineWidget>
     );
   }
 
-  Widget _buildStickerTrack(VideoEditorProvider provider) {
+  Widget _buildStickerTrack(
+      VideoEditorProvider provider, int trackIndex, TrackAllocationResult stickerAllocation) {
     return DragTarget<StickerModel>(
-      key: _stickerTrackKey,
+      key: ValueKey('sticker_track_$trackIndex'),
       onWillAcceptWithDetails: (_) => true,
       onAcceptWithDetails: (details) {
         final dropTime =
@@ -1082,6 +1126,11 @@ class _TimelineWidgetState extends State<TimelineWidget>
         } else {
           trackColor = AppColors.surface;
         }
+
+        final trackStickers = (provider.currentProject?.stickers ?? [])
+            .where((sticker) =>
+                (stickerAllocation.itemToTrackMap[sticker.id] ?? 0) == trackIndex)
+            .toList();
 
         return Container(
           height: _trackHeight,
@@ -1099,7 +1148,7 @@ class _TimelineWidgetState extends State<TimelineWidget>
                 ),
                 child: const SizedBox.shrink(),
               ),
-              ...provider.currentProject!.stickers
+              ...trackStickers
                   .map((sticker) => _buildStickerWidget(sticker, provider)),
             ],
           ),
@@ -1252,7 +1301,8 @@ class _TimelineWidgetState extends State<TimelineWidget>
     );
   }
 
-  Widget _buildAudioOverlayTrack(VideoEditorProvider provider, int trackIndex) {
+  Widget _buildAudioOverlayTrack(
+      VideoEditorProvider provider, int trackIndex, TrackAllocationResult audioAllocation) {
     return DragTarget<AudioOverlay>(
       key: ValueKey('audio_track_$trackIndex'),
       onWillAcceptWithDetails: (_) => true,
@@ -1260,8 +1310,7 @@ class _TimelineWidgetState extends State<TimelineWidget>
         // Use totalDuration for audio to allow extending beyond video
         final dropTime =
             _calculateDropTime(details.offset, provider.totalDuration);
-        provider.moveAudioOverlay(details.data.id, dropTime,
-            trackIndex: trackIndex);
+        provider.moveAudioOverlay(details.data.id, dropTime);
       },
       builder: (context, candidateData, rejectedData) {
         // Determine track color based on drag state
@@ -1275,11 +1324,15 @@ class _TimelineWidgetState extends State<TimelineWidget>
           trackColor = AppColors.surface;
         }
 
+        final trackAudios = (provider.currentProject?.audioOverlays ?? [])
+            .where((overlay) =>
+                (audioAllocation.itemToTrackMap[overlay.id] ?? 0) == trackIndex)
+            .toList();
+
         return GestureDetector(
           behavior: HitTestBehavior.translucent,
           onTap: () {
-            provider.selectAudioTrack(trackIndex);
-            _openAudioEditor(provider, trackIndex: trackIndex);
+            _openAudioEditor(provider);
           },
           child: Container(
             height: _trackHeight,
@@ -1297,8 +1350,7 @@ class _TimelineWidgetState extends State<TimelineWidget>
                   ),
                   child: const SizedBox.shrink(),
                 ),
-                ...provider.currentProject!.audioOverlays
-                    .where((overlay) => overlay.trackIndex == trackIndex)
+                ...trackAudios
                     .map(
                         (overlay) => _buildAudioOverlayWidget(overlay, provider)),
               ],

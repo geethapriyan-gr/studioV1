@@ -20,6 +20,7 @@ import '../services/export_service.dart';
 import '../services/chroma_key_service.dart';
 import '../services/waveform_service.dart';
 import '../services/hive_service.dart';
+import '../utils/track_allocation.dart';
 
 class VideoEditorProvider extends ChangeNotifier {
   VideoProject? _currentProject;
@@ -176,47 +177,59 @@ class VideoEditorProvider extends ChangeNotifier {
       Map.unmodifiable(_clipColorFilters);
 
   // Track management for multiple overlay and audio tracks
-  int _overlayTrackCount = 1;
-  int _audioTrackCount = 1;
-
-  int get overlayTrackCount => _overlayTrackCount;
-  int get audioTrackCount => _audioTrackCount;
-
-  void _updateTrackCountsFromProject() {
-    if (_currentProject == null) {
-      _overlayTrackCount = 1;
-      _audioTrackCount = 1;
-      return;
+  int get overlayTrackCount {
+    if (_currentProject == null || _currentProject!.overlayClips.isEmpty) {
+      return 1;
     }
-    
-    // Find maximum track index used by existing overlay clips
-    int maxOverlayIndex = 0; // Default to 1 track (index 0)
-    for (final clip in _currentProject!.overlayClips) {
-      if (clip.trackIndex > maxOverlayIndex) {
-        maxOverlayIndex = clip.trackIndex;
-      }
-    }
-    _overlayTrackCount = maxOverlayIndex + 1;
-
-    // Find maximum track index used by existing audio overlays
-    int maxAudioIndex = 0; // Default to 1 track (index 0)
-    for (final audio in _currentProject!.audioOverlays) {
-      if (audio.trackIndex > maxAudioIndex) {
-        maxAudioIndex = audio.trackIndex;
-      }
-    }
-    _audioTrackCount = maxAudioIndex + 1;
+    return computeTrackAllocation<VideoClip>(
+      items: _currentProject!.overlayClips,
+      getId: (c) => c.id,
+      getStartTime: (c) => c.startTime,
+      getEndTime: (c) => c.endTime,
+    ).trackCount;
   }
 
-  void addOverlayTrack() {
-    _overlayTrackCount++;
-    notifyListeners();
+  int get audioTrackCount {
+    if (_currentProject == null || _currentProject!.audioOverlays.isEmpty) {
+      return 1;
+    }
+    return computeTrackAllocation<AudioOverlay>(
+      items: _currentProject!.audioOverlays,
+      getId: (a) => a.id,
+      getStartTime: (a) => a.startTime,
+      getEndTime: (a) => a.endTime,
+    ).trackCount;
   }
 
-  void addAudioTrack() {
-    _audioTrackCount++;
-    notifyListeners();
+  int get textTrackCount {
+    if (_currentProject == null || _currentProject!.textOverlays.isEmpty) {
+      return 1;
+    }
+    return computeTrackAllocation<TextOverlay>(
+      items: _currentProject!.textOverlays,
+      getId: (t) => t.id,
+      getStartTime: (t) => t.startTime,
+      getEndTime: (t) => t.endTime,
+    ).trackCount;
   }
+
+  int get stickerTrackCount {
+    if (_currentProject == null || _currentProject!.stickers.isEmpty) {
+      return 1;
+    }
+    return computeTrackAllocation<StickerModel>(
+      items: _currentProject!.stickers,
+      getId: (s) => s.id,
+      getStartTime: (s) => s.startTime,
+      getEndTime: (s) => s.endTime,
+    ).trackCount;
+  }
+
+  void _updateTrackCountsFromProject() {}
+
+  void addOverlayTrack() {}
+
+  void addAudioTrack() {}
 
   VideoProject? get currentProject => _currentProject;
   VideoEditorController? get videoController => _videoController;
@@ -581,10 +594,6 @@ class VideoEditorProvider extends ChangeNotifier {
     // If there's an overlap, create a new track
     if (hasOverlap) {
       finalTrackIndex = _findAvailableAudioTrackIndex();
-      // Increase track count if needed
-      if (finalTrackIndex >= _audioTrackCount) {
-        _audioTrackCount = finalTrackIndex + 1;
-      }
     }
 
     final updated = overlay.copyWith(
@@ -1142,8 +1151,6 @@ class VideoEditorProvider extends ChangeNotifier {
       id: _uuid.v4(),
       name: name,
     );
-    _overlayTrackCount = 1;
-    _audioTrackCount = 1;
     _resetControllers();
     _undoStack.clear();
     _redoStack.clear();
@@ -1158,8 +1165,6 @@ class VideoEditorProvider extends ChangeNotifier {
     _currentPosition = Duration.zero;
     _undoStack.clear();
     _redoStack.clear();
-    _overlayTrackCount = 1;
-    _audioTrackCount = 1;
     notifyListeners();
   }
 
@@ -2606,10 +2611,6 @@ class VideoEditorProvider extends ChangeNotifier {
     // If there's an overlap, create a new track
     if (hasOverlap) {
       finalTrackIndex = _findAvailableAudioTrackIndex();
-      // Increase track count if needed
-      if (finalTrackIndex >= _audioTrackCount) {
-        _audioTrackCount = finalTrackIndex + 1;
-      }
     }
 
     // Debug print to verify track index
@@ -5040,10 +5041,6 @@ class VideoEditorProvider extends ChangeNotifier {
     // If there's an overlap, create a new track
     if (hasOverlap) {
       finalTrackIndex = _findAvailableTrackIndex();
-      // Increase track count if needed
-      if (finalTrackIndex >= _overlayTrackCount) {
-        _overlayTrackCount = finalTrackIndex + 1;
-      }
     }
 
     final updatedClip = originalClip.copyWith(
