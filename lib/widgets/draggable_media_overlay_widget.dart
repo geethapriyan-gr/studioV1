@@ -53,6 +53,14 @@ class _DraggableMediaOverlayState extends State<DraggableMediaOverlay> {
       _currentSize = widget.overlayClip.overlaySize;
       _disposeController();
       _initController();
+    } else {
+      if (oldWidget.overlayClip.volume != widget.overlayClip.volume ||
+          oldWidget.overlayClip.isMuted != widget.overlayClip.isMuted) {
+        final targetVol = widget.overlayClip.isMuted
+            ? 0.0
+            : widget.overlayClip.volume.clamp(0.0, 1.0);
+        _localController?.setVolume(targetVol);
+      }
     }
     if (oldWidget.previewController != widget.previewController) {
       _removePreviewControllerListener(oldWidget.previewController);
@@ -71,16 +79,22 @@ class _DraggableMediaOverlayState extends State<DraggableMediaOverlay> {
   void _initController() {
     if (widget.overlayClip.mediaType == MediaType.video &&
         widget.overlayClip.videoFile != null) {
-      _localController =
-          VideoPlayerController.file(widget.overlayClip.videoFile!)
-            ..setLooping(true)
-            ..initialize().then((_) {
-              if (mounted) {
-                setState(() {});
-                // Don't auto-play, wait for sync
-                _syncWithPreview();
-              }
-            });
+      _localController = VideoPlayerController.file(
+        widget.overlayClip.videoFile!,
+        videoPlayerOptions: VideoPlayerOptions(mixWithOthers: true),
+      )
+        ..setLooping(true)
+        ..initialize().then((_) {
+          if (mounted) {
+            final targetVol = widget.overlayClip.isMuted
+                ? 0.0
+                : widget.overlayClip.volume.clamp(0.0, 1.0);
+            _localController?.setVolume(targetVol);
+            setState(() {});
+            // Don't auto-play, wait for sync
+            _syncWithPreview();
+          }
+        });
     }
   }
 
@@ -159,14 +173,24 @@ class _DraggableMediaOverlayState extends State<DraggableMediaOverlay> {
     } else if (widget.overlayClip.mediaType == MediaType.video &&
         _localController != null &&
         _localController!.value.isInitialized) {
+      double videoWidth = _localController!.value.size.width;
+      double videoHeight = _localController!.value.size.height;
+      final rot = _localController!.value.rotationCorrection;
+      if ((rot % 180) != 0) {
+        videoWidth = _localController!.value.size.height;
+        videoHeight = _localController!.value.size.width;
+      }
       return ClipRRect(
         borderRadius: BorderRadius.circular(8),
         child: FittedBox(
           fit: BoxFit.contain,
           child: SizedBox(
-            width: _localController!.value.size.width,
-            height: _localController!.value.size.height,
-            child: VideoPlayer(_localController!),
+            width: videoWidth,
+            height: videoHeight,
+            child: VideoPlayer(
+              _localController!,
+              key: ValueKey(_localController),
+            ),
           ),
         ),
       );
@@ -174,7 +198,7 @@ class _DraggableMediaOverlayState extends State<DraggableMediaOverlay> {
     return Container(
       color: AppColors.surface,
       child: const Center(
-        child: Icon(Icons.media_bluetooth_off, color: AppColors.textTertiary),
+        child: Icon(Icons.videocam_outlined, color: AppColors.textTertiary),
       ),
     );
   }

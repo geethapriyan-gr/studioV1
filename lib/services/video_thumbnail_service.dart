@@ -1,3 +1,4 @@
+import 'dart:async';
 import 'dart:typed_data';
 import 'package:video_thumbnail/video_thumbnail.dart';
 
@@ -16,7 +17,18 @@ class VideoThumbnailService {
   final Set<String> _inFlight = {};
 
   // Maximum cache size (entries)
-  static const int _maxCacheSize = 500;
+  static const int _maxCacheSize = 300;
+
+  // Playback priority flag: when active, background extractions pause to avoid decoder contention
+  bool _isPlaybackActive = false;
+  bool get isPlaybackActive => _isPlaybackActive;
+
+  void setPlaybackActive(bool active) {
+    _isPlaybackActive = active;
+  }
+
+  // Sequential extraction lock to ensure only 1 native decoder extraction runs at a time
+  Future<void> _sequentialLock = Future.value();
 
   String _cacheKey(String videoPath, int timeMs) => '$videoPath|$timeMs';
 
@@ -27,18 +39,12 @@ class VideoThumbnailService {
     final key = _cacheKey(videoPath, 0);
     if (_cache.containsKey(key)) return _cache[key];
 
-    final bytes = await VideoThumbnail.thumbnailData(
-      video: videoPath,
-      imageFormat: ImageFormat.JPEG,
+    return getThumbnail(
+      videoPath: videoPath,
       timeMs: 0,
-      maxHeight: 120,
-      quality: 50,
+      maxHeight: 60,
+      quality: 40,
     );
-
-    if (bytes != null) {
-      _cache[key] = bytes;
-    }
-    return bytes;
   }
 
   /// Get a cached thumbnail, or null if not yet extracted.
@@ -52,7 +58,7 @@ class VideoThumbnailService {
     required String videoPath,
     required int timeMs,
     int maxHeight = 60,
-    int quality = 40,
+    int quality = 35,
   }) async {
     final key = _cacheKey(videoPath, timeMs);
 
@@ -63,44 +69,61 @@ class VideoThumbnailService {
     if (_inFlight.contains(key)) return null;
 
     _inFlight.add(key);
-    try {
-      final bytes = await VideoThumbnail.thumbnailData(
-        video: videoPath,
-        imageFormat: ImageFormat.JPEG,
-        timeMs: timeMs,
-        maxHeight: maxHeight,
-        quality: quality,
-      );
 
-      if (bytes != null) {
-        // Evict oldest entries if cache is full
-        if (_cache.length >= _maxCacheSize) {
-          final keysToRemove = _cache.keys.take(_cache.length - _maxCacheSize + 50).toList();
-          for (final k in keysToRemove) {
-            _cache.remove(k);
-          }
-        }
-        _cache[key] = bytes;
+    // Chain sequentially through the lock so only 1 decoder is active at any time
+    final completer = Completer<Uint8List?>();
+    _sequentialLock = _sequentialLock.then((_) async {
+      // If playback is currently active, pause/yield thumbnail generation
+      while (_isPlaybackActive) {
+        await Future.delayed(const Duration(milliseconds: 100));
       }
 
-      return bytes;
-    } catch (_) {
-      return null;
-    } finally {
-      _inFlight.remove(key);
-    }
+      try {
+        if (_cache.containsKey(key)) {
+          completer.complete(_cache[key]);
+          return;
+        }
+
+        final bytes = await VideoThumbnail.thumbnailData(
+          video: videoPath,
+          imageFormat: ImageFormat.JPEG,
+          timeMs: timeMs,
+          maxHeight: maxHeight,
+          quality: quality,
+        );
+
+        if (bytes != null) {
+          // Evict oldest entries if cache is full
+          if (_cache.length >= _maxCacheSize) {
+            final keysToRemove =
+                _cache.keys.take(_cache.length - _maxCacheSize + 30).toList();
+            for (final k in keysToRemove) {
+              _cache.remove(k);
+            }
+          }
+          _cache[key] = bytes;
+        }
+
+        completer.complete(bytes);
+      } catch (_) {
+        completer.complete(null);
+      } finally {
+        _inFlight.remove(key);
+      }
+    });
+
+    return completer.future;
   }
 
-  /// Generate thumbnails for a clip across its duration.
-  /// Returns the number of frames per second based on available width.
+  /// Generate thumbnails for a clip across its duration sequentially.
   /// [intervalMs] controls the spacing between frames.
   Future<void> preloadThumbnails({
     required String videoPath,
     required int startMs,
     required int endMs,
     required int intervalMs,
-    int maxHeight = 60,
-    int quality = 40,
+    int maxHeight = 50,
+    int quality = 35,
   }) async {
     final times = <int>[];
     for (int t = startMs; t < endMs; t += intervalMs) {
@@ -109,15 +132,18 @@ class VideoThumbnailService {
       }
     }
 
-    // Extract in batches of 4 for performance
-    for (int i = 0; i < times.length; i += 4) {
-      final batch = times.skip(i).take(4);
-      await Future.wait(batch.map((t) => getThumbnail(
-            videoPath: videoPath,
-            timeMs: t,
-            maxHeight: maxHeight,
-            quality: quality,
-          )));
+    // Extract sequentially with micro-delay to keep main thread and decoders responsive
+    for (final t in times) {
+      if (_isPlaybackActive) {
+        await Future.delayed(const Duration(milliseconds: 100));
+      }
+      await getThumbnail(
+        videoPath: videoPath,
+        timeMs: t,
+        maxHeight: maxHeight,
+        quality: quality,
+      );
+      await Future.delayed(const Duration(milliseconds: 15));
     }
   }
 
@@ -131,7 +157,7 @@ class VideoThumbnailService {
     required String videoPath,
     required int startMs,
     required int endMs,
-    int intervalMs = 1000,
+    int intervalMs = 3000,
   }) {
     if (_fullyPreGenerated.contains(videoPath)) return true;
     for (int t = startMs; t < endMs; t += intervalMs) {
@@ -220,7 +246,7 @@ class VideoThumbnailService {
     required String videoPath,
     required int startMs,
     required int endMs,
-    int intervalMs = 1000,
+    int intervalMs = 3000,
   }) {
     final frames = <Uint8List>[];
     for (int t = startMs; t < endMs; t += intervalMs) {
@@ -237,7 +263,7 @@ class VideoThumbnailService {
     required String videoPath,
     required int startMs,
     required int endMs,
-    int intervalMs = 1000,
+    int intervalMs = 3000,
   }) {
     int count = 0;
     for (int t = startMs; t < endMs; t += intervalMs) {
@@ -253,7 +279,7 @@ class VideoThumbnailService {
     required String videoPath,
     required int startMs,
     required int endMs,
-    int intervalMs = 1000,
+    int intervalMs = 3000,
   }) {
     for (int t = startMs; t < endMs; t += intervalMs) {
       if (_inFlight.contains(_cacheKey(videoPath, t))) {

@@ -20,6 +20,7 @@ import '../services/export_service.dart';
 import '../services/chroma_key_service.dart';
 import '../services/waveform_service.dart';
 import '../services/hive_service.dart';
+import '../services/video_thumbnail_service.dart';
 import '../utils/track_allocation.dart';
 
 class VideoEditorProvider extends ChangeNotifier {
@@ -38,6 +39,7 @@ class VideoEditorProvider extends ChangeNotifier {
   bool _isPlaying = false;
   Duration _currentPosition = Duration.zero;
   bool _isLoading = false;
+  String? _loadingMessage;
 
   Timer? _timelineTimer;
   DateTime? _playbackStartTime;
@@ -239,6 +241,7 @@ class VideoEditorProvider extends ChangeNotifier {
   bool get isPlaying => _isPlaying;
   Duration get currentPosition => _currentPosition;
   bool get isLoading => _isLoading;
+  String? get loadingMessage => _loadingMessage;
 
   bool get isExporting => _isExporting;
   double get exportProgress => _exportProgress;
@@ -1178,6 +1181,7 @@ class VideoEditorProvider extends ChangeNotifier {
   Future<void> loadVideoFile(File videoFile) async {
     try {
       _isLoading = true;
+      _loadingMessage = 'Importing video...';
       notifyListeners();
 
       var savedFile = await _importFileToAppDocs(videoFile);
@@ -1187,6 +1191,7 @@ class VideoEditorProvider extends ChangeNotifier {
       if (!isCompatible) {
         _exportError =
             'Incompatible video codec. Re-encoding video for compatibility...';
+        _loadingMessage = 'Re-encoding for device compatibility...';
         notifyListeners();
 
         final reencoded = await _reencodeVideoForCompatibility(savedFile);
@@ -1195,15 +1200,6 @@ class VideoEditorProvider extends ChangeNotifier {
               'Failed to re-encode video: Device hardware decoder cannot process this video format. Try using a different video file or convert it using H.264 codec.');
         }
         savedFile = reencoded;
-      }
-
-      _videoController ??= VideoEditorController.file(
-        savedFile,
-        minDuration: const Duration(seconds: 1),
-        maxDuration: const Duration(minutes: 10),
-      );
-      if (!_videoController!.initialized) {
-        await _videoController!.initialize();
       }
 
       final path = savedFile.path;
@@ -1291,12 +1287,25 @@ class VideoEditorProvider extends ChangeNotifier {
         await _switchActivePreviewController(path);
       }
 
+      // Pre-warm preview surface and cache initial frame for instant, stutter-free playback
+      _loadingMessage = 'Preparing media preview...';
+      notifyListeners();
+      try {
+        await _previewController?.seekTo(Duration.zero);
+        await VideoThumbnailService().extractFirstFrame(path);
+      } catch (_) {}
+
+      // Short buffer delay to allow GPU texture and ExoPlayer decoder to settle
+      await Future.delayed(const Duration(milliseconds: 500));
+
       _isLoading = false;
+      _loadingMessage = null;
       await _autoSaveProject();
       _scheduleAutoSave();
       notifyListeners();
     } catch (e) {
       _isLoading = false;
+      _loadingMessage = null;
       String errorMsg = _parseVideoError(e.toString());
       _exportError = errorMsg;
       notifyListeners();
@@ -1307,10 +1316,10 @@ class VideoEditorProvider extends ChangeNotifier {
   /// Validate if the video codec is compatible with the device
   Future<bool> _validateVideoCodec(File videoFile) async {
     try {
-      // Try to initialize the controller with a short timeout
+      // Try to initialize the controller with a 15-second timeout for large/4K media
       final testController = VideoPlayerController.file(videoFile);
       await testController.initialize().timeout(
-        const Duration(seconds: 5),
+        const Duration(seconds: 15),
         onTimeout: () {
           testController.dispose();
           throw TimeoutException('Video codec validation timeout');
@@ -1758,6 +1767,9 @@ class VideoEditorProvider extends ChangeNotifier {
 
     if (!controllerPlaying && !controllerBuffering) return true;
     final drift = (controllerPosition - expectedPosition).abs();
+    if (controllerBuffering && drift > const Duration(milliseconds: 500)) {
+      return true;
+    }
     return drift > driftTolerance;
   }
 
@@ -2906,7 +2918,7 @@ class VideoEditorProvider extends ChangeNotifier {
   Future<String?> exportVideo({
     required String outputPath,
     int crf = 23,
-    String preset = 'veryfast',
+    String preset = 'ultrafast',
     Function(double)? onProgress,
   }) async {
     if (_currentProject == null) return null;
@@ -4935,8 +4947,14 @@ class VideoEditorProvider extends ChangeNotifier {
           final controller = VideoPlayerController.file(savedFile);
           await controller.initialize();
           duration = controller.value.duration;
-          mediaWidth = controller.value.size.width;
-          mediaHeight = controller.value.size.height;
+          final rot = controller.value.rotationCorrection;
+          if ((rot % 180) != 0) {
+            mediaWidth = controller.value.size.height;
+            mediaHeight = controller.value.size.width;
+          } else {
+            mediaWidth = controller.value.size.width;
+            mediaHeight = controller.value.size.height;
+          }
           await controller.dispose(); // free memory immediately
           videoFile = savedFile;
         } catch (e) {
@@ -4944,15 +4962,13 @@ class VideoEditorProvider extends ChangeNotifier {
         }
       } else {
         imageFile = savedFile;
-        // Get image dimensions
+        // Get image dimensions (respecting EXIF orientation)
         try {
-          final data = await savedFile.readAsBytes();
-          final codec = await ui.instantiateImageCodec(data);
-          final frame = await codec.getNextFrame();
-          mediaWidth = frame.image.width.toDouble();
-          mediaHeight = frame.image.height.toDouble();
-          frame.image.dispose();
-          codec.dispose();
+          final imgSize = await _readImageDisplaySize(savedFile);
+          if (imgSize != null && imgSize.width > 0 && imgSize.height > 0) {
+            mediaWidth = imgSize.width;
+            mediaHeight = imgSize.height;
+          }
         } catch (e) {
           // Fallback to default dimensions if we can't read the image
         }
@@ -4967,34 +4983,50 @@ class VideoEditorProvider extends ChangeNotifier {
         }
       }
 
-      // Calculate initial overlay size that maintains original aspect ratio.
-      // Portrait media (tall) → height is primary dimension, width derived.
-      // Landscape media (wide) → width is primary dimension, height derived.
-      const maxDimensionFraction = 0.5;
-      final mediaAspectRatio = mediaWidth / mediaHeight;
+      // Calculate initial overlay size that maintains the overlay's true aspect ratio
+      // in parent normalized coordinate space:
+      // absoluteWidth / absoluteHeight == (overlayWidth * parentWidth) / (overlayHeight * parentHeight) == mediaWidth / mediaHeight.
+      final parentWidth = _currentProject?.outputResolution.width ?? 1920.0;
+      final parentHeight = _currentProject?.outputResolution.height ?? 1080.0;
+      final parentAspectRatio = (parentWidth > 0 && parentHeight > 0)
+          ? (parentWidth / parentHeight)
+          : (16.0 / 9.0);
+      final mediaAspectRatio = (mediaWidth > 0 && mediaHeight > 0)
+          ? (mediaWidth / mediaHeight)
+          : 1.0;
 
+      // normalizedRatio is the ratio of overlayWidth / overlayHeight in normalized coords [0..1]
+      final normalizedRatio = mediaAspectRatio / parentAspectRatio;
+
+      const maxDimensionFraction = 0.45;
       double overlayWidth;
       double overlayHeight;
 
-      if (mediaAspectRatio >= 1.0) {
-        // Landscape or square: width is the primary dimension
+      if (normalizedRatio >= 1.0) {
+        // Overlay is wider than tall relative to canvas
         overlayWidth = maxDimensionFraction;
-        overlayHeight = overlayWidth / mediaAspectRatio;
+        overlayHeight = overlayWidth / normalizedRatio;
+        if (overlayHeight > maxDimensionFraction) {
+          overlayHeight = maxDimensionFraction;
+          overlayWidth = overlayHeight * normalizedRatio;
+        }
       } else {
-        // Portrait: height is the primary dimension
+        // Overlay is taller than wide relative to canvas (e.g. portrait video/image)
         overlayHeight = maxDimensionFraction;
-        overlayWidth = overlayHeight * mediaAspectRatio;
+        overlayWidth = overlayHeight * normalizedRatio;
+        if (overlayWidth > maxDimensionFraction) {
+          overlayWidth = maxDimensionFraction;
+          overlayHeight = overlayWidth / normalizedRatio;
+        }
       }
 
-      // Safety clamp so overlay never exceeds 50% in either dimension
-      if (overlayWidth > maxDimensionFraction) {
-        overlayWidth = maxDimensionFraction;
-        overlayHeight = overlayWidth / mediaAspectRatio;
-      }
-      if (overlayHeight > maxDimensionFraction) {
-        overlayHeight = maxDimensionFraction;
-        overlayWidth = overlayHeight * mediaAspectRatio;
-      }
+      overlayWidth = overlayWidth.clamp(0.05, 1.0);
+      overlayHeight = overlayHeight.clamp(0.05, 1.0);
+
+      final overlayDx =
+          ((1.0 - overlayWidth) / 2.0).clamp(0.0, 1.0 - overlayWidth);
+      final overlayDy =
+          ((1.0 - overlayHeight) / 2.0).clamp(0.0, 1.0 - overlayHeight);
 
       final clip = VideoClip(
         id: _uuid.v4(),
@@ -5008,8 +5040,15 @@ class VideoEditorProvider extends ChangeNotifier {
         trimStart: Duration.zero,
         trimEnd: duration,
         trackIndex: trackIndex,
+        overlayPosition: Offset(overlayDx, overlayDy),
         overlaySize: Size(overlayWidth, overlayHeight),
       );
+
+      if (videoFile != null) {
+        try {
+          await VideoThumbnailService().extractFirstFrame(videoFile.path);
+        } catch (_) {}
+      }
 
       recordUndo();
       _currentProject = _currentProject!.addOverlayClip(clip);
@@ -5181,6 +5220,43 @@ class VideoEditorProvider extends ChangeNotifier {
       _selectedOverlayClipId = null;
     }
 
+    _scheduleAutoSave();
+    notifyListeners();
+  }
+
+  /// Update the overlay clip's volume
+  void updateOverlayClipVolume(String clipId, double volume,
+      {bool skipUndo = false}) {
+    if (_currentProject == null) return;
+    final clipIndex = getOverlayClipIndexById(clipId);
+    if (clipIndex == null || clipIndex == -1) return;
+
+    final originalClip = _currentProject!.overlayClips[clipIndex];
+    final updatedClip = originalClip.copyWith(volume: volume.clamp(0.0, 2.0));
+    final updatedClips = List<VideoClip>.from(_currentProject!.overlayClips);
+    updatedClips[clipIndex] = updatedClip;
+
+    if (!skipUndo) {
+      recordUndo();
+    }
+    _currentProject = _currentProject!.copyWith(overlayClips: updatedClips);
+    _scheduleAutoSave();
+    notifyListeners();
+  }
+
+  /// Toggle mute for an overlay clip
+  void toggleOverlayClipMute(String clipId) {
+    if (_currentProject == null) return;
+    final clipIndex = getOverlayClipIndexById(clipId);
+    if (clipIndex == null || clipIndex == -1) return;
+
+    final originalClip = _currentProject!.overlayClips[clipIndex];
+    final updatedClip = originalClip.copyWith(isMuted: !originalClip.isMuted);
+    final updatedClips = List<VideoClip>.from(_currentProject!.overlayClips);
+    updatedClips[clipIndex] = updatedClip;
+
+    recordUndo();
+    _currentProject = _currentProject!.copyWith(overlayClips: updatedClips);
     _scheduleAutoSave();
     notifyListeners();
   }

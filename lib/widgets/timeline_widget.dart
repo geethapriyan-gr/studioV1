@@ -433,6 +433,7 @@ class _TimelineWidgetState extends State<TimelineWidget>
   Widget build(BuildContext context) {
     return Consumer<VideoEditorProvider>(
       builder: (context, provider, child) {
+        _thumbnailService.setPlaybackActive(provider.isPlaying);
         if (!provider.hasProject) {
           return const Center(
             child: Text(
@@ -2237,7 +2238,11 @@ class _TimelineWidgetState extends State<TimelineWidget>
   ///
   /// Phase 2: This method generates all remaining frames in parallel batches
   /// in the background, calling setState periodically so frames appear
-  /// progressively (but the clip is never blank — the first frame tiles).
+  /// Progressive background thumbnail generation:
+  /// - Adaptive interval: long/4K clips are capped to ~10-12 keyframes so we never
+  ///   overload the hardware decoder.
+  /// - Sequential extraction: 1 frame at a time with micro-delays so decoders and memory stay stable.
+  /// - Playback awareness: yields while video is playing so playback remains 100% smooth.
   void _ensureThumbnailsForVideo(VideoClip clip) {
     if (clip.mediaType != MediaType.video || clip.videoFile == null) return;
 
@@ -2254,15 +2259,18 @@ class _TimelineWidgetState extends State<TimelineWidget>
       return;
     }
 
-    // Check if all frames are already in cache (still based on time intervals)
+    // Adaptive interval to cap extraction to max ~12 keyframes across any clip length
     final sourceStartMs = clip.sourceStart.inMilliseconds;
     final sourceEndMs = clip.sourceEnd.inMilliseconds;
-    final totalExpected =
-        math.max(1, ((sourceEndMs - sourceStartMs) / 3000).ceil());
+    final durationMs = math.max(1, sourceEndMs - sourceStartMs);
+    final intervalMs = math.max(3000, (durationMs / 12).round());
+
+    final totalExpected = math.max(1, (durationMs / intervalMs).ceil());
     final cachedCount = _thumbnailService.getCachedFrameCount(
       videoPath: path,
       startMs: sourceStartMs,
       endMs: sourceEndMs,
+      intervalMs: intervalMs,
     );
     if (cachedCount >= totalExpected) {
       _fullyLoadedPaths.add(path);
@@ -2270,26 +2278,27 @@ class _TimelineWidgetState extends State<TimelineWidget>
       return;
     }
 
-    // Start background generation with periodic UI updates
+    // Start safe sequential generation
     _loadingVideoPaths.add(path);
     _backgroundGenerateFrames(
       path: path,
       startMs: sourceStartMs,
       endMs: sourceEndMs,
+      intervalMs: intervalMs,
     );
   }
 
-  /// Generates frames in parallel batches in the background.
-  /// Calls setState after each batch so frames appear progressively,
-  /// but the first frame is already tiled across the strip — never blank.
+  /// Generates frames sequentially in the background with micro-delays.
+  /// Pauses while playback is active to prevent any video lag or decoder conflicts.
   Future<void> _backgroundGenerateFrames({
     required String path,
     required int startMs,
     required int endMs,
+    required int intervalMs,
   }) async {
     // Build list of timestamps we still need
     final times = <int>[];
-    for (int t = startMs; t < endMs; t += 3000) {
+    for (int t = startMs; t < endMs; t += intervalMs) {
       if (_thumbnailService.getCached(path, t) == null) {
         times.add(t);
       }
@@ -2305,24 +2314,28 @@ class _TimelineWidgetState extends State<TimelineWidget>
       return;
     }
 
-    // Extract in parallel batches of 6, setState after each batch
-    const batchSize = 6;
-    for (int i = 0; i < times.length; i += batchSize) {
+    // Sequential extraction — 1 at a time to prevent hardware decoder saturation
+    for (final t in times) {
       if (!mounted) return;
 
-      final batch = times.skip(i).take(batchSize);
-      await Future.wait(
-        batch.map((t) => _thumbnailService.getThumbnail(
-              videoPath: path,
-              timeMs: t,
-              maxHeight: 120,
-              quality: 50,
-            )),
-        eagerError: false,
+      // Yield / pause thumbnail generation if playback is active
+      while (_thumbnailService.isPlaybackActive && mounted) {
+        await Future.delayed(const Duration(milliseconds: 150));
+      }
+      if (!mounted) return;
+
+      await _thumbnailService.getThumbnail(
+        videoPath: path,
+        timeMs: t,
+        maxHeight: 50,
+        quality: 35,
       );
 
-      // Update UI after each batch so frames appear progressively
-      if (mounted) {
+      // Micro delay to let device MediaServer, GPU, and UI breathe
+      await Future.delayed(const Duration(milliseconds: 25));
+
+      // Update UI progressively
+      if (mounted && !_thumbnailService.isPlaybackActive) {
         setState(() {});
       }
     }
@@ -2367,7 +2380,8 @@ class _TimelineWidgetState extends State<TimelineWidget>
     final path = clip.videoFile!.path;
     final trimStartMs = clip.trimStart.inMilliseconds;
     final trimEndMs = clip.trimEnd.inMilliseconds;
-    final trimDurationMs = trimEndMs - trimStartMs;
+    final trimDurationMs = math.max(1, trimEndMs - trimStartMs);
+    final intervalMs = math.max(3000, (trimDurationMs / 12).round());
 
     // Fixed frame width in pixels (appears same size regardless of zoom)
     const double fixedFrameWidth = 40.0; // 40px per frame
@@ -2381,6 +2395,7 @@ class _TimelineWidgetState extends State<TimelineWidget>
       videoPath: path,
       startMs: trimStartMs,
       endMs: trimEndMs,
+      intervalMs: intervalMs,
     );
 
     // If we have zero frames for the trimmed range, try the first frame
@@ -2815,6 +2830,19 @@ class _TimelineWidgetState extends State<TimelineWidget>
       } catch (_) {}
     }
 
+    final bool hasOverlayVideoSelection = provider.selectedOverlayClipId != null &&
+        (provider.currentProject?.overlayClips.any((c) =>
+                c.id == provider.selectedOverlayClipId &&
+                c.mediaType == MediaType.video) ??
+            false);
+    VideoClip? selectedOverlayClip;
+    if (hasOverlayVideoSelection) {
+      try {
+        selectedOverlayClip = provider.currentProject!.overlayClips
+            .firstWhere((c) => c.id == provider.selectedOverlayClipId);
+      } catch (_) {}
+    }
+
     return Container(
       height: 60,
       decoration: const BoxDecoration(
@@ -2868,6 +2896,24 @@ class _TimelineWidgetState extends State<TimelineWidget>
             onPressed: provider.canRedo ? () => provider.redo() : null,
             tooltip: 'Redo',
           ),
+          if (hasOverlayVideoSelection && selectedOverlayClip != null) ...[
+            _buildControlButton(
+              icon: selectedOverlayClip.isMuted || selectedOverlayClip.volume == 0
+                  ? Icons.volume_off_outlined
+                  : Icons.volume_up_outlined,
+              onPressed: () => _showOverlayVolumeDialog(
+                context,
+                provider,
+                selectedOverlayClip!,
+              ),
+              tooltip: 'Overlay Volume',
+              color: selectedOverlayClip.isMuted
+                  ? AppColors.error
+                  : (selectedOverlayClip.volume != 1.0
+                      ? AppColors.primary
+                      : null),
+            ),
+          ],
           if (hasVideoSelection) ...[
             _buildControlButton(
               icon: isClipMuted
@@ -2881,6 +2927,239 @@ class _TimelineWidgetState extends State<TimelineWidget>
           ],
         ],
       ),
+    );
+  }
+
+  void _showOverlayVolumeDialog(
+    BuildContext context,
+    VideoEditorProvider provider,
+    VideoClip overlayClip,
+  ) {
+    showModalBottomSheet(
+      context: context,
+      backgroundColor: AppColors.surface,
+      isScrollControlled: true,
+      shape: const RoundedRectangleBorder(
+        borderRadius: BorderRadius.vertical(top: Radius.circular(16)),
+      ),
+      builder: (ctx) {
+        double currentVol = overlayClip.volume;
+        bool isMuted = overlayClip.isMuted;
+
+        return StatefulBuilder(
+          builder: (ctx, setSheetState) {
+            return SafeArea(
+              top: false,
+              child: Padding(
+                padding: const EdgeInsets.fromLTRB(20, 16, 20, 20),
+                child: Column(
+                  mainAxisSize: MainAxisSize.min,
+                  crossAxisAlignment: CrossAxisAlignment.start,
+                  children: [
+                    // Handle bar
+                    Center(
+                      child: Container(
+                        width: 40,
+                        height: 4,
+                        decoration: BoxDecoration(
+                          color: AppColors.border,
+                          borderRadius: BorderRadius.circular(2),
+                        ),
+                      ),
+                    ),
+                    const SizedBox(height: 16),
+                    // Header Row
+                    Row(
+                      children: [
+                        Container(
+                          width: 36,
+                          height: 36,
+                          decoration: BoxDecoration(
+                            color: isMuted
+                                ? AppColors.error.withOpacity(0.15)
+                                : AppColors.primary.withOpacity(0.15),
+                            borderRadius: BorderRadius.circular(10),
+                            border: Border.all(
+                              color: isMuted
+                                  ? AppColors.error.withOpacity(0.3)
+                                  : AppColors.primary.withOpacity(0.3),
+                            ),
+                          ),
+                          child: Icon(
+                            isMuted
+                                ? Icons.volume_off_rounded
+                                : (currentVol == 0
+                                    ? Icons.volume_mute_rounded
+                                    : Icons.volume_up_rounded),
+                            color: isMuted ? AppColors.error : AppColors.primary,
+                            size: 20,
+                          ),
+                        ),
+                        const SizedBox(width: 12),
+                        const Expanded(
+                          child: Text(
+                            'Overlay Volume',
+                            style: TextStyle(
+                              color: AppColors.textPrimary,
+                              fontWeight: FontWeight.w700,
+                              fontSize: 16,
+                            ),
+                          ),
+                        ),
+                        // Mute / Unmute Button
+                        GestureDetector(
+                          onTap: () {
+                            setSheetState(() {
+                              isMuted = !isMuted;
+                            });
+                            provider.toggleOverlayClipMute(overlayClip.id);
+                          },
+                          child: Container(
+                            padding: const EdgeInsets.symmetric(
+                                horizontal: 12, vertical: 6),
+                            decoration: BoxDecoration(
+                              color: isMuted
+                                  ? AppColors.error.withOpacity(0.2)
+                                  : AppColors.surfaceLight,
+                              borderRadius: BorderRadius.circular(8),
+                              border: Border.all(
+                                color: isMuted
+                                    ? AppColors.error
+                                    : AppColors.border,
+                              ),
+                            ),
+                            child: Text(
+                              isMuted ? 'Muted' : 'Mute',
+                              style: TextStyle(
+                                color: isMuted
+                                    ? AppColors.error
+                                    : AppColors.textSecondary,
+                                fontSize: 12,
+                                fontWeight: FontWeight.w600,
+                              ),
+                            ),
+                          ),
+                        ),
+                      ],
+                    ),
+                    const SizedBox(height: 24),
+                    // Volume percentage & slider
+                    Row(
+                      mainAxisAlignment: MainAxisAlignment.spaceBetween,
+                      children: [
+                        const Text(
+                          'Volume Level',
+                          style: TextStyle(
+                            color: AppColors.textSecondary,
+                            fontSize: 13,
+                            fontWeight: FontWeight.w500,
+                          ),
+                        ),
+                        Text(
+                          isMuted ? '0%' : '${(currentVol * 100).round()}%',
+                          style: TextStyle(
+                            color: isMuted
+                                ? AppColors.textTertiary
+                                : AppColors.primary,
+                            fontSize: 15,
+                            fontWeight: FontWeight.w700,
+                          ),
+                        ),
+                      ],
+                    ),
+                    const SizedBox(height: 12),
+                    SliderTheme(
+                      data: SliderThemeData(
+                        trackHeight: 6,
+                        thumbShape:
+                            const RoundSliderThumbShape(enabledThumbRadius: 9),
+                        overlayShape:
+                            const RoundSliderOverlayShape(overlayRadius: 18),
+                        activeTrackColor:
+                            isMuted ? AppColors.textTertiary : AppColors.primary,
+                        inactiveTrackColor: AppColors.primary.withOpacity(0.2),
+                        thumbColor: Colors.white,
+                        overlayColor: AppColors.primary.withOpacity(0.15),
+                      ),
+                      child: Slider(
+                        value: isMuted ? 0.0 : currentVol.clamp(0.0, 2.0),
+                        min: 0.0,
+                        max: 2.0,
+                        onChanged: (v) {
+                          setSheetState(() {
+                            currentVol = v;
+                            if (isMuted && v > 0) isMuted = false;
+                          });
+                          provider.updateOverlayClipVolume(
+                            overlayClip.id,
+                            v,
+                            skipUndo: true,
+                          );
+                        },
+                        onChangeEnd: (v) {
+                          provider.updateOverlayClipVolume(
+                            overlayClip.id,
+                            v,
+                            skipUndo: false,
+                          );
+                        },
+                      ),
+                    ),
+                    const SizedBox(height: 16),
+                    // Bottom actions: Reset (100%) and Done
+                    Row(
+                      children: [
+                        Expanded(
+                          child: OutlinedButton(
+                            onPressed: () {
+                              setSheetState(() {
+                                currentVol = 1.0;
+                                isMuted = false;
+                              });
+                              provider.updateOverlayClipVolume(
+                                overlayClip.id,
+                                1.0,
+                                skipUndo: false,
+                              );
+                            },
+                            style: OutlinedButton.styleFrom(
+                              foregroundColor: AppColors.textSecondary,
+                              side: const BorderSide(color: AppColors.border),
+                              padding: const EdgeInsets.symmetric(vertical: 12),
+                              shape: RoundedRectangleBorder(
+                                borderRadius: BorderRadius.circular(10),
+                              ),
+                            ),
+                            child: const Text('Reset (100%)'),
+                          ),
+                        ),
+                        const SizedBox(width: 12),
+                        Expanded(
+                          child: ElevatedButton(
+                            onPressed: () => Navigator.pop(ctx),
+                            style: ElevatedButton.styleFrom(
+                              backgroundColor: AppColors.primary,
+                              foregroundColor: Colors.white,
+                              padding: const EdgeInsets.symmetric(vertical: 12),
+                              shape: RoundedRectangleBorder(
+                                borderRadius: BorderRadius.circular(10),
+                              ),
+                            ),
+                            child: const Text(
+                              'Done',
+                              style: TextStyle(fontWeight: FontWeight.w600),
+                            ),
+                          ),
+                        ),
+                      ],
+                    ),
+                  ],
+                ),
+              ),
+            );
+          },
+        );
+      },
     );
   }
 

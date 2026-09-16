@@ -13,6 +13,7 @@ import 'dart:async';
 
 import '../providers/video_editor_provider.dart';
 import '../services/permissions_service.dart';
+import '../services/video_thumbnail_service.dart';
 import '../widgets/timeline_widget.dart';
 import '../widgets/text_overlay_editor.dart';
 import '../widgets/audio_overlay_editor.dart';
@@ -252,13 +253,23 @@ class _VideoEditorScreenState extends State<VideoEditorScreen>
       );
     }
     if (first.mediaType == MediaType.video && first.videoFile != null) {
+      final cached =
+          VideoThumbnailService().getCached(first.videoFile!.path, 0);
+      if (cached != null) {
+        return ClipRRect(
+          borderRadius: BorderRadius.circular(6),
+          child: Image.memory(
+            cached,
+            fit: BoxFit.cover,
+            width: double.infinity,
+            height: double.infinity,
+          ),
+        );
+      }
+
       return FutureBuilder<Uint8List?>(
-        future: VideoThumbnail.thumbnailData(
-          video: first.videoFile!.path,
-          imageFormat: ImageFormat.PNG,
-          timeMs: first.sourceStart.inMilliseconds,
-          quality: 75,
-        ),
+        future:
+            VideoThumbnailService().extractFirstFrame(first.videoFile!.path),
         builder: (context, snapshot) {
           if (snapshot.connectionState == ConnectionState.waiting) {
             return const Center(
@@ -1230,9 +1241,25 @@ class _VideoEditorScreenState extends State<VideoEditorScreen>
                   alignment: Alignment.center,
                   children: [
                     if (provider.isLoading)
-                      const Center(
-                        child: CircularProgressIndicator(
-                            color: AppColors.primary, strokeWidth: 2),
+                      Center(
+                        child: Column(
+                          mainAxisSize: MainAxisSize.min,
+                          children: [
+                            const CircularProgressIndicator(
+                                color: AppColors.primary, strokeWidth: 2.5),
+                            if (provider.loadingMessage != null) ...[
+                              const SizedBox(height: 14),
+                              Text(
+                                provider.loadingMessage!,
+                                style: const TextStyle(
+                                  color: AppColors.textSecondary,
+                                  fontSize: 13,
+                                  fontWeight: FontWeight.w500,
+                                ),
+                              ),
+                            ],
+                          ],
+                        ),
                       )
                     else if (provider.hasProject)
                       Center(
@@ -2270,7 +2297,6 @@ class _VideoEditorScreenState extends State<VideoEditorScreen>
       barrierDismissible: false,
       builder: (dialogContext) {
         int crf = 23;
-        String preset = 'veryfast';
         final proj = provider.currentProject;
         Size selectedResolution =
             proj?.outputResolution ?? const Size(1920, 1080);
@@ -2285,17 +2311,6 @@ class _VideoEditorScreenState extends State<VideoEditorScreen>
         };
 
         int selectedFps = proj?.outputFrameRate ?? 30;
-        const presets = [
-          'ultrafast',
-          'superfast',
-          'veryfast',
-          'faster',
-          'fast',
-          'medium',
-          'slow',
-          'slower',
-          'veryslow',
-        ];
 
         Future<void> startExport() async {
           await Provider.of<VideoEditorProvider>(context, listen: false)
@@ -2303,7 +2318,7 @@ class _VideoEditorScreenState extends State<VideoEditorScreen>
                   resolution: selectedResolution, frameRate: selectedFps);
           final result = await Provider.of<VideoEditorProvider>(context,
                   listen: false)
-              .exportVideo(outputPath: outputPath, crf: crf, preset: preset);
+              .exportVideo(outputPath: outputPath, crf: crf, preset: 'ultrafast');
           if (result != null && mounted) {
             Navigator.of(dialogContext).pop();
             String finalPath = result;
@@ -2455,46 +2470,6 @@ class _VideoEditorScreenState extends State<VideoEditorScreen>
                                   ? null
                                   : (v) => setState(
                                       () => selectedFps = v ?? selectedFps),
-                            ),
-                          ),
-                        ],
-                      ),
-                      const SizedBox(height: 12),
-                      Row(
-                        children: [
-                          const Text('Speed',
-                              style: TextStyle(
-                                  color: AppColors.textSecondary,
-                                  fontSize: 13)),
-                          const SizedBox(width: 12),
-                          Expanded(
-                            child: DropdownButtonFormField<String>(
-                              value: preset,
-                              isExpanded: true,
-                              dropdownColor: AppColors.surface,
-                              style: const TextStyle(
-                                  color: AppColors.textPrimary, fontSize: 13),
-                              decoration: InputDecoration(
-                                border: OutlineInputBorder(
-                                  borderRadius: BorderRadius.circular(8),
-                                  borderSide:
-                                      const BorderSide(color: AppColors.border),
-                                ),
-                                enabledBorder: OutlineInputBorder(
-                                  borderRadius: BorderRadius.circular(8),
-                                  borderSide:
-                                      const BorderSide(color: AppColors.border),
-                                ),
-                                contentPadding: const EdgeInsets.symmetric(
-                                    horizontal: 12, vertical: 8),
-                              ),
-                              items: presets
-                                  .map((e) => DropdownMenuItem(
-                                      value: e, child: Text(e)))
-                                  .toList(),
-                              onChanged: exporting
-                                  ? null
-                                  : (v) => setState(() => preset = v ?? preset),
                             ),
                           ),
                         ],
