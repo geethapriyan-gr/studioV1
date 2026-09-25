@@ -314,10 +314,20 @@ class _TimelineWidgetState extends State<TimelineWidget>
   }
 
   bool _handleScrollNotification(ScrollNotification notification) {
+    if (notification.depth != 0) return false;
     if (notification is ScrollStartNotification) {
-      _isUserScrolling = true;
+      // Only a finger drag is a user scrub. Programmatic jumpTo() calls (the
+      // playhead following playback, zoom) also emit start/end notifications.
+      if (notification.dragDetails != null && !_isUserScrolling) {
+        _isUserScrolling = true;
+        Provider.of<VideoEditorProvider>(context, listen: false).beginScrub();
+      }
     } else if (notification is ScrollEndNotification) {
-      _isUserScrolling = false;
+      // Fires after the drag and any fling have settled.
+      if (_isUserScrolling) {
+        _isUserScrolling = false;
+        Provider.of<VideoEditorProvider>(context, listen: false).endScrub();
+      }
     }
     return false;
   }

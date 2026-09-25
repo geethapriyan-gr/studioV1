@@ -238,7 +238,51 @@ class VideoEditorProvider extends ChangeNotifier {
   VideoPlayerController? get previewController => _previewController;
   String? get activeFilePath => _activeFilePath;
 
-  bool get isPlaying => _isPlaying;
+  /// While the user drags the timeline during playback, playback is
+  /// suspended internally but still reported as "playing" so the UI does not
+  /// flicker; it resumes from the new position when the drag ends.
+  bool get isPlaying => _isPlaying || _resumePlaybackAfterScrub;
+  bool get isScrubbing => _isScrubbing;
+
+  bool _isScrubbing = false;
+  bool _resumePlaybackAfterScrub = false;
+
+  /// Called when the user starts dragging the timeline.
+  ///
+  /// Playing video while seeking it dozens of times per second is what made
+  /// the preview freeze and buffer: every scroll event re-seeked a running
+  /// decoder. Instead, pause once, show frames while scrubbing, and resume
+  /// once from the final position.
+  Future<void> beginScrub() async {
+    if (_isScrubbing) return;
+    _isScrubbing = true;
+    if (_isPlaying) {
+      _resumePlaybackAfterScrub = true;
+      _seekSyncSerial++;
+      _playbackRecoverySerial++;
+      _playbackRecoveryInFlight = false;
+      _seekPauseTimer?.cancel();
+      _deferredSeekSyncTimer?.cancel();
+      _isPlaying = false;
+      _stopTimelineClock();
+      _activePreviewClipId = null;
+      _activeTransitionId = null;
+      await _pauseAllPreviewControllers(mute: false);
+      await _pauseAllAudioPlayers();
+    }
+  }
+
+  /// Called when the timeline drag (including its fling) has settled.
+  Future<void> endScrub() async {
+    if (!_isScrubbing) return;
+    _isScrubbing = false;
+    if (_resumePlaybackAfterScrub) {
+      _resumePlaybackAfterScrub = false;
+      if (!_isPlaying) {
+        await togglePlayback();
+      }
+    }
+  }
   Duration get currentPosition => _currentPosition;
   bool get isLoading => _isLoading;
   String? get loadingMessage => _loadingMessage;
@@ -1499,6 +1543,12 @@ class VideoEditorProvider extends ChangeNotifier {
   }
 
   Future<void> togglePlayback() async {
+    if (!_isPlaying && _resumePlaybackAfterScrub) {
+      // Pause pressed while scrubbing a playing video: just don't resume.
+      _resumePlaybackAfterScrub = false;
+      notifyListeners();
+      return;
+    }
     if (_isPlaying) {
       _seekSyncSerial++;
       _playbackRecoverySerial++;
@@ -1860,7 +1910,13 @@ class VideoEditorProvider extends ChangeNotifier {
 
     _previewSyncInFlight = true;
     try {
-      if (refreshController && Platform.isAndroid) {
+      // Re-creating a controller throws away the decoder and its buffers
+      // (seconds of "buffering" on phones). Only do it when the existing
+      // controller is actually broken — never just because a seek was slow
+      // or went backwards.
+      if (refreshController &&
+          Platform.isAndroid &&
+          _isControllerBroken(videoPath)) {
         await _discardPreviewController(videoPath);
       }
 
@@ -1874,6 +1930,7 @@ class VideoEditorProvider extends ChangeNotifier {
       if (synced || !allowControllerRecovery) return synced;
 
       if (isCurrent != null && !isCurrent()) return false;
+      if (!_isControllerBroken(videoPath)) return false;
       await _discardPreviewController(videoPath);
       synced = await _syncPreviewControllerOnce(
         clip,
@@ -1886,6 +1943,42 @@ class VideoEditorProvider extends ChangeNotifier {
     } finally {
       _previewSyncInFlight = false;
     }
+  }
+
+  /// True when the cached controller for [videoPath] is missing, failed to
+  /// initialize or reported a playback error.
+  bool _isControllerBroken(String videoPath) {
+    final controller = _previewControllers[videoPath];
+    if (controller == null) return false;
+    final value = controller.value;
+    return !value.isInitialized || value.hasError;
+  }
+
+  /// Waits until a seek has actually been completed by the native player
+  /// (it is no longer buffering). Returns false only when the request was
+  /// superseded or the controller broke — a slow seek is not a failure.
+  Future<bool> _waitForSeekToLand(
+    VideoPlayerController controller, {
+    bool Function()? isCurrent,
+    Duration timeout = const Duration(milliseconds: 3000),
+  }) async {
+    // The buffering event for a seek arrives asynchronously; give it a moment.
+    await Future<void>.delayed(const Duration(milliseconds: 60));
+    final deadline = DateTime.now().add(timeout);
+    var readyPolls = 0;
+    while (DateTime.now().isBefore(deadline)) {
+      if (isCurrent != null && !isCurrent()) return false;
+      final value = controller.value;
+      if (!value.isInitialized || value.hasError) return false;
+      if (!value.isBuffering) {
+        readyPolls++;
+        if (readyPolls >= 2) return true;
+      } else {
+        readyPolls = 0;
+      }
+      await Future<void>.delayed(const Duration(milliseconds: 30));
+    }
+    return true;
   }
 
   Future<bool> _syncPreviewControllerOnce(
@@ -1917,21 +2010,16 @@ class VideoEditorProvider extends ChangeNotifier {
     final currentNativePosition = controller.value.position;
     final driftMs = (currentNativePosition - target).inMilliseconds.abs();
 
-    final nativePositionAhead = currentNativePosition - target;
-    final nativeNearEnd = videoDuration > const Duration(milliseconds: 250) &&
-        currentNativePosition >=
-            videoDuration - const Duration(milliseconds: 120);
-    final targetSafelyBeforeEnd =
-        target < videoDuration - const Duration(milliseconds: 250);
-    final replayingBackwardOnAndroid = Platform.isAndroid &&
-        play &&
-        forceSeek &&
-        (nativePositionAhead > const Duration(milliseconds: 500) ||
-            (nativeNearEnd && targetSafelyBeforeEnd));
-    if (replayingBackwardOnAndroid) return false;
-
     if (forceSeek || driftMs > 120 || !controller.value.isPlaying) {
+      // Seeking a player while it is running (especially backwards) makes
+      // ExoPlayer/AVPlayer show stale frames and stall. Pause, seek, and wait
+      // until the decoder has landed on the new position before playing.
+      if (controller.value.isPlaying) {
+        await controller.pause();
+      }
       await controller.seekTo(target);
+      final landed = await _waitForSeekToLand(controller, isCurrent: isCurrent);
+      if (!landed) return false;
     }
     if (isCurrent != null && !isCurrent()) return false;
 
@@ -1944,28 +2032,16 @@ class VideoEditorProvider extends ChangeNotifier {
     if (!play) return true;
 
     await controller.play();
-    final started = await _waitForControllerPlaybackStart(
+    await _waitForControllerPlaybackStart(
       controller,
       target,
       isCurrent: isCurrent,
     );
     if (isCurrent != null && !isCurrent()) return false;
-    if (!started) return false;
 
     final value = controller.value;
-    if (!value.isInitialized) return false;
-    if (!value.isPlaying && !value.isBuffering) return false;
-
-    final postPlayDrift = (value.position - target).inMilliseconds.abs();
-    final nearVideoEnd = videoDuration > const Duration(milliseconds: 250) &&
-        value.position >= videoDuration - const Duration(milliseconds: 80);
-    final targetNearEnd = videoDuration > const Duration(milliseconds: 250) &&
-        target >= videoDuration - const Duration(milliseconds: 250);
-
-    if (!value.isBuffering && postPlayDrift > 500) return false;
-    if (!value.isBuffering && nearVideoEnd && !targetNearEnd) return false;
-
-    return true;
+    if (!value.isInitialized || value.hasError) return false;
+    return value.isPlaying || value.isBuffering;
   }
 
   Future<bool> _waitForControllerPlaybackStart(
@@ -2128,9 +2204,13 @@ class VideoEditorProvider extends ChangeNotifier {
   }) {
     _deferredSeekSyncTimer?.cancel();
     _seekPauseTimer?.cancel();
+    // While scrubbing, coalesce seeks so the decoder can actually show a
+    // frame instead of being re-seeked on every scroll event.
     final delay = resumeWhenSynced
         ? const Duration(milliseconds: 80)
-        : const Duration(milliseconds: 16);
+        : (_isScrubbing
+            ? const Duration(milliseconds: 50)
+            : const Duration(milliseconds: 16));
     _deferredSeekSyncTimer = Timer(delay, () {
       unawaited(_runDeferredSeekSync(
         serial,
@@ -3829,6 +3909,8 @@ class VideoEditorProvider extends ChangeNotifier {
     _previewControllers.clear();
     _lruAccessList.clear(); // Clear LRU list too
     _isPlaying = false;
+    _isScrubbing = false;
+    _resumePlaybackAfterScrub = false;
     _playbackRecoverySerial++;
     _playbackRecoveryInFlight = false;
     _transitionPrewarmInFlight.clear();
@@ -3953,6 +4035,13 @@ class VideoEditorProvider extends ChangeNotifier {
     if (currentClip != null && currentClip.id != _activePreviewClipId) {
       if (_isPlaying &&
           currentClip.mediaType == MediaType.video &&
+          currentClip.videoFile != null &&
+          _canContinueSeamlessly(currentClip)) {
+        // Next clip continues the same file at the frame that is already
+        // playing (e.g. the two halves of a cut): no pause/seek hitch.
+        _activePreviewClipId = currentClip.id;
+      } else if (_isPlaying &&
+          currentClip.mediaType == MediaType.video &&
           currentClip.videoFile != null) {
         _holdTimelineForVideoSync(currentClip, forceSeek: true);
       } else {
@@ -3969,6 +4058,30 @@ class VideoEditorProvider extends ChangeNotifier {
 
     unawaited(_applyPreviewVolumeForCurrentPosition());
     unawaited(_syncAudioPlayback());
+  }
+
+  /// True when the active controller is already playing [clip]'s file at the
+  /// right speed and within a few frames of where [clip] should be.
+  bool _canContinueSeamlessly(VideoClip clip) {
+    final videoPath = _resolvePlaybackPath(clip);
+    final controller = _previewController;
+    if (videoPath == null ||
+        _activeFilePath != videoPath ||
+        controller == null ||
+        !controller.value.isInitialized ||
+        !controller.value.isPlaying ||
+        controller.value.isBuffering) {
+      return false;
+    }
+    if ((controller.value.playbackSpeed - clip.playbackSpeed).abs() > 0.001) {
+      return false;
+    }
+    final expected = clampSourcePositionForVideo(
+      calculateSourcePositionForTimeline(clip, _currentPosition),
+      controller.value.duration,
+    );
+    return (controller.value.position - expected).abs() <=
+        const Duration(milliseconds: 250);
   }
 
   bool _controllerNeedsTimelineHoldForClip(VideoClip clip) {
