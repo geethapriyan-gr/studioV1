@@ -268,6 +268,14 @@ class VideoEditorProvider extends ChangeNotifier {
   String? get selectedOverlayClipId => _selectedOverlayClipId;
   String? get selectedStickerId => _selectedStickerId;
 
+  /// Returns true if any component (video, overlay, text, audio, sticker) is currently selected on the timeline
+  bool get hasTimelineSelection =>
+      _selectedVideoClipId != null ||
+      _selectedAudioOverlayId != null ||
+      _selectedStickerId != null ||
+      _selectedTextOverlayId != null ||
+      _selectedOverlayClipId != null;
+
   List<StickerModel> get currentStickers {
     if (_currentProject == null) return [];
     return _currentProject!.getStickersAtTime(_currentPosition);
@@ -3551,33 +3559,64 @@ class VideoEditorProvider extends ChangeNotifier {
   void selectTextOverlay(String? overlayId) {
     _selectedTextOverlayId = overlayId;
     if (overlayId != null) {
-      toggleTextEditor();
-    } else {
-      notifyListeners();
+      _selectedAudioOverlayId = null;
+      _selectedVideoClipId = null;
+      _selectedOverlayClipId = null;
+      _selectedStickerId = null;
     }
+    notifyListeners();
   }
 
   void selectAudioOverlay(String? overlayId) {
     _selectedAudioOverlayId = overlayId;
     if (overlayId != null) {
-      toggleAudioEditor();
-    } else {
-      notifyListeners();
+      _selectedTextOverlayId = null;
+      _selectedVideoClipId = null;
+      _selectedOverlayClipId = null;
+      _selectedStickerId = null;
     }
+    notifyListeners();
   }
 
   void selectVideoClip(String? clipId) {
     _selectedVideoClipId = clipId;
+    if (clipId != null) {
+      _selectedAudioOverlayId = null;
+      _selectedTextOverlayId = null;
+      _selectedOverlayClipId = null;
+      _selectedStickerId = null;
+    }
     notifyListeners();
   }
 
   void selectOverlayClip(String? clipId) {
     _selectedOverlayClipId = clipId;
+    if (clipId != null) {
+      _selectedVideoClipId = null;
+      _selectedAudioOverlayId = null;
+      _selectedTextOverlayId = null;
+      _selectedStickerId = null;
+    }
     notifyListeners();
   }
 
   void selectSticker(String? stickerId) {
     _selectedStickerId = stickerId;
+    if (stickerId != null) {
+      _selectedVideoClipId = null;
+      _selectedAudioOverlayId = null;
+      _selectedTextOverlayId = null;
+      _selectedOverlayClipId = null;
+    }
+    notifyListeners();
+  }
+
+  void clearSelection() {
+    _selectedTextOverlayId = null;
+    _selectedAudioOverlayId = null;
+    _selectedVideoClipId = null;
+    _selectedOverlayClipId = null;
+    _selectedStickerId = null;
     notifyListeners();
   }
 
@@ -3798,6 +3837,8 @@ class VideoEditorProvider extends ChangeNotifier {
     _selectedTextOverlayId = null;
     _selectedAudioOverlayId = null;
     _selectedVideoClipId = null;
+    _selectedOverlayClipId = null;
+    _selectedStickerId = null;
   }
 
   Future<void> _disposeControllers() async {

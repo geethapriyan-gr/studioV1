@@ -1270,7 +1270,7 @@ class _VideoEditorScreenState extends State<VideoEditorScreen>
                             height: _getPreviewHeight(provider),
                             child: GestureDetector(
                               behavior: HitTestBehavior.opaque,
-                              onTap: () => provider.selectTextOverlay(null),
+                              onTap: () => provider.clearSelection(),
                               child: Stack(
                                 children: [
                                   _buildFilteredMedia(provider),
@@ -1538,20 +1538,26 @@ class _VideoEditorScreenState extends State<VideoEditorScreen>
               ),
               const SizedBox(width: 6),
               _buildToolButton(
-                icon: provider.showTextEditor
+                icon: (provider.showTextEditor ||
+                        provider.selectedTextOverlayId != null)
                     ? Icons.text_fields
                     : Icons.text_fields_outlined,
                 label: 'Text',
-                isActive: provider.showTextEditor,
+                isActive: provider.showTextEditor ||
+                    provider.selectedTextOverlayId != null,
+                activeColor: AppColors.textTrack,
                 onPressed: provider.toggleTextEditor,
               ),
               const SizedBox(width: 6),
               _buildToolButton(
-                icon: provider.showAudioEditor
+                icon: (provider.showAudioEditor ||
+                        provider.selectedAudioOverlayId != null)
                     ? Icons.audiotrack
                     : Icons.audiotrack_outlined,
                 label: 'Music',
-                isActive: provider.showAudioEditor,
+                isActive: provider.showAudioEditor ||
+                    provider.selectedAudioOverlayId != null,
+                activeColor: AppColors.audioTrack,
                 onPressed: provider.toggleAudioEditor,
               ),
               const SizedBox(width: 6),
@@ -1756,12 +1762,14 @@ class _VideoEditorScreenState extends State<VideoEditorScreen>
     required IconData icon,
     required String label,
     bool isActive = false,
+    Color? activeColor,
     required VoidCallback? onPressed,
   }) {
     return _buildPremiumToolBox(
       icon: icon,
       label: label,
       isActive: isActive,
+      activeColor: activeColor,
       isEnabled: onPressed != null,
       onTap: onPressed,
     );
@@ -1772,23 +1780,26 @@ class _VideoEditorScreenState extends State<VideoEditorScreen>
     required String label,
     bool isActive = false,
     bool isEnabled = true,
+    Color? activeColor,
     VoidCallback? onTap,
   }) {
+    final effectiveColor = activeColor ?? AppColors.primary;
     final iconColor = isActive
-        ? AppColors.primary
+        ? effectiveColor
         : isEnabled
             ? AppColors.textSecondary
             : AppColors.textTertiary;
     final bgColor = isActive
-        ? AppColors.primary.withOpacity(0.12)
+        ? effectiveColor.withOpacity(0.12)
         : AppColors.surfaceLight;
     final borderColor = isActive
-        ? AppColors.primary.withOpacity(0.5)
+        ? effectiveColor.withOpacity(0.5)
         : AppColors.border;
 
     return GestureDetector(
       onTap: onTap,
-      child: Container(
+      child: AnimatedContainer(
+        duration: const Duration(milliseconds: 200),
         width: 64,
         height: 64,
         decoration: BoxDecoration(

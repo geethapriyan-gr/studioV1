@@ -2847,6 +2847,8 @@ class _TimelineWidgetState extends State<TimelineWidget>
       } catch (_) {}
     }
 
+    final bool hasItemSelection = provider.hasTimelineSelection;
+
     return Container(
       height: 60,
       decoration: const BoxDecoration(
@@ -2886,14 +2888,17 @@ class _TimelineWidgetState extends State<TimelineWidget>
           ),
           _buildControlButton(
             icon: Icons.delete_outline,
-            onPressed: (provider.selectedVideoClipId != null ||
-                    provider.selectedAudioOverlayId != null ||
-                    provider.selectedStickerId != null ||
-                    provider.selectedTextOverlayId != null ||
-                    provider.selectedOverlayClipId != null)
+            onPressed: hasItemSelection
                 ? () => _showDeleteDialog(context, provider)
                 : null,
             tooltip: 'Delete',
+            color: hasItemSelection ? AppColors.error : null,
+            backgroundColor: hasItemSelection
+                ? AppColors.error.withOpacity(0.15)
+                : null,
+            borderColor: hasItemSelection
+                ? AppColors.error.withOpacity(0.5)
+                : null,
           ),
           _buildControlButton(
             icon: Icons.redo,
@@ -3172,25 +3177,31 @@ class _TimelineWidgetState extends State<TimelineWidget>
     required VoidCallback? onPressed,
     required String tooltip,
     Color? color,
+    Color? backgroundColor,
+    Color? borderColor,
   }) {
     final isEnabled = onPressed != null;
-    final iconColor = isEnabled ? (color ?? AppColors.textSecondary) : AppColors.textTertiary;
+    final iconColor =
+        isEnabled ? (color ?? AppColors.textSecondary) : AppColors.textTertiary;
     return Tooltip(
       message: tooltip,
       child: GestureDetector(
         onTap: onPressed,
-        child: Container(
+        child: AnimatedContainer(
+          duration: const Duration(milliseconds: 200),
           width: 48,
           height: 48,
           decoration: BoxDecoration(
-            color: isEnabled
-                ? AppColors.surfaceLight
-                : AppColors.surfaceLight.withOpacity(0.5),
+            color: backgroundColor ??
+                (isEnabled
+                    ? AppColors.surfaceLight
+                    : AppColors.surfaceLight.withOpacity(0.5)),
             borderRadius: BorderRadius.circular(10),
             border: Border.all(
-              color: isEnabled
-                  ? AppColors.border
-                  : AppColors.border.withOpacity(0.4),
+              color: borderColor ??
+                  (isEnabled
+                      ? AppColors.border
+                      : AppColors.border.withOpacity(0.4)),
               width: 1,
             ),
           ),
@@ -3448,6 +3459,19 @@ class _TimelineWidgetState extends State<TimelineWidget>
   }
 
   void _showDeleteDialog(BuildContext context, VideoEditorProvider provider) {
+    String itemLabel = 'item';
+    if (provider.selectedVideoClipId != null) {
+      itemLabel = 'video clip';
+    } else if (provider.selectedAudioOverlayId != null) {
+      itemLabel = 'audio track';
+    } else if (provider.selectedStickerId != null) {
+      itemLabel = 'sticker';
+    } else if (provider.selectedTextOverlayId != null) {
+      itemLabel = 'text overlay';
+    } else if (provider.selectedOverlayClipId != null) {
+      itemLabel = 'overlay clip';
+    }
+
     showDialog(
       context: context,
       builder: (context) => AlertDialog(
@@ -3458,9 +3482,9 @@ class _TimelineWidgetState extends State<TimelineWidget>
         ),
         title: const Text('Delete Item',
             style: TextStyle(color: AppColors.textPrimary)),
-        content: const Text(
-          'Are you sure you want to delete the selected item?',
-          style: TextStyle(color: AppColors.textSecondary),
+        content: Text(
+          'Are you sure you want to delete the selected $itemLabel?',
+          style: const TextStyle(color: AppColors.textSecondary),
         ),
         actions: [
           TextButton(
