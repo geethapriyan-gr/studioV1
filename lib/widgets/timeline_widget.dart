@@ -1870,7 +1870,9 @@ class _TimelineWidgetState extends State<TimelineWidget>
                   }
                   _lastVideoTrimUpdate = now;
 
-                  final delta = Duration(milliseconds: deltaMs);
+                  // Timeline drag distance -> source distance (speed-aware)
+                  final delta = Duration(
+                      milliseconds: (deltaMs * clip.playbackSpeed).round());
                   final newTrimStart = clip.trimStart + delta;
                   if (newTrimStart < clip.sourceStart ||
                       newTrimStart >=
@@ -1916,7 +1918,9 @@ class _TimelineWidgetState extends State<TimelineWidget>
                   }
                   _lastVideoTrimUpdate = now;
 
-                  final delta = Duration(milliseconds: deltaMs);
+                  // Timeline drag distance -> source distance (speed-aware)
+                  final delta = Duration(
+                      milliseconds: (deltaMs * clip.playbackSpeed).round());
                   final newTrimEnd = clip.trimEnd + delta;
 
                   if (newTrimEnd <=

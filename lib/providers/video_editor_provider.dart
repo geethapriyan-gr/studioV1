@@ -649,26 +649,28 @@ class VideoEditorProvider extends ChangeNotifier {
       return;
     }
     final firstDuration = cutPosition - originalClip.startTime;
-    final firstSourceEnd = originalClip.sourceStart + firstDuration;
-    final firstClip = VideoClip(
+    // Split point inside the source window that is actually played/exported
+    // (trimStart-based, speed-aware) so both halves show the same frames in
+    // preview and export as the original clip did.
+    final firstSourceEnd = originalClip.trimStart +
+        sourceLengthForTimeline(firstDuration, originalClip.playbackSpeed);
+    final firstClip = originalClip.copyWith(
       id: _uuid.v4(),
-      mediaType: originalClip.mediaType,
-      videoFile: originalClip.videoFile,
-      imageFile: originalClip.imageFile,
       startTime: originalClip.startTime,
       endTime: cutPosition,
       sourceStart: originalClip.sourceStart,
       sourceEnd: firstSourceEnd,
+      trimStart: originalClip.trimStart,
+      trimEnd: firstSourceEnd,
     );
-    final secondClip = VideoClip(
+    final secondClip = originalClip.copyWith(
       id: _uuid.v4(),
-      mediaType: originalClip.mediaType,
-      videoFile: originalClip.videoFile,
-      imageFile: originalClip.imageFile,
       startTime: cutPosition,
       endTime: originalClip.endTime,
       sourceStart: firstSourceEnd,
       sourceEnd: originalClip.sourceEnd,
+      trimStart: firstSourceEnd,
+      trimEnd: originalClip.trimEnd,
     );
     final updatedClips = List<VideoClip>.from(_currentProject!.videoClips);
     updatedClips.removeAt(clipIndex);
@@ -701,8 +703,10 @@ class VideoEditorProvider extends ChangeNotifier {
       return;
     }
 
-    final oldDuration = originalClip.trimEnd - originalClip.trimStart;
-    final newDuration = newTrimEnd - originalClip.trimStart;
+    // Timeline lengths (window / speed) — same formula as the exporter.
+    final oldDuration = originalClip.endTime - originalClip.startTime;
+    final newDuration = timelineLengthForSource(
+        newTrimEnd - originalClip.trimStart, originalClip.playbackSpeed);
     final durationDiff = newDuration - oldDuration;
 
     final updatedClip = originalClip.copyWith(
@@ -763,8 +767,10 @@ class VideoEditorProvider extends ChangeNotifier {
       return;
     }
 
-    final oldDuration = originalClip.trimEnd - originalClip.trimStart;
-    final newDuration = endTrim - startTrim;
+    // Timeline lengths (source window / speed) — same formula as the exporter.
+    final oldDuration = originalClip.endTime - originalClip.startTime;
+    final newDuration =
+        timelineLengthForSource(endTrim - startTrim, originalClip.playbackSpeed);
 
     final updatedClip = originalClip.copyWith(
       trimStart: startTrim,
@@ -1662,14 +1668,39 @@ class VideoEditorProvider extends ChangeNotifier {
     _previewController?.addListener(_videoPositionListener);
   }
 
+  /// Safe playback speed (guards against 0 / negative values).
+  static double _safeSpeed(double speed) =>
+      (speed.isNaN || speed <= 0) ? 1.0 : speed;
+
+  /// Length a clip occupies on the timeline for a given source window.
+  /// This is the same formula the exporter uses (source window / speed), so
+  /// preview and export always agree on clip length.
+  static Duration timelineLengthForSource(Duration source, double speed) {
+    return Duration(
+        microseconds: (source.inMicroseconds / _safeSpeed(speed)).round());
+  }
+
+  /// Amount of source media consumed by [timeline] of playback at [speed].
+  static Duration sourceLengthForTimeline(Duration timeline, double speed) {
+    return Duration(
+        microseconds: (timeline.inMicroseconds * _safeSpeed(speed)).round());
+  }
+
+  /// Maps a timeline position to a position inside the clip's source file.
+  ///
+  /// The source window of a clip is [VideoClip.trimStart]..[VideoClip.trimEnd]
+  /// — exactly what the exporter reads (`-ss trimStart -t trimmedDuration`) —
+  /// and the clip's playback speed is honoured, so the preview shows the same
+  /// frames that end up in the exported file.
   @visibleForTesting
   static Duration calculateSourcePositionForTimeline(
     VideoClip clip,
     Duration timelinePosition,
   ) {
     final offsetWithinClip = timelinePosition - clip.startTime;
-    if (offsetWithinClip <= Duration.zero) return clip.sourceStart;
-    return clip.sourceStart + offsetWithinClip;
+    if (offsetWithinClip <= Duration.zero) return clip.trimStart;
+    return clip.trimStart +
+        sourceLengthForTimeline(offsetWithinClip, clip.playbackSpeed);
   }
 
   @visibleForTesting
@@ -2210,10 +2241,21 @@ class VideoEditorProvider extends ChangeNotifier {
 
   Future<void> setVideoClipPlaybackSpeed(String clipId, double speed) async {
     if (_currentProject == null) return;
-    final clip = _currentProject!.videoClips.firstWhere((c) => c.id == clipId);
-    final updatedClip = clip.copyWith(playbackSpeed: speed);
+    final clipIndex =
+        _currentProject!.videoClips.indexWhere((c) => c.id == clipId);
+    if (clipIndex == -1) return;
+    final clip = _currentProject!.videoClips[clipIndex];
+    // The exporter renders a clip as (source window / speed) seconds, so the
+    // clip's timeline length changes with speed; later clips shift with it.
+    final updatedClip = clip.copyWith(
+      playbackSpeed: speed,
+      endTime: clip.startTime +
+          timelineLengthForSource(clip.trimEnd - clip.trimStart, speed),
+    );
     recordUndo();
-    _currentProject = _currentProject!.updateVideoClip(clipId, updatedClip);
+    _currentProject = _currentProject!.copyWith(
+      videoClips: _replaceAndRipple(clipIndex, clip, updatedClip),
+    );
 
     // Apply playback speed immediately if this is the current clip
     if (clipId == _selectedVideoClipId && _previewController != null) {
@@ -2837,36 +2879,28 @@ class VideoEditorProvider extends ChangeNotifier {
       return;
     }
     final firstDuration = cutPosition - originalClip.startTime;
-    final firstSourceEnd = originalClip.sourceStart + firstDuration;
-    final firstClip = VideoClip(
+    final secondDuration = originalClip.endTime - cutPosition;
+    final isImage = originalClip.mediaType == MediaType.image;
+    // Overlay preview and export both play trimStart..trimEnd, so each half
+    // keeps its own part of that window.
+    final firstSourceEnd = originalClip.trimStart + firstDuration;
+    final firstClip = originalClip.copyWith(
       id: _uuid.v4(),
-      mediaType: originalClip.mediaType,
-      videoFile: originalClip.videoFile,
-      imageFile: originalClip.imageFile,
       startTime: originalClip.startTime,
       endTime: cutPosition,
-      sourceStart: originalClip.sourceStart,
-      sourceEnd: firstSourceEnd,
-      trimStart: originalClip.trimStart,
-      trimEnd: originalClip.trimEnd,
-      overlayPosition: originalClip.overlayPosition,
-      overlaySize: originalClip.overlaySize,
-      overlayOpacity: originalClip.overlayOpacity,
+      sourceStart: isImage ? Duration.zero : originalClip.sourceStart,
+      sourceEnd: isImage ? firstDuration : firstSourceEnd,
+      trimStart: isImage ? Duration.zero : originalClip.trimStart,
+      trimEnd: isImage ? firstDuration : firstSourceEnd,
     );
-    final secondClip = VideoClip(
+    final secondClip = originalClip.copyWith(
       id: _uuid.v4(),
-      mediaType: originalClip.mediaType,
-      videoFile: originalClip.videoFile,
-      imageFile: originalClip.imageFile,
       startTime: cutPosition,
       endTime: originalClip.endTime,
-      sourceStart: firstSourceEnd,
-      sourceEnd: originalClip.sourceEnd,
-      trimStart: originalClip.trimStart,
-      trimEnd: originalClip.trimEnd,
-      overlayPosition: originalClip.overlayPosition,
-      overlaySize: originalClip.overlaySize,
-      overlayOpacity: originalClip.overlayOpacity,
+      sourceStart: isImage ? Duration.zero : firstSourceEnd,
+      sourceEnd: isImage ? secondDuration : originalClip.sourceEnd,
+      trimStart: isImage ? Duration.zero : firstSourceEnd,
+      trimEnd: isImage ? secondDuration : originalClip.trimEnd,
     );
     final updatedClips = List<VideoClip>.from(_currentProject!.overlayClips);
     updatedClips.removeAt(clipIndex);
@@ -2931,6 +2965,8 @@ class VideoEditorProvider extends ChangeNotifier {
       // Free preview controllers before export to avoid OOM during FFmpeg processing.
       // Save the active path so we can restore after export.
       final savedActivePath = _activeFilePath;
+      var lastNotifiedPercent = -1;
+      var lastProgressNotify = DateTime.fromMillisecondsSinceEpoch(0);
       if (_isPlaying) await togglePlayback();
       for (final entry in _previewControllers.entries) {
         try {
@@ -2954,7 +2990,18 @@ class VideoEditorProvider extends ChangeNotifier {
         onProgress: (p) {
           _exportProgress = p;
           onProgress?.call(p);
-          notifyListeners();
+          // Rebuilding the whole editor for every FFmpeg statistics callback
+          // competes with the encoder for CPU; refresh at most ~8x/second or
+          // when the visible percentage changes.
+          final now = DateTime.now();
+          final percent = (p * 100).floor();
+          if (percent != lastNotifiedPercent &&
+              now.difference(lastProgressNotify) >=
+                  const Duration(milliseconds: 120)) {
+            lastNotifiedPercent = percent;
+            lastProgressNotify = now;
+            notifyListeners();
+          }
         },
       );
       // Restore preview controller after export
@@ -2974,7 +3021,8 @@ class VideoEditorProvider extends ChangeNotifier {
       return resultPath;
     } catch (e) {
       _isExporting = false;
-      _exportError = 'Export failed: $e';
+      // A user-cancelled export is not an error.
+      _exportError = ExportService.wasCancelled ? null : 'Export failed: $e';
       notifyListeners();
       return null;
     }
@@ -3120,6 +3168,38 @@ class VideoEditorProvider extends ChangeNotifier {
     notifyListeners();
   }
 
+  /// Replaces [clipIndex] with [updatedClip] and shifts every later clip on
+  /// the main track by the change in timeline length, so the timeline stays
+  /// contiguous exactly like the exported video.
+  List<VideoClip> _replaceAndRipple(
+      int clipIndex, VideoClip originalClip, VideoClip updatedClip) {
+    final updatedClips = List<VideoClip>.from(_currentProject!.videoClips);
+    updatedClips[clipIndex] = updatedClip;
+    final durationDiff = (updatedClip.endTime - updatedClip.startTime) -
+        (originalClip.endTime - originalClip.startTime);
+    if (durationDiff != Duration.zero) {
+      for (int i = clipIndex + 1; i < updatedClips.length; i++) {
+        final c = updatedClips[i];
+        updatedClips[i] = c.copyWith(
+          startTime: c.startTime + durationDiff,
+          endTime: c.endTime + durationDiff,
+        );
+      }
+    }
+    return updatedClips;
+  }
+
+  /// The trim editor expresses handle positions as
+  /// `clip.startTime + fraction * (sourceEnd - sourceStart)`; convert that back
+  /// into an absolute position inside the source file.
+  static Duration _trimEditorPositionToSource(
+      VideoClip clip, Duration trimPosition) {
+    var source = clip.sourceStart + (trimPosition - clip.startTime);
+    if (source < clip.sourceStart) source = clip.sourceStart;
+    if (source > clip.sourceEnd) source = clip.sourceEnd;
+    return source;
+  }
+
   /// Applies left trim - keeps only the right portion, deletes left portion
   Future<void> applyLeftTrim(String clipId, Duration trimPosition) async {
     if (_currentProject == null) return;
@@ -3130,28 +3210,23 @@ class VideoEditorProvider extends ChangeNotifier {
 
     final originalClip = _currentProject!.videoClips[clipIndex];
 
-    // The trimPosition is where we want to cut
-    // Keep everything from trimPosition to end
-    final offsetWithinClip = trimPosition - originalClip.startTime;
-    final newSourceStart = originalClip.sourceStart + offsetWithinClip;
-
-    if (newSourceStart >= originalClip.sourceEnd) {
+    final newTrimStart = _trimEditorPositionToSource(originalClip, trimPosition);
+    if (newTrimStart >=
+        originalClip.trimEnd - const Duration(milliseconds: 100)) {
       return; // Can't trim everything
     }
 
+    final newLength = timelineLengthForSource(
+        originalClip.trimEnd - newTrimStart, originalClip.playbackSpeed);
     final updatedClip = originalClip.copyWith(
-      startTime: Duration.zero,
-      endTime: originalClip.endTime - trimPosition,
-      sourceStart: newSourceStart,
-      trimStart: Duration.zero,
-      trimEnd: originalClip.sourceEnd,
+      endTime: originalClip.startTime + newLength,
+      sourceStart: newTrimStart,
+      trimStart: newTrimStart,
     );
 
-    final updatedClips = List<VideoClip>.from(_currentProject!.videoClips);
-    updatedClips[clipIndex] = updatedClip;
-
     recordUndo();
-    _currentProject = _currentProject!.copyWith(videoClips: updatedClips);
+    _currentProject = _currentProject!.copyWith(
+        videoClips: _replaceAndRipple(clipIndex, originalClip, updatedClip));
     _scheduleAutoSave();
     notifyListeners();
   }
@@ -3166,27 +3241,23 @@ class VideoEditorProvider extends ChangeNotifier {
 
     final originalClip = _currentProject!.videoClips[clipIndex];
 
-    // The trimPosition is where we want to cut
-    // Keep everything from start to trimPosition
-    final offsetWithinClip = trimPosition - originalClip.startTime;
-    final newSourceEnd = originalClip.sourceStart + offsetWithinClip;
-
-    if (newSourceEnd <= originalClip.sourceStart) {
+    final newTrimEnd = _trimEditorPositionToSource(originalClip, trimPosition);
+    if (newTrimEnd <=
+        originalClip.trimStart + const Duration(milliseconds: 100)) {
       return; // Can't trim everything
     }
 
+    final newLength = timelineLengthForSource(
+        newTrimEnd - originalClip.trimStart, originalClip.playbackSpeed);
     final updatedClip = originalClip.copyWith(
-      endTime: trimPosition,
-      sourceEnd: newSourceEnd,
-      trimStart: Duration.zero,
-      trimEnd: newSourceEnd,
+      endTime: originalClip.startTime + newLength,
+      sourceEnd: newTrimEnd,
+      trimEnd: newTrimEnd,
     );
 
-    final updatedClips = List<VideoClip>.from(_currentProject!.videoClips);
-    updatedClips[clipIndex] = updatedClip;
-
     recordUndo();
-    _currentProject = _currentProject!.copyWith(videoClips: updatedClips);
+    _currentProject = _currentProject!.copyWith(
+        videoClips: _replaceAndRipple(clipIndex, originalClip, updatedClip));
     _scheduleAutoSave();
     notifyListeners();
   }
@@ -3200,11 +3271,7 @@ class VideoEditorProvider extends ChangeNotifier {
     if (clipIndex == -1) return;
 
     final originalClip = _currentProject!.videoClips[clipIndex];
-
-    // Get the current cursor position
     final cursorPosition = _currentPosition;
-
-    // Calculate the offset within the clip
     final offsetWithinClip = cursorPosition - originalClip.startTime;
 
     // Only proceed if cursor is within this clip
@@ -3213,11 +3280,11 @@ class VideoEditorProvider extends ChangeNotifier {
       return;
     }
 
-    // Calculate new source start (the position in the original video where we want to start)
-    final newSourceStart = originalClip.sourceStart + offsetWithinClip;
+    // Source frame under the cursor (same mapping as preview and export)
+    final newTrimStart =
+        calculateSourcePositionForTimeline(originalClip, cursorPosition);
 
-    // The new timeline start should stay at the original clip's position
-    // This keeps the trimmed right portion at the same position in the timeline
+    // Keep the remaining right portion at the clip's original timeline start
     final newTimelineStart = originalClip.startTime;
     final newEndTime =
         originalClip.startTime + (originalClip.endTime - cursorPosition);
@@ -3225,28 +3292,13 @@ class VideoEditorProvider extends ChangeNotifier {
     final updatedClip = originalClip.copyWith(
       startTime: newTimelineStart,
       endTime: newEndTime,
-      sourceStart: newSourceStart,
-      trimStart: Duration.zero,
-      trimEnd: originalClip.sourceEnd,
+      sourceStart: newTrimStart,
+      trimStart: newTrimStart,
     );
-
-    final updatedClips = List<VideoClip>.from(_currentProject!.videoClips);
-    updatedClips[clipIndex] = updatedClip;
-
-    // Adjust position of subsequent clips if any
-    final durationDiff = newEndTime - originalClip.endTime;
-    for (int i = clipIndex + 1; i < updatedClips.length; i++) {
-      final c = updatedClips[i];
-      updatedClips[i] = c.copyWith(
-        startTime: c.startTime + durationDiff,
-        endTime: c.endTime + durationDiff,
-      );
-    }
 
     recordUndo();
     _currentProject = _currentProject!.copyWith(
-      videoClips: updatedClips,
-      totalDuration: _currentProject!.calculateTotalDuration(),
+      videoClips: _replaceAndRipple(clipIndex, originalClip, updatedClip),
     );
 
     // Update cursor position to the start of the trimmed clip
@@ -3264,11 +3316,7 @@ class VideoEditorProvider extends ChangeNotifier {
     if (clipIndex == -1) return;
 
     final originalClip = _currentProject!.videoClips[clipIndex];
-
-    // Get the current cursor position
     final cursorPosition = _currentPosition;
-
-    // Calculate the offset within the clip
     final offsetWithinClip = cursorPosition - originalClip.startTime;
 
     // Only proceed if cursor is within this clip
@@ -3277,31 +3325,18 @@ class VideoEditorProvider extends ChangeNotifier {
       return;
     }
 
-    // Calculate new source end (the position in the original video where we want to end)
-    final newSourceEnd = originalClip.sourceStart + offsetWithinClip;
+    final newTrimEnd =
+        calculateSourcePositionForTimeline(originalClip, cursorPosition);
 
     final updatedClip = originalClip.copyWith(
       endTime: cursorPosition,
-      sourceEnd: newSourceEnd,
-      trimStart: Duration.zero,
-      trimEnd: newSourceEnd,
+      sourceEnd: newTrimEnd,
+      trimEnd: newTrimEnd,
     );
 
-    final updatedClips = List<VideoClip>.from(_currentProject!.videoClips);
-    updatedClips[clipIndex] = updatedClip;
-
-    // Adjust position of subsequent clips if any
-    final durationDiff = cursorPosition - originalClip.endTime;
-    for (int i = clipIndex + 1; i < updatedClips.length; i++) {
-      final c = updatedClips[i];
-      updatedClips[i] = c.copyWith(
-        startTime: c.startTime + durationDiff,
-        endTime: c.endTime + durationDiff,
-      );
-    }
-
     recordUndo();
-    _currentProject = _currentProject!.copyWith(videoClips: updatedClips);
+    _currentProject = _currentProject!.copyWith(
+        videoClips: _replaceAndRipple(clipIndex, originalClip, updatedClip));
     _scheduleAutoSave();
     notifyListeners();
   }
@@ -3315,11 +3350,7 @@ class VideoEditorProvider extends ChangeNotifier {
     if (clipIndex == -1) return;
 
     final originalClip = _currentProject!.overlayClips[clipIndex];
-
-    // Get the current cursor position
     final cursorPosition = _currentPosition;
-
-    // Calculate the offset within the clip
     final offsetWithinClip = cursorPosition - originalClip.startTime;
 
     // Only proceed if cursor is within this clip
@@ -3328,16 +3359,27 @@ class VideoEditorProvider extends ChangeNotifier {
       return;
     }
 
-    // Calculate new source start (the position in the original video where we want to start)
-    final newSourceStart = originalClip.sourceStart + offsetWithinClip;
-
-    final updatedClip = originalClip.copyWith(
-      startTime: cursorPosition,
-      endTime: originalClip.endTime,
-      sourceStart: newSourceStart,
-      trimStart: Duration.zero,
-      trimEnd: originalClip.sourceEnd - newSourceStart,
-    );
+    final VideoClip updatedClip;
+    if (originalClip.mediaType == MediaType.image) {
+      final remaining = originalClip.endTime - cursorPosition;
+      updatedClip = originalClip.copyWith(
+        startTime: cursorPosition,
+        endTime: originalClip.endTime,
+        sourceStart: Duration.zero,
+        sourceEnd: remaining,
+        trimStart: Duration.zero,
+        trimEnd: remaining,
+      );
+    } else {
+      // Overlay preview and export both read trimStart..trimEnd.
+      final newTrimStart = originalClip.trimStart + offsetWithinClip;
+      updatedClip = originalClip.copyWith(
+        startTime: cursorPosition,
+        endTime: originalClip.endTime,
+        sourceStart: newTrimStart,
+        trimStart: newTrimStart,
+      );
+    }
 
     final updatedClips = List<VideoClip>.from(_currentProject!.overlayClips);
     updatedClips[clipIndex] = updatedClip;
@@ -3357,11 +3399,7 @@ class VideoEditorProvider extends ChangeNotifier {
     if (clipIndex == -1) return;
 
     final originalClip = _currentProject!.overlayClips[clipIndex];
-
-    // Get the current cursor position
     final cursorPosition = _currentPosition;
-
-    // Calculate the offset within the clip
     final offsetWithinClip = cursorPosition - originalClip.startTime;
 
     // Only proceed if cursor is within this clip
@@ -3370,15 +3408,23 @@ class VideoEditorProvider extends ChangeNotifier {
       return;
     }
 
-    // Calculate new source end (the position in the original video where we want to end)
-    final newSourceEnd = originalClip.sourceStart + offsetWithinClip;
-
-    final updatedClip = originalClip.copyWith(
-      endTime: cursorPosition,
-      sourceEnd: newSourceEnd,
-      trimStart: Duration.zero,
-      trimEnd: newSourceEnd - originalClip.sourceStart,
-    );
+    final VideoClip updatedClip;
+    if (originalClip.mediaType == MediaType.image) {
+      updatedClip = originalClip.copyWith(
+        endTime: cursorPosition,
+        sourceStart: Duration.zero,
+        sourceEnd: offsetWithinClip,
+        trimStart: Duration.zero,
+        trimEnd: offsetWithinClip,
+      );
+    } else {
+      final newTrimEnd = originalClip.trimStart + offsetWithinClip;
+      updatedClip = originalClip.copyWith(
+        endTime: cursorPosition,
+        sourceEnd: newTrimEnd,
+        trimEnd: newTrimEnd,
+      );
+    }
 
     final updatedClips = List<VideoClip>.from(_currentProject!.overlayClips);
     updatedClips[clipIndex] = updatedClip;
@@ -3389,7 +3435,9 @@ class VideoEditorProvider extends ChangeNotifier {
     notifyListeners();
   }
 
-  /// Applies trim (split) - splits video into two separate clips
+  /// Applies trim (split) - removes the part between the two handles and
+  /// keeps the parts before and after it as two separate clips (the removed
+  /// section is left as a gap on the timeline, as before).
   Future<void> applyTrimSplit(
       String clipId, Duration startTrim, Duration endTrim) async {
     if (_currentProject == null) return;
@@ -3399,33 +3447,42 @@ class VideoEditorProvider extends ChangeNotifier {
     if (clipIndex == -1) return;
 
     final originalClip = _currentProject!.videoClips[clipIndex];
+    final speed = originalClip.playbackSpeed;
 
-    // Calculate durations
-    final firstPartDuration = startTrim - originalClip.startTime;
-    final secondPartDuration = originalClip.endTime - endTrim;
+    // Source positions of the two handles
+    final firstSourceEnd =
+        _trimEditorPositionToSource(originalClip, startTrim);
+    final secondSourceStart =
+        _trimEditorPositionToSource(originalClip, endTrim);
 
-    if (firstPartDuration.inMilliseconds < 100 ||
-        secondPartDuration.inMilliseconds < 100) {
+    if (firstSourceEnd - originalClip.trimStart <
+            const Duration(milliseconds: 100) ||
+        originalClip.trimEnd - secondSourceStart <
+            const Duration(milliseconds: 100) ||
+        secondSourceStart < firstSourceEnd) {
       return; // Parts too short
     }
 
-    // First clip: from start to startTrim
-    final firstClipSourceEnd = originalClip.sourceStart + firstPartDuration;
+    // First clip: from the clip start up to the first handle
     final firstClip = originalClip.copyWith(
       id: _uuid.v4(),
-      endTime: startTrim,
-      sourceEnd: firstClipSourceEnd,
-      trimEnd: originalClip.duration! - firstPartDuration,
+      endTime: originalClip.startTime +
+          timelineLengthForSource(firstSourceEnd - originalClip.trimStart, speed),
+      sourceEnd: firstSourceEnd,
+      trimEnd: firstSourceEnd,
     );
 
-    // Second clip: from endTrim to end
-    final secondClipSourceStart =
-        originalClip.sourceStart + (endTrim - originalClip.startTime);
+    // Second clip: from the second handle to the end, placed where that
+    // content sat on the timeline before the middle part was removed.
+    final secondStart = originalClip.startTime +
+        timelineLengthForSource(secondSourceStart - originalClip.trimStart, speed);
     final secondClip = originalClip.copyWith(
       id: _uuid.v4(),
-      startTime: endTrim,
-      sourceStart: secondClipSourceStart,
-      trimStart: secondClipSourceStart,
+      startTime: secondStart,
+      endTime: secondStart +
+          timelineLengthForSource(originalClip.trimEnd - secondSourceStart, speed),
+      sourceStart: secondSourceStart,
+      trimStart: secondSourceStart,
     );
 
     final updatedClips = List<VideoClip>.from(_currentProject!.videoClips);
@@ -3712,8 +3769,8 @@ class VideoEditorProvider extends ChangeNotifier {
     if (clip.mediaType == MediaType.image) return false;
     if (clip.mediaType == MediaType.video && clip.videoFile != null) {
       const eps = Duration(milliseconds: 5);
-      final offsetWithinClip = _currentPosition - clip.startTime;
-      final sourcePosition = clip.sourceStart + offsetWithinClip;
+      final sourcePosition =
+          calculateSourcePositionForTimeline(clip, _currentPosition);
       final path = clip.videoFile!.path;
       final controller = _previewControllers[path];
       final dur = controller?.value.duration ?? Duration.zero;
@@ -4022,7 +4079,7 @@ class VideoEditorProvider extends ChangeNotifier {
       }
 
       final key =
-          '${transition.id}|$clip2Path|${clip2.sourceStart.inMilliseconds}';
+          '${transition.id}|$clip2Path|${clip2.trimStart.inMilliseconds}';
       if (_transitionPrewarmedControllerKeys.contains(key) ||
           _transitionPrewarmInFlight.contains(key)) {
         continue;
@@ -4044,7 +4101,7 @@ class VideoEditorProvider extends ChangeNotifier {
 
       await controller.setVolume(0.0);
       final target = clampSourcePositionForVideo(
-        clip.sourceStart,
+        clip.trimStart,
         controller.value.duration,
       );
       if ((controller.value.position - target).abs() >
@@ -4260,12 +4317,73 @@ class VideoEditorProvider extends ChangeNotifier {
     await _autoSaveProject();
   }
 
+  /// Older builds stored some clips with `trimStart/trimEnd` that disagreed
+  /// with the clip's timeline length (preview used `sourceStart`, export used
+  /// `trimStart`), and ignored playback speed for the clip length. Bring such
+  /// clips into the single consistent model used by both preview and export,
+  /// keeping what the preview used to show.
+  static VideoProject normalizeLegacyClipTiming(VideoProject project) {
+    const tolerance = Duration(milliseconds: 40);
+    bool close(Duration a, Duration b) => (a - b).abs() <= tolerance;
+
+    final clips = List<VideoClip>.from(project.videoClips);
+    var changed = false;
+    for (int i = 0; i < clips.length; i++) {
+      var c = clips[i];
+      final timelineLen = c.endTime - c.startTime;
+      if (timelineLen <= Duration.zero) continue;
+      final speed = c.playbackSpeed;
+
+      if (close(timelineLengthForSource(c.trimEnd - c.trimStart, speed),
+          timelineLen)) {
+        continue; // already consistent
+      }
+
+      final sourceWindow = c.sourceEnd - c.sourceStart;
+      if (sourceWindow > Duration.zero &&
+          (close(timelineLengthForSource(sourceWindow, speed), timelineLen) ||
+              close(sourceWindow, timelineLen))) {
+        // Preview used sourceStart..sourceEnd for this clip.
+        c = c.copyWith(trimStart: c.sourceStart, trimEnd: c.sourceEnd);
+        changed = true;
+      }
+
+      final window = c.trimEnd - c.trimStart;
+      final expectedLen = timelineLengthForSource(window, speed);
+      if (!close(expectedLen, timelineLen) &&
+          window > Duration.zero &&
+          close(window, timelineLen)) {
+        // Speed was never applied to the clip length; the exporter always
+        // rendered window/speed, so adopt that length and shift later clips.
+        final diff = expectedLen - timelineLen;
+        final oldEnd = c.endTime;
+        c = c.copyWith(endTime: c.startTime + expectedLen);
+        for (int j = 0; j < clips.length; j++) {
+          if (j == i) continue;
+          final o = clips[j];
+          if (o.startTime >= oldEnd - tolerance) {
+            clips[j] = o.copyWith(
+                startTime: o.startTime + diff, endTime: o.endTime + diff);
+          }
+        }
+        changed = true;
+      }
+      clips[i] = c;
+    }
+    if (!changed) return project;
+    return project.copyWith(
+      videoClips: clips,
+      lastModified: project.lastModified,
+    );
+  }
+
   Future<void> loadProject(String projectId) async {
     final project = HiveService.getProject(projectId);
     if (project != null) {
       await _disposeControllers();
       // Use healer to fix paths before loading
       await _healProjectPaths(project);
+      _currentProject = normalizeLegacyClipTiming(_currentProject!);
 
       _undoStack.clear();
       _redoStack.clear();
@@ -4784,16 +4902,19 @@ class VideoEditorProvider extends ChangeNotifier {
 
         // Update the clip with the processed video file
         final processedFile = File(newPath);
-        final processedDuration = clip.duration > Duration.zero
-            ? clip.duration
-            : clip.trimmedDuration;
+        // The processed file contains the clip's source window at 1x speed;
+        // playback speed is still applied on top of it (preview and export).
+        final processedDuration = clip.trimmedDuration > Duration.zero
+            ? clip.trimmedDuration
+            : clip.duration;
         final updatedClip = clip.copyWith(
           videoFile: processedFile,
           sourceStart: Duration.zero,
           sourceEnd: processedDuration,
           trimStart: Duration.zero,
           trimEnd: processedDuration,
-          endTime: clip.startTime + processedDuration,
+          endTime: clip.startTime +
+              timelineLengthForSource(processedDuration, clip.playbackSpeed),
           isReversed: false,
           clearReversedFilePath: true,
           clearChromaKeySettings: true,
@@ -4870,14 +4991,14 @@ class VideoEditorProvider extends ChangeNotifier {
     final updatedClips = <VideoClip>[];
 
     for (final clip in clips) {
-      // Preserve the trimmed duration of the clip
-      final trimmedDuration = clip.trimmedDuration;
+      // Preserve the clip's timeline length (what is previewed and exported)
+      final clipLength = clip.endTime - clip.startTime;
       final updatedClip = clip.copyWith(
         startTime: currentStartTime,
-        endTime: currentStartTime + trimmedDuration,
+        endTime: currentStartTime + clipLength,
       );
       updatedClips.add(updatedClip);
-      currentStartTime += trimmedDuration;
+      currentStartTime += clipLength;
     }
 
     _currentProject = _currentProject!.copyWith(

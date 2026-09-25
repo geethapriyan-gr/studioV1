@@ -49,7 +49,100 @@ class _RenderedSticker {
   });
 }
 
+/// A pre-rendered, tightly cropped overlay image and its position in the
+/// output frame.
+class _LayerPng {
+  final File file;
+  final int x;
+  final int y;
+
+  const _LayerPng(this.file, this.x, this.y);
+}
+
+enum _ComposeLayerKind { png, rawImage, video }
+
+/// One visual layer drawn on top of the base timeline during export.
+class _ComposeLayer {
+  final _ComposeLayerKind kind;
+  final _LayerPng? png;
+  final String? path;
+  final Rect? box;
+  final double opacity;
+  final double start;
+  final double end;
+  final double trimStart;
+  final double trimDuration;
+  final bool withAudio;
+  final double volume;
+
+  _ComposeLayer._(
+    this.kind, {
+    this.png,
+    this.path,
+    this.box,
+    this.opacity = 1.0,
+    required this.start,
+    required this.end,
+    this.trimStart = 0,
+    this.trimDuration = 0,
+    this.withAudio = false,
+    this.volume = 1.0,
+  });
+
+  factory _ComposeLayer.png(_LayerPng png, double start, double end) =>
+      _ComposeLayer._(_ComposeLayerKind.png,
+          png: png, start: start, end: end);
+
+  factory _ComposeLayer.rawImage(
+          String path, Rect box, double opacity, double start, double end) =>
+      _ComposeLayer._(_ComposeLayerKind.rawImage,
+          path: path, box: box, opacity: opacity, start: start, end: end);
+
+  factory _ComposeLayer.video(
+    String path,
+    Rect box,
+    double opacity,
+    double start,
+    double end, {
+    required double trimStart,
+    required double trimDuration,
+    required bool withAudio,
+    required double volume,
+  }) =>
+      _ComposeLayer._(_ComposeLayerKind.video,
+          path: path,
+          box: box,
+          opacity: opacity,
+          start: start,
+          end: end,
+          trimStart: trimStart,
+          trimDuration: trimDuration,
+          withAudio: withAudio,
+          volume: volume);
+}
+
+/// Transition into a clip: blend [seconds] from the previous clip's last frame.
+class _TransitionPlan {
+  final int fromIndex;
+  final double seconds;
+  final TransitionType type;
+
+  const _TransitionPlan(this.fromIndex, this.seconds, this.type);
+}
+
 class ExportService {
+  // Per-export caches so the same file is not probed over and over.
+  static final Map<String, double> _aspectCache = {};
+  static final Map<String, bool> _audioStreamCache = {};
+  static bool _cancelled = false;
+
+  /// True when the last export was stopped by [cancelExport].
+  static bool get wasCancelled => _cancelled;
+
+  static void _throwIfCancelled() {
+    if (_cancelled) throw Exception('Export cancelled');
+  }
+
   static Future<double> _getClipAspectRatio(VideoProject project, Duration time) async {
     VideoClip? clip;
     for (final c in project.videoClips) {
@@ -59,8 +152,17 @@ class ExportService {
       }
     }
     clip ??= project.videoClips.firstOrNull;
+
+    // The preview shows image clips in a box with the project's output aspect.
+    if (clip != null && clip.mediaType == MediaType.image) {
+      final res = project.outputResolution;
+      if (res.width > 0 && res.height > 0) return res.width / res.height;
+    }
+
     final path = clip?.videoFile?.path;
     if (path != null) {
+      final cached = _aspectCache[path];
+      if (cached != null) return cached;
       final session = await FFprobeKit.getMediaInformation(path);
       final info = await session.getMediaInformation();
       if (info != null) {
@@ -69,15 +171,28 @@ class ExportService {
           if (s.getProperty('codec_type') == 'video' || s.getType() == 'video') {
             num w = s.getWidth() ?? 1080;
             num h = s.getHeight() ?? 1920;
-            final rotMap = s.getAllProperties();
+            final props = s.getAllProperties();
             double rot = 0;
-            if (rotMap != null && rotMap['tags'] != null && rotMap['tags']['rotate'] != null) {
-              rot = double.tryParse(rotMap['tags']['rotate'].toString()) ?? 0;
+            if (props != null && props['tags'] != null && props['tags']['rotate'] != null) {
+              rot = double.tryParse(props['tags']['rotate'].toString()) ?? 0;
+            }
+            // FFmpeg 6+ reports rotation in the display matrix side data
+            // instead of the 'rotate' tag (portrait phone recordings).
+            final sideData = props?['side_data_list'];
+            if (rot == 0 && sideData is List) {
+              for (final sd in sideData) {
+                if (sd is Map && sd['rotation'] != null) {
+                  rot = double.tryParse(sd['rotation'].toString()) ?? 0;
+                  break;
+                }
+              }
             }
             if ((rot % 180) != 0) {
               final temp = w; w = h; h = temp;
             }
-            return (w / h).toDouble();
+            final aspect = (w / h).toDouble();
+            _aspectCache[path] = aspect;
+            return aspect;
           }
         }
       }
@@ -91,17 +206,9 @@ class ExportService {
     int targetWidth,
     int targetHeight,
   ) async {
-    final clipAspect = await _getClipAspectRatio(project, time);
-    final targetAspect = targetWidth / targetHeight;
-
-    final clipPortrait = clipAspect < 1.0;
-    final targetPortrait = targetAspect < 1.0;
-
-    if (clipPortrait != targetPortrait) {
-      return targetAspect;
-    }
-
-    return clipAspect;
+    // The preview always lays overlays out relative to the clip's own box,
+    // so the export uses the clip's aspect ratio as well.
+    return _getClipAspectRatio(project, time);
   }
 
   static Future<double?> _getMediaDuration(String path) async {
@@ -146,6 +253,9 @@ class ExportService {
     double audioMasterVolume = 1.0,
     Map<String, ColorFilter>? clipColorFilters,
   }) async {
+    _cancelled = false;
+    _aspectCache.clear();
+    _audioStreamCache.clear();
     try {
       if (project.videoClips.isEmpty) {
         throw Exception('No video clips to export');
@@ -219,16 +329,50 @@ class ExportService {
       // Pick the best available encoder (hardware preferred)
       String encoder = await _pickBestEncoder();
 
-      final processedClips = <String>[];
-      final totalDuration =
-          project.calculateTotalDuration().inSeconds.toDouble();
+      // Full timeline length, exactly as long as the preview timeline
+      // (previously truncated to whole seconds and limited to video clips).
+      final totalDuration = _timelineTotalSeconds(project);
 
       // Get per-clip color filters from provider's internal map
       final resolvedClipColorFilters =
           Map<String, ColorFilter>.from(clipColorFilters ?? const {});
 
+      // Clips in timeline order (the preview plays by timeline position)
+      final order = List<int>.generate(project.videoClips.length, (i) => i);
+      order.sort((a, b) {
+        final c = project.videoClips[a].startTime
+            .compareTo(project.videoClips[b].startTime);
+        return c != 0 ? c : a.compareTo(b);
+      });
+
+      // Transitions between consecutive clips: blend window at the start of
+      // the incoming clip, the same window the preview animates.
+      final incoming = <int, _TransitionPlan>{};
+      for (int j = 1; j < order.length; j++) {
+        final prev = project.videoClips[order[j - 1]];
+        final cur = project.videoClips[order[j]];
+        Transition? t;
+        for (final tr in project.transitions) {
+          if (tr.clipId1 == prev.id && tr.clipId2 == cur.id) {
+            t = tr;
+            break;
+          }
+        }
+        if (t == null) continue;
+        final curLen = (cur.endTime - cur.startTime).inMilliseconds / 1000.0;
+        var sd = t.duration.inMilliseconds / 1000.0;
+        final maxSd = curLen - 2.0 / targetFps;
+        if (sd > maxSd) sd = maxSd;
+        sd = (sd * targetFps).floor() / targetFps; // whole frames
+        if (sd < 1.0 / targetFps) continue;
+        incoming[order[j]] = _TransitionPlan(order[j - 1], sd, t.type);
+      }
+
+      final processedClips = <String>[];
+
       // 1. Process Clips
       for (int i = 0; i < project.videoClips.length; i++) {
+        _throwIfCancelled();
         final clip = project.videoClips[i];
 
         // Use per-clip filter if available, otherwise fall back to project-wide filter
@@ -245,69 +389,112 @@ class ExportService {
           // 40% of progress allocated to clip processing
           double base = (i / project.videoClips.length) * 0.4;
           onProgress?.call(base + (p * (0.4 / project.videoClips.length)));
-        }, colorFilter: clipFilter.hasFilters ? clipFilter : project.colorFilter);
+        },
+            colorFilter: clipFilter.hasFilters ? clipFilter : project.colorFilter,
+            forceKeyFrameAt: incoming[i]?.seconds);
 
         if (processedPath == null) {
+          _throwIfCancelled();
           throw Exception(
               'Failed to process clip $i: ${clip.videoFile?.path ?? clip.imageFile?.path}');
         }
         processedClips.add(processedPath);
       }
 
-      // 2. Stitch Timeline
-      final baseVideoPath = await _createTimelineBase(
-          project, processedClips, workDir, encoder, (p) {
-        onProgress?.call(0.4 + (p * 0.2));
-      }, // 40% -> 60%
-          duration: totalDuration, preset: preset);
+      // 2. Stitch Timeline (gaps, transitions, trailing black) — 40% -> 60%
+      _throwIfCancelled();
+      String? baseVideoPath = await _stitchTimeline(
+        project: project,
+        order: order,
+        processed: processedClips,
+        incoming: incoming,
+        workDir: workDir,
+        targetWidth: targetW,
+        targetHeight: targetH,
+        targetFps: targetFps,
+        timelineTotal: totalDuration,
+        encoder: encoder,
+        preset: preset,
+        onProgress: (p) => onProgress?.call(0.4 + (p * 0.2)),
+      );
       if (baseVideoPath == null) {
+        _throwIfCancelled();
+        // Fallback: previous stitching implementation
+        baseVideoPath = await _createTimelineBase(
+            project, processedClips, workDir, encoder, (p) {
+          onProgress?.call(0.4 + (p * 0.2));
+        }, duration: totalDuration, preset: preset);
+      }
+      if (baseVideoPath == null) {
+        _throwIfCancelled();
         throw Exception('Failed to create timeline base');
       }
 
       String currentVideo = baseVideoPath;
 
-      // 3+4+4.5: Apply effects, text overlays, and stickers in ONE pass
-      if (project.videoEffects.isNotEmpty ||
-          project.textOverlays.isNotEmpty ||
-          project.stickers.isNotEmpty) {
-        final combinedPath = await _applyEffectsAndOverlaysInOnePass(
-            currentVideo, project, workDir, encoder, (p) {
-          onProgress?.call(0.6 + p * 0.2);
-        }, // 60% -> 80%
-            duration: totalDuration,
-            targetWidth: targetW,
-            targetHeight: targetH,
-            targetFps: targetFps,
-            preset: preset);
-        if (combinedPath != null) {
-          currentVideo = combinedPath;
+      // 3. Effects, media overlays, text and stickers — 60% -> 90%
+      _throwIfCancelled();
+      final composed = await _composeLayers(
+        project: project,
+        basePath: currentVideo,
+        workDir: workDir,
+        targetWidth: targetW,
+        targetHeight: targetH,
+        targetFps: targetFps,
+        duration: totalDuration,
+        encoder: encoder,
+        preset: preset,
+        onProgress: (p) => onProgress?.call(0.6 + p * 0.3),
+      );
+      if (composed != null) {
+        currentVideo = composed;
+      } else {
+        _throwIfCancelled();
+        // Fallback: previous multi-pass implementation
+        if (project.videoEffects.isNotEmpty ||
+            project.textOverlays.isNotEmpty ||
+            project.stickers.isNotEmpty) {
+          final combinedPath = await _applyEffectsAndOverlaysInOnePass(
+              currentVideo, project, workDir, encoder, (p) {
+            onProgress?.call(0.6 + p * 0.2);
+          },
+              duration: totalDuration,
+              targetWidth: targetW,
+              targetHeight: targetH,
+              targetFps: targetFps,
+              preset: preset);
+          if (combinedPath != null) {
+            currentVideo = combinedPath;
+          }
+        }
+        if (project.overlayClips.isNotEmpty) {
+          _throwIfCancelled();
+          final mediaOverlayPath = await _addMediaOverlays(
+              currentVideo, project.overlayClips, workDir, (p) {
+            onProgress?.call(0.8 + p * 0.1);
+          },
+              targetWidth: targetW,
+              targetHeight: targetH,
+              duration: totalDuration,
+              encoder: encoder,
+              preset: preset);
+          if (mediaOverlayPath == null) {
+            throw Exception('Failed to add media overlays');
+          }
+          currentVideo = mediaOverlayPath;
         }
       }
 
-      // 5. Add Media Overlays
-      if (project.overlayClips.isNotEmpty) {
-        final mediaOverlayPath = await _addMediaOverlays(
-            currentVideo, project.overlayClips, workDir, (p) {
-          onProgress?.call(0.8 + p * 0.1);
-        }, // 80% -> 90%
-            targetWidth: targetW,
-            targetHeight: targetH,
-            duration: totalDuration,
-            encoder: encoder,
-            preset: preset);
-        if (mediaOverlayPath == null) {
-          throw Exception('Failed to add media overlays');
-        }
-        currentVideo = mediaOverlayPath;
-      }
-
-      // 6. Finalize Audio
+      // 4. Finalize Audio — 90% -> 100%
+      _throwIfCancelled();
       final finalPath = await _finalizeWithAudio(currentVideo, project,
           outputPath, encoder, videoMasterVolume, audioMasterVolume, (p) {
         onProgress?.call(0.9 + p * 0.1);
-      }, // 90% -> 100%
-          duration: totalDuration);
-      if (finalPath == null) throw Exception('Failed to finalize with audio');
+      }, duration: totalDuration);
+      if (finalPath == null) {
+        _throwIfCancelled();
+        throw Exception('Failed to finalize with audio');
+      }
 
       onProgress?.call(1.0);
       return finalPath;
@@ -326,7 +513,8 @@ class ExportService {
       int crf,
       String preset,
       String encoder,
-      Function(double) onClipProgress, {ColorFilter? colorFilter}) async {
+      Function(double) onClipProgress,
+      {ColorFilter? colorFilter, double? forceKeyFrameAt}) async {
     final inputPath = clip.videoFile?.path ?? clip.imageFile?.path;
     if (inputPath == null) return null;
 
@@ -358,7 +546,8 @@ class ExportService {
           durationSeconds,
           chromaKeySettings,
           backgroundPath,
-          outputPath);
+          outputPath,
+          forceKeyFrameAt: forceKeyFrameAt);
     }
     // ============ END CHROMA KEY ============
 
@@ -376,7 +565,8 @@ class ExportService {
         durationSeconds,
         outputPath,
         colorFilter: colorFilter,
-        preset: preset);
+        preset: preset,
+        forceKeyFrameAt: forceKeyFrameAt);
   }
 
   /// Process clip with chroma key (green screen) effect using a SINGLE FFmpeg pass.
@@ -407,7 +597,8 @@ class ExportService {
       double durationSeconds,
       ChromaKeySettings chromaKeySettings,
       String backgroundPath,
-      String outputPath) async {
+      String outputPath,
+      {double? forceKeyFrameAt}) async {
     final inputPath = (clip.isReversed &&
                 clip.reversedFilePath != null &&
                 File(clip.reversedFilePath!).existsSync())
@@ -421,7 +612,7 @@ class ExportService {
       return _processClipComprehensiveNoChromaKey(
           clip, workDir, index, targetWidth, targetHeight, targetFps,
           _softwareEncoder, onClipProgress, sourceStartSeconds, durationSeconds,
-          outputPath, preset: 'ultrafast');
+          outputPath, preset: 'ultrafast', forceKeyFrameAt: forceKeyFrameAt);
     }
 
     final keyColorHex = chromaKeySettings.keyColorHex;
@@ -519,7 +710,7 @@ class ExportService {
     final overlayX = '(W-w)*${position.dx}';
     final overlayY = '(H-h)*${position.dy}';
     parts.add('[ck_bg][ck_keyed]overlay=$overlayX:$overlayY:shortest=1'
-        ',format=yuv420p[ck_out]');
+        ',fps=$targetFps,format=yuv420p[ck_out]');
 
     final filterComplex = parts.join(';');
 
@@ -551,6 +742,7 @@ class ExportService {
         '-map "[ck_out]" $audioMap $audioFilter '
         '-c:v $_softwareEncoder -preset ultrafast -tune fastdecode -threads 0 -crf 23 -pix_fmt yuv420p '
         '-c:a aac -ar 44100 -ac 2 -shortest '
+        '${forceKeyFrameAt != null ? '-force_key_frames ${_secs(forceKeyFrameAt)} ' : ''}'
         '"$outputPath"';
 
     final result = await _executeFFmpeg(cmd, onClipProgress,
@@ -561,7 +753,7 @@ class ExportService {
       return _processClipComprehensiveNoChromaKey(
           clip, workDir, index, targetWidth, targetHeight, targetFps,
           _softwareEncoder, onClipProgress, sourceStartSeconds, durationSeconds,
-          outputPath, preset: 'ultrafast');
+          outputPath, preset: 'ultrafast', forceKeyFrameAt: forceKeyFrameAt);
     }
     return result;
   }
@@ -580,11 +772,26 @@ class ExportService {
       double durationSeconds,
       String outputPath, {
       ColorFilter? colorFilter,
-      String preset = 'ultrafast'}) async {
-    final inputPath = (clip.isReversed && clip.reversedFilePath != null && File(clip.reversedFilePath!).existsSync())
+      String preset = 'ultrafast',
+      double? forceKeyFrameAt}) async {
+    var inputPath = (clip.isReversed && clip.reversedFilePath != null && File(clip.reversedFilePath!).existsSync())
         ? clip.reversedFilePath
         : (clip.videoFile?.path ?? clip.imageFile?.path);
     if (inputPath == null) return null;
+
+    // Still images: render the frame once with Flutter at the output size
+    // (same contain-fit and EXIF orientation as the preview), then repeat that
+    // single frame instead of decoding and rescaling the photo on every frame.
+    bool imageFrameReady = false;
+    if (clip.mediaType == MediaType.image) {
+      final framePath = path.join(workDir.path, 'image_clip_$index.png');
+      final rendered = await _prerenderImageClipFrame(
+          inputPath, targetWidth, targetHeight, framePath);
+      if (rendered != null) {
+        inputPath = rendered;
+        imageFrameReady = true;
+      }
+    }
 
     final filters = <String>[];
     String inputFilter = '[0:v]';
@@ -686,12 +893,22 @@ class ExportService {
     }
     // === END BAKED COLOR FILTERS ===
 
-    // Format final processing back to yuv420p for standard mp4 encoding
-    filters.add('${inputFilter}fps=$targetFps,format=yuv420p[final_out]');
-
     String command;
     final double speed = clip.playbackSpeed;
     final outputDurationSeconds = durationSeconds / speed;
+
+    // Format final processing back to yuv420p for standard mp4 encoding
+    if (imageFrameReady) {
+      final frames = math.max(1, (outputDurationSeconds * targetFps).round());
+      filters.add('${inputFilter}format=yuv420p,'
+          'loop=loop=${frames - 1}:size=1:start=0,'
+          'setpts=N/($targetFps*TB),fps=$targetFps[final_out]');
+    } else {
+      filters.add('${inputFilter}fps=$targetFps,format=yuv420p[final_out]');
+    }
+    final keyFrameArg = forceKeyFrameAt != null
+        ? '-force_key_frames ${_secs(forceKeyFrameAt)} '
+        : '';
     final totalDurationSeconds = durationSeconds;
     final String nullAudio = '-f lavfi -t $outputDurationSeconds -i anullsrc=channel_layout=stereo:sample_rate=44100';
     
@@ -722,10 +939,13 @@ class ExportService {
       String audioFilter = aFilters.isNotEmpty ? '-af "${aFilters.join(',')}"' : '';
 
       command =
-          '-y -ss $sourceStartSeconds -t $totalDurationSeconds -i "$inputPath" $nullAudio -filter_complex "${filters.join(',')}" -map "[final_out]" $audioMap $audioFilter -c:v $encoder -preset $preset -tune fastdecode -threads 0 -crf 23 -c:a aac -ar 44100 -ac 2 -shortest "$outputPath"';
+          '-y -ss $sourceStartSeconds -t $totalDurationSeconds -i "$inputPath" $nullAudio -filter_complex "${filters.join(',')}" -map "[final_out]" $audioMap $audioFilter -c:v $encoder -preset $preset -tune fastdecode -threads 0 -crf 23 -c:a aac -ar 44100 -ac 2 -shortest $keyFrameArg"$outputPath"';
+    } else if (imageFrameReady) {
+      command =
+          '-y -i "$inputPath" $nullAudio -filter_complex "${filters.join(',')}" -map "[final_out]" -map 1:a -c:v $encoder -preset $preset -tune fastdecode -threads 0 -crf 23 -c:a aac -ar 44100 -ac 2 -t ${_secs(outputDurationSeconds)} $keyFrameArg"$outputPath"';
     } else {
       command =
-          '-y -loop 1 -t $outputDurationSeconds -i "$inputPath" $nullAudio -filter_complex "${filters.join(',')}" -map "[final_out]" -map 1:a -c:v $encoder -preset $preset -tune fastdecode -threads 0 -crf 23 -c:a aac -ar 44100 -ac 2 -shortest "$outputPath"';
+          '-y -loop 1 -t $outputDurationSeconds -i "$inputPath" $nullAudio -filter_complex "${filters.join(',')}" -map "[final_out]" -map 1:a -c:v $encoder -preset $preset -tune fastdecode -threads 0 -crf 23 -c:a aac -ar 44100 -ac 2 -shortest $keyFrameArg"$outputPath"';
     }
 
     return await _executeFFmpeg(command, onClipProgress,
@@ -733,6 +953,14 @@ class ExportService {
   }
 
   static Future<bool> _hasAudioStream(String path) async {
+    final cached = _audioStreamCache[path];
+    if (cached != null) return cached;
+    final result = await _probeHasAudioStream(path);
+    _audioStreamCache[path] = result;
+    return result;
+  }
+
+  static Future<bool> _probeHasAudioStream(String path) async {
     try {
       final session = await FFprobeKit.getMediaInformation(path);
       final info = await session.getMediaInformation();
@@ -1644,21 +1872,21 @@ class ExportService {
           final delayMs = overlay.startTime.inMilliseconds;
           if (baseHasAudio) {
             command = '-y -i "$trimmedOverlay" -i "$currentInput" '
-                '-filter_complex "[0:v]scale=$width:$height:force_original_aspect_ratio=decrease$opacityFilter[opacity];'
+                '-filter_complex "[0:v]setpts=PTS-STARTPTS+$start/TB,scale=$width:$height:force_original_aspect_ratio=decrease$opacityFilter[opacity];'
                 '[1:v][opacity]overlay=$x:$y:enable=\'between(t,$start,$end)\'[out];'
                 '[0:a]volume=$overlayVol,adelay=$delayMs|$delayMs[a_delayed];'
                 '[1:a][a_delayed]amix=inputs=2:duration=first:dropout_transition=0[aout]" '
                 '-map "[out]" -map "[aout]" -c:v $encoder -preset $preset -tune fastdecode -threads 0 -b:v 3M -c:a aac "$tempOutput"';
           } else {
             command = '-y -i "$trimmedOverlay" -i "$currentInput" '
-                '-filter_complex "[0:v]scale=$width:$height:force_original_aspect_ratio=decrease$opacityFilter[opacity];'
+                '-filter_complex "[0:v]setpts=PTS-STARTPTS+$start/TB,scale=$width:$height:force_original_aspect_ratio=decrease$opacityFilter[opacity];'
                 '[1:v][opacity]overlay=$x:$y:enable=\'between(t,$start,$end)\'[out];'
                 '[0:a]volume=$overlayVol,adelay=$delayMs|$delayMs[aout]" '
                 '-map "[out]" -map "[aout]" -c:v $encoder -preset $preset -tune fastdecode -threads 0 -b:v 3M -c:a aac "$tempOutput"';
           }
         } else {
           command = '-y -i "$trimmedOverlay" -i "$currentInput" '
-              '-filter_complex "[0:v]scale=$width:$height:force_original_aspect_ratio=decrease$opacityFilter[opacity];'
+              '-filter_complex "[0:v]setpts=PTS-STARTPTS+$start/TB,scale=$width:$height:force_original_aspect_ratio=decrease$opacityFilter[opacity];'
               '[1:v][opacity]overlay=$x:$y:enable=\'between(t,$start,$end)\'[out]" '
               '-map "[out]" -map 1:a? -c:v $encoder -preset $preset -tune fastdecode -threads 0 -b:v 3M -c:a copy "$tempOutput"';
         }
@@ -1937,6 +2165,709 @@ class ExportService {
     }
   }
 
+  // ══════════════════════════════════════════════════════════════════════════
+  //  Fast, preview-accurate pipeline helpers
+  // ══════════════════════════════════════════════════════════════════════════
+
+  /// Length of the whole timeline in seconds — identical to the preview's
+  /// `VideoEditorProvider.totalDuration` (video clips, audio and text).
+  static double _timelineTotalSeconds(VideoProject project) {
+    var maxMs = 0;
+    for (final c in project.videoClips) {
+      if (c.endTime.inMilliseconds > maxMs) maxMs = c.endTime.inMilliseconds;
+    }
+    for (final a in project.audioOverlays) {
+      if (a.endTime.inMilliseconds > maxMs) maxMs = a.endTime.inMilliseconds;
+    }
+    for (final t in project.textOverlays) {
+      if (t.endTime.inMilliseconds > maxMs) maxMs = t.endTime.inMilliseconds;
+    }
+    return maxMs / 1000.0;
+  }
+
+  static String _secs(double v) => v.toStringAsFixed(6);
+
+  /// Area (inside the output frame) that the preview box maps to at [time].
+  /// The preview draws text, stickers and media overlays relative to a box
+  /// with the current clip's aspect ratio; the exporter fits that clip into
+  /// the output frame, so overlays must be placed inside the same area.
+  static Future<Rect> _clipAreaAt(VideoProject project, Duration time,
+      int targetWidth, int targetHeight) async {
+    final clipAspect = await _getClipAspectRatio(project, time);
+    final baseAspect = targetWidth / targetHeight;
+    final clipW = clipAspect > baseAspect
+        ? targetWidth.toDouble()
+        : targetHeight * clipAspect;
+    final clipH = clipAspect > baseAspect
+        ? targetWidth / clipAspect
+        : targetHeight.toDouble();
+    return Rect.fromLTWH((targetWidth - clipW) / 2, (targetHeight - clipH) / 2,
+        clipW, clipH);
+  }
+
+  /// Draws [paint] on a [designWidth] x [designHeight] canvas scaled to
+  /// [outWidth] x [outHeight], trims fully transparent borders and writes a
+  /// small PNG. Returns null when nothing visible was drawn.
+  ///
+  /// Pre-rendering at the final pixel size (instead of a full-frame PNG that
+  /// FFmpeg decodes and rescales on every frame) is the main export speed-up.
+  static Future<_LayerPng?> _rasterizeLayer({
+    required void Function(Canvas canvas) paint,
+    required double designWidth,
+    required double designHeight,
+    required int outWidth,
+    required int outHeight,
+    required double offsetX,
+    required double offsetY,
+    required String filePath,
+    double opacity = 1.0,
+  }) async {
+    if (outWidth <= 0 || outHeight <= 0) return null;
+    if (designWidth <= 0 || designHeight <= 0) return null;
+    final recorder = ui.PictureRecorder();
+    final canvas = Canvas(recorder);
+    canvas.scale(outWidth / designWidth, outHeight / designHeight);
+    final op = opacity.clamp(0.0, 1.0).toDouble();
+    if (op < 1.0) {
+      canvas.saveLayer(null, Paint()..color = Color.fromRGBO(0, 0, 0, op));
+    }
+    paint(canvas);
+    if (op < 1.0) canvas.restore();
+    final picture = recorder.endRecording();
+    final full = await picture.toImage(outWidth, outHeight);
+    picture.dispose();
+    try {
+      final raw = await full.toByteData(format: ui.ImageByteFormat.rawRgba);
+      if (raw == null) return null;
+      final bytes =
+          raw.buffer.asUint8List(raw.offsetInBytes, raw.lengthInBytes);
+      int minX = outWidth, minY = outHeight, maxX = -1, maxY = -1;
+      for (int y = 0; y < outHeight; y++) {
+        final row = y * outWidth * 4 + 3;
+        int rowMin = -1, rowMax = -1;
+        for (int x = 0; x < outWidth; x++) {
+          if (bytes[row + x * 4] != 0) {
+            rowMin = x;
+            break;
+          }
+        }
+        if (rowMin < 0) continue;
+        for (int x = outWidth - 1; x >= rowMin; x--) {
+          if (bytes[row + x * 4] != 0) {
+            rowMax = x;
+            break;
+          }
+        }
+        if (rowMin < minX) minX = rowMin;
+        if (rowMax > maxX) maxX = rowMax;
+        if (y < minY) minY = y;
+        maxY = y;
+      }
+      if (maxX < 0) return null;
+      final cw = maxX - minX + 1;
+      final ch = maxY - minY + 1;
+      final rec2 = ui.PictureRecorder();
+      Canvas(rec2).drawImageRect(
+        full,
+        Rect.fromLTWH(
+            minX.toDouble(), minY.toDouble(), cw.toDouble(), ch.toDouble()),
+        Rect.fromLTWH(0, 0, cw.toDouble(), ch.toDouble()),
+        Paint()..filterQuality = FilterQuality.none,
+      );
+      final pic2 = rec2.endRecording();
+      final cropped = await pic2.toImage(cw, ch);
+      pic2.dispose();
+      final png = await cropped.toByteData(format: ui.ImageByteFormat.png);
+      cropped.dispose();
+      if (png == null) return null;
+      final file = File(filePath);
+      await file.writeAsBytes(
+          png.buffer.asUint8List(png.offsetInBytes, png.lengthInBytes));
+      return _LayerPng(
+          file, (offsetX + minX).round(), (offsetY + minY).round());
+    } finally {
+      full.dispose();
+    }
+  }
+
+  /// Decodes an image file with Flutter (EXIF orientation applied exactly as
+  /// in the preview's `Image.file`), limiting the decoded size to [maxSide].
+  static Future<ui.Image?> _decodeImageFile(String filePath, int maxSide) async {
+    try {
+      final bytes = await File(filePath).readAsBytes();
+      final buffer = await ui.ImmutableBuffer.fromUint8List(bytes);
+      final codec = await ui.instantiateImageCodecWithSize(
+        buffer,
+        getTargetSize: (int w, int h) {
+          final longest = math.max(w, h);
+          final s = (maxSide > 0 && longest > maxSide) ? maxSide / longest : 1.0;
+          return ui.TargetImageSize(
+            width: math.max(1, (w * s).round()),
+            height: math.max(1, (h * s).round()),
+          );
+        },
+      );
+      final frame = await codec.getNextFrame();
+      codec.dispose();
+      return frame.image;
+    } catch (_) {
+      return null;
+    }
+  }
+
+  static Rect _containRect(double srcW, double srcH, Rect box) {
+    if (srcW <= 0 || srcH <= 0) return box;
+    final s = math.min(box.width / srcW, box.height / srcH);
+    final w = srcW * s;
+    final h = srcH * s;
+    return Rect.fromLTWH(
+        box.left + (box.width - w) / 2, box.top + (box.height - h) / 2, w, h);
+  }
+
+  /// Renders a still-image clip onto a black output-size frame (contain fit,
+  /// like the preview) and writes it as PNG. Returns null on failure.
+  static Future<String?> _prerenderImageClipFrame(String imagePath,
+      int targetWidth, int targetHeight, String outPath) async {
+    final image = await _decodeImageFile(
+        imagePath, math.max(targetWidth, targetHeight));
+    if (image == null) return null;
+    try {
+      final recorder = ui.PictureRecorder();
+      final canvas = Canvas(recorder);
+      final frame = Rect.fromLTWH(
+          0, 0, targetWidth.toDouble(), targetHeight.toDouble());
+      canvas.drawRect(frame, Paint()..color = const Color(0xFF000000));
+      canvas.drawImageRect(
+        image,
+        Rect.fromLTWH(0, 0, image.width.toDouble(), image.height.toDouble()),
+        _containRect(image.width.toDouble(), image.height.toDouble(), frame),
+        Paint()..filterQuality = FilterQuality.high,
+      );
+      final picture = recorder.endRecording();
+      final rendered = await picture.toImage(targetWidth, targetHeight);
+      picture.dispose();
+      final png = await rendered.toByteData(format: ui.ImageByteFormat.png);
+      rendered.dispose();
+      if (png == null) return null;
+      await File(outPath).writeAsBytes(
+          png.buffer.asUint8List(png.offsetInBytes, png.lengthInBytes));
+      return outPath;
+    } catch (_) {
+      return null;
+    } finally {
+      image.dispose();
+    }
+  }
+
+  /// Text layer rendered exactly like the preview's text widget.
+  static Future<_LayerPng?> _renderTextLayer(
+    TextOverlay overlay,
+    Rect clipArea,
+    double designWidth,
+    String filePath,
+  ) async {
+    TextStyle style;
+    try {
+      style = GoogleFonts.getFont(
+        overlay.fontFamily,
+        fontSize: overlay.fontSize.clamp(1.0, 512.0).toDouble(),
+        color: overlay.color,
+        fontWeight: overlay.fontWeight,
+        fontStyle: overlay.flutterFontStyle,
+        shadows: const [
+          Shadow(offset: Offset(1, 1), color: Colors.black54, blurRadius: 2),
+        ],
+      );
+    } catch (_) {
+      style = GoogleFonts.roboto(
+        fontSize: overlay.fontSize.clamp(1.0, 512.0).toDouble(),
+        color: overlay.color,
+        fontWeight: overlay.fontWeight,
+        fontStyle: overlay.flutterFontStyle,
+        shadows: const [
+          Shadow(offset: Offset(1, 1), color: Colors.black54, blurRadius: 2),
+        ],
+      );
+    }
+    try {
+      // Make sure the font is actually loaded before rasterizing.
+      await GoogleFonts.pendingFonts([style]);
+    } catch (_) {}
+
+    const designHeight = 1920.0;
+    // The preview draws the text inside a container with a 3px border and
+    // 4px padding, positioned at (dx, dy) of the preview box, without wrapping.
+    const previewInset = 7.0;
+    final painter = TextPainter(
+      text: TextSpan(text: overlay.text, style: style),
+      textAlign: overlay.flutterTextAlign,
+      textDirection: TextDirection.ltr,
+    )..layout();
+    final origin = Offset(
+      overlay.position.dx * designWidth + previewInset,
+      overlay.position.dy * designHeight + previewInset,
+    );
+    return _rasterizeLayer(
+      paint: (canvas) => painter.paint(canvas, origin),
+      designWidth: designWidth,
+      designHeight: designHeight,
+      outWidth: clipArea.width.round(),
+      outHeight: clipArea.height.round(),
+      offsetX: clipArea.left,
+      offsetY: clipArea.top,
+      filePath: filePath,
+      opacity: overlay.opacity,
+    );
+  }
+
+  /// Sticker layer rendered exactly like the preview's sticker widget
+  /// (600 * scale box centred on the position, rotated, image contain-fit).
+  static Future<_LayerPng?> _renderStickerLayer(
+    StickerModel sticker,
+    Rect clipArea,
+    double designWidth,
+    String filePath,
+  ) async {
+    ui.Image? image;
+    try {
+      final byteData = await rootBundle.load(sticker.assetPath);
+      final codec = await ui.instantiateImageCodec(byteData.buffer
+          .asUint8List(byteData.offsetInBytes, byteData.lengthInBytes));
+      image = (await codec.getNextFrame()).image;
+      codec.dispose();
+    } catch (_) {
+      return null;
+    }
+    final img = image;
+    try {
+      const designHeight = 1920.0;
+      const previewBaseStickerSize = 600.0;
+      final size = previewBaseStickerSize * sticker.scale;
+      final center = Offset(sticker.position.dx * designWidth,
+          sticker.position.dy * designHeight);
+      return await _rasterizeLayer(
+        paint: (canvas) {
+          canvas.save();
+          canvas.translate(center.dx, center.dy);
+          canvas.rotate(sticker.rotation);
+          final box = Rect.fromCenter(
+              center: Offset.zero, width: size, height: size);
+          canvas.drawImageRect(
+            img,
+            Rect.fromLTWH(0, 0, img.width.toDouble(), img.height.toDouble()),
+            _containRect(img.width.toDouble(), img.height.toDouble(), box),
+            Paint()..filterQuality = FilterQuality.high,
+          );
+          canvas.restore();
+        },
+        designWidth: designWidth,
+        designHeight: designHeight,
+        outWidth: clipArea.width.round(),
+        outHeight: clipArea.height.round(),
+        offsetX: clipArea.left,
+        offsetY: clipArea.top,
+        filePath: filePath,
+        opacity: sticker.opacity,
+      );
+    } finally {
+      img.dispose();
+    }
+  }
+
+  /// Image media overlay pre-rendered at its final on-screen size.
+  static Future<_LayerPng?> _renderImageOverlayLayer(
+      String imagePath, Rect box, double opacity, String filePath) async {
+    final w = box.width.round();
+    final h = box.height.round();
+    if (w < 1 || h < 1) return null;
+    final image = await _decodeImageFile(imagePath, math.max(w, h));
+    if (image == null) return null;
+    try {
+      return await _rasterizeLayer(
+        paint: (canvas) {
+          canvas.drawImageRect(
+            image,
+            Rect.fromLTWH(
+                0, 0, image.width.toDouble(), image.height.toDouble()),
+            _containRect(image.width.toDouble(), image.height.toDouble(),
+                Rect.fromLTWH(0, 0, w.toDouble(), h.toDouble())),
+            Paint()..filterQuality = FilterQuality.high,
+          );
+        },
+        designWidth: w.toDouble(),
+        designHeight: h.toDouble(),
+        outWidth: w,
+        outHeight: h,
+        offsetX: box.left,
+        offsetY: box.top,
+        filePath: filePath,
+        opacity: opacity,
+      );
+    } finally {
+      image.dispose();
+    }
+  }
+
+  static List<String> _effectFilterStrings(
+      VideoProject project, double duration) {
+    final out = <String>[];
+    for (final effect in project.videoEffects) {
+      final start = effect.startTime.inMilliseconds / 1000.0;
+      final end = (effect.startTime + effect.duration).inMilliseconds / 1000.0;
+      if (start >= duration) continue;
+      final intensity = effect.intensity.clamp(0.01, 1.0);
+      switch (effect.type) {
+        case VideoEffectType.blur:
+          final radius = (intensity * 15).toStringAsFixed(1);
+          out.add("boxblur=luma_radius=$radius:enable='between(t,$start,$end)'");
+          break;
+        case VideoEffectType.shake:
+          out.add(
+              "colorchannelmixer=rr=1.0:rg=0.1:rb=0.0:gr=0.0:gg=1.0:gb=0.1:br=0.1:bg=0.0:bb=1.0:enable='between(t,$start,$end)*lt(mod(t*15,1.0),0.5)'");
+          break;
+        case VideoEffectType.flash:
+          out.add(
+              "colorchannelmixer=rr=1.5:gg=1.5:bb=1.5:enable='between(t,$start,$end)*lt(mod(t-floor(t-$start),0.3),0.15)'");
+          break;
+        case VideoEffectType.glitch:
+          out.add("noise=alls=15:allf=t+u:enable='between(t,$start,$end)'");
+          break;
+        case VideoEffectType.grayscale:
+          out.add(
+              "colorchannelmixer=rr=0.2126:rg=0.7152:rb=0.0722:gr=0.2126:gg=0.7152:gb=0.0722:br=0.2126:bg=0.7152:bb=0.0722:enable='between(t,$start,$end)'");
+          break;
+        case VideoEffectType.sepia:
+          out.add(
+              "colorchannelmixer=rr=0.393:rg=0.769:rb=0.189:gr=0.349:gg=0.686:gb=0.168:br=0.272:bg=0.534:bb=0.131:enable='between(t,$start,$end)'");
+          break;
+        default:
+          break;
+      }
+    }
+    return out;
+  }
+
+  /// Composites media overlays, text and stickers onto [basePath] in the same
+  /// stacking order as the preview (media overlays, then text, then
+  /// stickers), in as few encoding passes as possible.
+  ///
+  /// Returns [basePath] when there is nothing to draw, or null on failure so
+  /// the caller can fall back to the previous multi-pass implementation.
+  static Future<String?> _composeLayers({
+    required VideoProject project,
+    required String basePath,
+    required Directory workDir,
+    required int targetWidth,
+    required int targetHeight,
+    required double targetFps,
+    required double duration,
+    required String encoder,
+    required String preset,
+    required void Function(double) onProgress,
+  }) async {
+    final effects = _effectFilterStrings(project, duration);
+    final layers = <_ComposeLayer>[];
+
+    // 1. Media overlays (bottom of the overlay stack in the preview)
+    for (int i = 0; i < project.overlayClips.length; i++) {
+      final o = project.overlayClips[i];
+      final filePath = o.videoFile?.path ?? o.imageFile?.path;
+      if (filePath == null) continue;
+      final start = o.startTime.inMilliseconds / 1000.0;
+      final end = o.endTime.inMilliseconds / 1000.0;
+      if (end <= start) continue;
+      final area =
+          await _clipAreaAt(project, o.startTime, targetWidth, targetHeight);
+      final box = Rect.fromLTWH(
+        area.left + o.overlayPosition.dx * area.width,
+        area.top + o.overlayPosition.dy * area.height,
+        math.max(2.0, o.overlaySize.width * area.width),
+        math.max(2.0, o.overlaySize.height * area.height),
+      );
+      final opacity = o.overlayOpacity.clamp(0.0, 1.0).toDouble();
+      if (o.mediaType == MediaType.image) {
+        final png = await _renderImageOverlayLayer(filePath, box, opacity,
+            path.join(workDir.path, 'layer_media_$i.png'));
+        if (png != null) {
+          layers.add(_ComposeLayer.png(png, start, end));
+        } else {
+          layers.add(_ComposeLayer.rawImage(filePath, box, opacity, start, end));
+        }
+      } else {
+        final hasAudio = !o.isMuted &&
+            o.volume > 0 &&
+            await _hasAudioStream(filePath);
+        layers.add(_ComposeLayer.video(
+          filePath,
+          box,
+          opacity,
+          start,
+          end,
+          trimStart: o.trimStart.inMilliseconds / 1000.0,
+          trimDuration: o.trimmedDuration.inMilliseconds / 1000.0,
+          withAudio: hasAudio,
+          volume: o.volume.clamp(0.0, 2.0).toDouble(),
+        ));
+      }
+    }
+
+    // 2. Text overlays
+    for (int i = 0; i < project.textOverlays.length; i++) {
+      final t = project.textOverlays[i];
+      final start = t.startTime.inMilliseconds / 1000.0;
+      final end = t.endTime.inMilliseconds / 1000.0;
+      if (end <= start) continue;
+      final clipAspect = await _getClipAspectRatio(project, t.startTime);
+      final area =
+          await _clipAreaAt(project, t.startTime, targetWidth, targetHeight);
+      final designWidth =
+          (1920.0 * clipAspect).round().clamp(1, 4096).toDouble();
+      final png = await _renderTextLayer(
+          t, area, designWidth, path.join(workDir.path, 'layer_text_$i.png'));
+      if (png != null) layers.add(_ComposeLayer.png(png, start, end));
+    }
+
+    // 3. Stickers (top of the stack in the preview)
+    for (int i = 0; i < project.stickers.length; i++) {
+      final s = project.stickers[i];
+      final start = s.startTime.inMilliseconds / 1000.0;
+      final end = s.endTime.inMilliseconds / 1000.0;
+      if (end <= start) continue;
+      final clipAspect = await _getClipAspectRatio(project, s.startTime);
+      final area =
+          await _clipAreaAt(project, s.startTime, targetWidth, targetHeight);
+      final designWidth =
+          (1920.0 * clipAspect).round().clamp(1, 4096).toDouble();
+      final png = await _renderStickerLayer(s, area, designWidth,
+          path.join(workDir.path, 'layer_sticker_$i.png'));
+      if (png != null) layers.add(_ComposeLayer.png(png, start, end));
+    }
+
+    if (effects.isEmpty && layers.isEmpty) return basePath;
+
+    // Split into passes: at most 3 simultaneously decoded videos per pass
+    // (keeps memory low on phones) and a bounded number of inputs.
+    const maxVideosPerPass = 3;
+    const maxInputsPerPass = 24;
+    final passes = <List<_ComposeLayer>>[];
+    var currentPass = <_ComposeLayer>[];
+    var videosInPass = 0;
+    for (final l in layers) {
+      final isVideo = l.kind == _ComposeLayerKind.video;
+      if (currentPass.isNotEmpty &&
+          ((isVideo && videosInPass >= maxVideosPerPass) ||
+              currentPass.length >= maxInputsPerPass)) {
+        passes.add(currentPass);
+        currentPass = <_ComposeLayer>[];
+        videosInPass = 0;
+      }
+      currentPass.add(l);
+      if (isVideo) videosInPass++;
+    }
+    if (currentPass.isNotEmpty || passes.isEmpty) passes.add(currentPass);
+
+    String current = basePath;
+    for (int p = 0; p < passes.length; p++) {
+      final pass = passes[p];
+      final inputs = StringBuffer('-y -i "$current"');
+      final fc = StringBuffer();
+      final baseFx = (p == 0 && effects.isNotEmpty) ? ',${effects.join(',')}' : '';
+      fc.write('[0:v]setpts=PTS-STARTPTS$baseFx[b0];');
+      var prev = 'b0';
+      final audioLabels = <String>[];
+      for (int j = 0; j < pass.length; j++) {
+        final l = pass[j];
+        final idx = j + 1;
+        final layerDur = math.max(1.0 / targetFps, l.end - l.start);
+        final bw = l.box == null ? 0 : math.max(2, (l.box!.width.round() ~/ 2) * 2);
+        final bh = l.box == null ? 0 : math.max(2, (l.box!.height.round() ~/ 2) * 2);
+        final alpha = l.opacity < 1.0
+            ? ',colorchannelmixer=aa=${l.opacity.toStringAsFixed(4)}'
+            : '';
+        int x;
+        int y;
+        switch (l.kind) {
+          case _ComposeLayerKind.png:
+            inputs.write(
+                ' -loop 1 -framerate $targetFps -t ${_secs(layerDur)} -i "${l.png!.file.path}"');
+            fc.write(
+                '[$idx:v]format=rgba,setpts=PTS-STARTPTS+${_secs(l.start)}/TB[l$idx];');
+            x = l.png!.x;
+            y = l.png!.y;
+            break;
+          case _ComposeLayerKind.rawImage:
+            inputs.write(
+                ' -loop 1 -framerate $targetFps -t ${_secs(layerDur)} -i "${l.path}"');
+            fc.write('[$idx:v]scale=$bw:$bh:force_original_aspect_ratio=decrease,'
+                'format=rgba$alpha,pad=$bw:$bh:(ow-iw)/2:(oh-ih)/2:color=black@0,'
+                'setpts=PTS-STARTPTS+${_secs(l.start)}/TB[l$idx];');
+            x = l.box!.left.round();
+            y = l.box!.top.round();
+            break;
+          case _ComposeLayerKind.video:
+            inputs.write(
+                ' -ss ${_secs(l.trimStart)} -t ${_secs(l.trimDuration)} -i "${l.path}"');
+            fc.write('[$idx:v]setpts=PTS-STARTPTS+${_secs(l.start)}/TB,'
+                'scale=$bw:$bh:force_original_aspect_ratio=decrease,'
+                'format=rgba$alpha,pad=$bw:$bh:(ow-iw)/2:(oh-ih)/2:color=black@0[l$idx];');
+            x = l.box!.left.round();
+            y = l.box!.top.round();
+            if (l.withAudio) {
+              final delayMs = (l.start * 1000).round();
+              fc.write('[$idx:a]asetpts=PTS-STARTPTS,volume=${l.volume},'
+                  'adelay=$delayMs|$delayMs[a$idx];');
+              audioLabels.add('[a$idx]');
+            }
+            break;
+        }
+        final outLabel = 'v$idx';
+        fc.write('[$prev][l$idx]overlay=$x:$y:'
+            "enable='between(t,${_secs(l.start)},${_secs(l.end)})':"
+            'eof_action=pass[$outLabel];');
+        prev = outLabel;
+      }
+      String audioArgs;
+      if (audioLabels.isNotEmpty) {
+        fc.write('[0:a]${audioLabels.join()}amix=inputs=${audioLabels.length + 1}:'
+            'duration=first:dropout_transition=0:normalize=0[aout];');
+        audioArgs = '-map "[aout]" -c:a aac -ar 44100 -ac 2';
+      } else {
+        audioArgs = '-map 0:a? -c:a copy';
+      }
+      var fcStr = fc.toString();
+      if (fcStr.endsWith(';')) fcStr = fcStr.substring(0, fcStr.length - 1);
+
+      final out = path.join(workDir.path, 'composed_$p.mp4');
+      final command = '$inputs -filter_complex "$fcStr" -map "[$prev]" $audioArgs '
+          '-c:v $encoder -preset $preset -tune fastdecode -threads 0 -crf 23 '
+          '-r $targetFps -pix_fmt yuv420p -t ${_secs(duration)} "$out"';
+      final result = await _executeFFmpeg(command, (v) {
+        onProgress((p + v) / passes.length);
+      }, outputPath: out, duration: duration);
+      if (result == null) return null;
+      if (current != basePath) {
+        try {
+          await File(current).delete();
+        } catch (_) {}
+      }
+      current = result;
+    }
+    return current;
+  }
+
+  /// Encodes [seconds] of black video with silent audio in the same format
+  /// as processed clips so it can be stream-copied into the timeline.
+  static Future<String?> _encodeBlackSegment(double seconds, int w, int h,
+      double fps, String preset, String outPath) {
+    final cmd = '-y -f lavfi -i color=c=black:s=${w}x$h:r=$fps '
+        '-f lavfi -i anullsrc=channel_layout=stereo:sample_rate=44100 '
+        '-t ${_secs(seconds)} -vf "setsar=1,format=yuv420p" '
+        '-c:v $_softwareEncoder -preset $preset -tune fastdecode -threads 0 -crf 23 '
+        '-c:a aac -ar 44100 -ac 2 "$outPath"';
+    return _executeFFmpeg(cmd, null, outputPath: outPath);
+  }
+
+  /// Builds the base timeline exactly as the preview plays it:
+  /// clips at their timeline positions, black where the timeline has gaps
+  /// (including before the first clip and after the last one, up to the end
+  /// of audio/text), and transitions that blend the outgoing clip's last
+  /// frame into the incoming clip. Only the short transition windows and gaps
+  /// are encoded; everything else is stream-copied, so the cost no longer
+  /// grows with the square of the number of clips.
+  static Future<String?> _stitchTimeline({
+    required VideoProject project,
+    required List<int> order,
+    required List<String> processed,
+    required Map<int, _TransitionPlan> incoming,
+    required Directory workDir,
+    required int targetWidth,
+    required int targetHeight,
+    required double targetFps,
+    required double timelineTotal,
+    required String encoder,
+    required String preset,
+    required void Function(double) onProgress,
+  }) async {
+    final frame = 1.0 / targetFps;
+    final entries = <String>[];
+    var cursor = 0.0;
+    var generated = 0;
+    final steps = math.max(1, order.length + 1);
+
+    for (int k = 0; k < order.length; k++) {
+      final clipIndex = order[k];
+      final clip = project.videoClips[clipIndex];
+      final start = clip.startTime.inMilliseconds / 1000.0;
+      final len = (clip.endTime - clip.startTime).inMilliseconds / 1000.0;
+
+      final gap = start - cursor;
+      if (gap >= frame) {
+        final gapPath = path.join(workDir.path, 'gap_${generated++}.mp4');
+        final g = await _encodeBlackSegment(
+            gap, targetWidth, targetHeight, targetFps, preset, gapPath);
+        if (g == null) return null;
+        entries.add("file '$g'");
+        cursor += gap;
+      }
+
+      final plan = incoming[clipIndex];
+      if (plan != null) {
+        final lastFrame = path.join(workDir.path, 'last_$clipIndex.png');
+        final lf = await _executeFFmpeg(
+            '-y -sseof -1 -i "${processed[plan.fromIndex]}" -an -update 1 "$lastFrame"',
+            null,
+            outputPath: lastFrame);
+        if (lf == null) return null;
+        final tPath = path.join(workDir.path, 'transition_$clipIndex.mp4');
+        final sd = _secs(plan.seconds);
+        final xfadeName = _mapToFfmpegXfade(plan.type);
+        final cmd = '-y -loop 1 -framerate $targetFps -t $sd -i "$lastFrame" '
+            '-t $sd -i "${processed[clipIndex]}" '
+            '-filter_complex "'
+            '[0:v]scale=$targetWidth:$targetHeight,setsar=1,format=yuv420p,settb=AVTB,setpts=PTS-STARTPTS,fps=$targetFps[ta];'
+            '[1:v]setsar=1,format=yuv420p,settb=AVTB,setpts=PTS-STARTPTS,fps=$targetFps[tb];'
+            '[ta][tb]xfade=transition=$xfadeName:duration=$sd:offset=0,format=yuv420p[tv];'
+            '[1:a]asetpts=PTS-STARTPTS[tau]" '
+            '-map "[tv]" -map "[tau]" -c:v $encoder -preset $preset -tune fastdecode '
+            '-threads 0 -crf 23 -c:a aac -ar 44100 -ac 2 -t $sd "$tPath"';
+        final t = await _executeFFmpeg(cmd, null, outputPath: tPath);
+        if (t == null) return null;
+        entries.add("file '$t'");
+        entries.add("file '${processed[clipIndex]}'");
+        entries.add('inpoint $sd');
+      } else {
+        entries.add("file '${processed[clipIndex]}'");
+      }
+      cursor += len;
+      onProgress((k + 1) / steps);
+    }
+
+    final tail = timelineTotal - cursor;
+    if (tail >= frame) {
+      final tailPath = path.join(workDir.path, 'gap_${generated++}.mp4');
+      final g = await _encodeBlackSegment(
+          tail, targetWidth, targetHeight, targetFps, preset, tailPath);
+      if (g == null) return null;
+      entries.add("file '$g'");
+    }
+
+    final fileEntries = entries.where((e) => e.startsWith('file ')).length;
+    if (fileEntries == 1 && !entries.any((e) => e.startsWith('inpoint'))) {
+      // Single segment: already in final form, no need to copy it.
+      onProgress(1.0);
+      return entries.first.substring(6, entries.first.length - 1);
+    }
+
+    final listFile = File(path.join(workDir.path, 'timeline_segments.txt'));
+    await listFile.writeAsString(entries.join('\n'));
+    final outputPath = path.join(workDir.path, 'timeline_base.mp4');
+    return _executeFFmpeg(
+        '-y -f concat -safe 0 -i "${listFile.path}" -c copy "$outputPath"',
+        onProgress,
+        outputPath: outputPath,
+        duration: timelineTotal);
+  }
+
   static Future<String?> _finalizeWithAudio(
     String inputPath,
     VideoProject project,
@@ -1977,7 +2908,10 @@ class ExportService {
       inputs.add('-ss $sourceStart -t $overlayDuration -i "${overlay.audioFile.path}"');
       
       final delayMs = overlay.startTime.inMilliseconds;
-      String filter = '[$audioInputIdx:a]volume=${overlay.volume}';
+      // Same level as the preview: overlay volume x audio master volume.
+      final overlayVolume =
+          (overlay.volume * audioMasterVolume).clamp(0.0, 1.0);
+      String filter = '[$audioInputIdx:a]volume=$overlayVolume';
       if (delayMs > 0) {
         filter += ',adelay=$delayMs|$delayMs';
       }
@@ -1987,7 +2921,9 @@ class ExportService {
     }
 
     final inputsConcat = mixInputs.join('');
-    fc.write('${inputsConcat}amix=inputs=${mixInputs.length}:duration=first:dropout_transition=0[aout]');
+    // normalize=0: keep each track at its own level (as heard in the preview)
+    // instead of dividing every track by the number of inputs.
+    fc.write('${inputsConcat}amix=inputs=${mixInputs.length}:duration=first:dropout_transition=0:normalize=0[aout]');
 
     final command = '-y ${inputs.join(' ')} -filter_complex "$fc" -map 0:v -map "[aout]" -c:v copy -c:a aac "$outputPath"';
     return await _executeFFmpeg(command, onProgress, outputPath: outputPath, duration: duration);
@@ -1997,6 +2933,7 @@ class ExportService {
   static Future<String?> _executeFFmpeg(
       String command, Function(double)? onProgress,
       {double? duration, String? outputPath}) async {
+    if (_cancelled) return null;
 
     try {
       final completer = Completer<String?>();
@@ -2039,6 +2976,7 @@ class ExportService {
   }
 
   static Future<bool> cancelExport() async {
+    _cancelled = true;
     try {
       if (_currentSession != null) {
         await _currentSession.cancel();

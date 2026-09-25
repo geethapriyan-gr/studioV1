@@ -1835,7 +1835,7 @@ class _VideoEditorScreenState extends State<VideoEditorScreen>
             constraints: const BoxConstraints(minWidth: 36, minHeight: 36),
           ),
           Text(
-            _formatDuration(provider.currentPosition),
+            '${_formatDuration(provider.currentPosition)} / ${_formatDuration(provider.totalDuration)}',
             style: const TextStyle(
               color: AppColors.textSecondary,
               fontSize: 11,
@@ -2749,11 +2749,12 @@ class _VideoEditorScreenState extends State<VideoEditorScreen>
   }
 
   int _transitionStaticFrameTimeMs(VideoClip clip, {required bool lastFrame}) {
+    // Same source window the exporter uses (trimStart..trimEnd).
     final position = lastFrame
-        ? (clip.sourceEnd > clip.sourceStart
-            ? clip.sourceEnd - const Duration(milliseconds: 1)
-            : clip.sourceStart)
-        : clip.sourceStart;
+        ? (clip.trimEnd > clip.trimStart
+            ? clip.trimEnd - const Duration(milliseconds: 1)
+            : clip.trimStart)
+        : clip.trimStart;
     return position.inMilliseconds < 0 ? 0 : position.inMilliseconds;
   }
 
@@ -2843,11 +2844,16 @@ class _VideoEditorScreenState extends State<VideoEditorScreen>
     // Use per-clip filter if available, otherwise fall back to project-wide filter
     final currentClipForFilter = provider.currentVideoClip;
     final ColorFilter colorFilter;
-    if (currentClipForFilter != null &&
-        provider.clipColorFilters.containsKey(currentClipForFilter.id)) {
-      colorFilter = provider.clipColorFilters[currentClipForFilter.id]!;
+    final clipFilter = currentClipForFilter != null
+        ? provider.clipColorFilters[currentClipForFilter.id]
+        : null;
+    if (clipFilter != null && clipFilter.hasFilters) {
+      colorFilter = clipFilter;
     } else {
-      colorFilter = const ColorFilter();
+      // Same fallback as the exporter: project-wide filter when the clip has
+      // no filter of its own.
+      colorFilter =
+          provider.currentProject?.colorFilter ?? const ColorFilter();
     }
     final selectedClipId = provider.selectedVideoClipId;
     final currentClip = provider.currentVideoClip;
@@ -2959,9 +2965,20 @@ class _VideoEditorScreenState extends State<VideoEditorScreen>
     }
 
     if (rotation != 0.0) {
-      mediaWidget = Transform.rotate(
-        angle: rotation * (3.14159 / 180),
-        child: mediaWidget,
+      final rotatedChild = mediaWidget;
+      // The exporter rotates the frame and then fits the rotated frame inside
+      // the output canvas, so scale the preview the same way.
+      mediaWidget = LayoutBuilder(
+        builder: (context, constraints) {
+          return Transform.rotate(
+            angle: rotation * (3.14159 / 180),
+            child: Transform.scale(
+              scale: _rotationFitScale(
+                  rotation, constraints.maxWidth, constraints.maxHeight),
+              child: rotatedChild,
+            ),
+          );
+        },
       );
     }
 
@@ -3060,6 +3077,7 @@ class _VideoEditorScreenState extends State<VideoEditorScreen>
 
     VideoClip? clipForCrop;
     if (!isPreviewMode &&
+        provider.showCropEditor &&
         provider.selectedVideoClipId != null &&
         provider.currentProject != null) {
       try {
@@ -3118,20 +3136,29 @@ class _VideoEditorScreenState extends State<VideoEditorScreen>
               crop.right * constraints.maxWidth,
               crop.bottom * constraints.maxHeight,
             );
+            if (originalRect.width <= 0 || originalRect.height <= 0) {
+              return filteredMedia;
+            }
             final center =
                 Offset(constraints.maxWidth / 2, constraints.maxHeight / 2);
-            final centeredRect = Rect.fromCenter(
-              center: center,
-              width: originalRect.width,
-              height: originalRect.height,
+            // The exporter crops this region and scales it to fit the output
+            // frame, so enlarge it the same way here.
+            final fitScale = math.min(
+              constraints.maxWidth / originalRect.width,
+              constraints.maxHeight / originalRect.height,
             );
-            final translate = center - originalRect.center;
             return SizedBox.expand(
-              child: ClipPath(
-                clipper: _RectClipper(centeredRect),
-                child: Transform.translate(
-                  offset: translate,
-                  child: SizedBox.expand(child: filteredMedia),
+              child: ClipRect(
+                child: Transform(
+                  transform: Matrix4.identity()
+                    ..translate(center.dx, center.dy)
+                    ..scale(fitScale, fitScale)
+                    ..translate(
+                        -originalRect.center.dx, -originalRect.center.dy),
+                  child: ClipPath(
+                    clipper: _RectClipper(originalRect),
+                    child: SizedBox.expand(child: filteredMedia),
+                  ),
                 ),
               ),
             );
@@ -3140,6 +3167,19 @@ class _VideoEditorScreenState extends State<VideoEditorScreen>
       }
       return filteredMedia;
     }
+  }
+
+  /// Scale applied after rotating the preview so the rotated frame fits the
+  /// preview box exactly like the exporter fits it into the output canvas
+  /// (transpose for 90/270, rotate onto a hypot x hypot canvas otherwise).
+  static double _rotationFitScale(double rotation, double w, double h) {
+    if (w <= 0 || h <= 0 || !w.isFinite || !h.isFinite) return 1.0;
+    final rot = rotation % 360;
+    if (rot.abs() < 0.1 || (rot - 180).abs() < 0.1) return 1.0;
+    if ((rot - 90).abs() < 0.1 || (rot - 270).abs() < 0.1) {
+      return math.min(w / h, h / w);
+    }
+    return math.min(w, h) / math.sqrt(w * w + h * h);
   }
 
   List<double> _calculateColorMatrix(ColorFilter filter) {
