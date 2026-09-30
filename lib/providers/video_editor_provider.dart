@@ -49,7 +49,26 @@ class VideoEditorProvider extends ChangeNotifier {
   DateTime _lastTransitionSeek = DateTime.fromMillisecondsSinceEpoch(0);
   bool _transitionOpInFlight = false;
   final Set<String> _transitionPrewarmInFlight = {};
-  final Set<String> _transitionPrewarmedControllerKeys = {};
+
+  // ── Pre-rendered transition previews ────────────────────────────────────
+  // Each transition is rendered once with FFmpeg (the exporter's own filters)
+  // into a short clip. The preview plays that clip during the transition
+  // window instead of compositing it live, so it looks exactly like the
+  // export and never has to decode two full-resolution files at once.
+  final Map<String, String> _transitionRenderFiles = {}; // signature -> file
+  final Set<String> _failedTransitionRenders = {};
+  final List<String> _transitionRenderQueue = []; // transition ids
+  String? _transitionRenderingSignature;
+  double _transitionRenderProgress = 0.0;
+  DateTime _lastRenderProgressNotify = DateTime.fromMillisecondsSinceEpoch(0);
+  Timer? _transitionRenderDebounce;
+  int _transitionRenderGeneration = 0;
+
+  VideoPlayerController? _transitionClipController;
+  String? _transitionClipPath;
+  Future<void>? _transitionClipLoad;
+  String? _renderedTransitionShownId;
+  bool _renderedTransitionEnterInFlight = false;
 
   bool _audioSyncInProgress = false;
   DateTime _lastAudioSync = DateTime.fromMillisecondsSinceEpoch(0);
@@ -72,6 +91,12 @@ class VideoEditorProvider extends ChangeNotifier {
   static const int _maxPlaybackSyncAttempts = 4;
   static const Duration _playbackSyncRetryDelay = Duration(milliseconds: 120);
   static const Duration _videoDriftTolerance = Duration(milliseconds: 350);
+
+  /// How early the incoming clip's controller of a transition is initialized
+  /// and parked on its first frame. High-resolution files need well over a
+  /// second to open a decoder, so this has to lead the transition generously.
+  static const Duration _transitionControllerPrewarmLead =
+      Duration(milliseconds: 3000);
 
   final List<VideoProject> _undoStack = [];
   final List<VideoProject> _redoStack = [];
@@ -237,6 +262,59 @@ class VideoEditorProvider extends ChangeNotifier {
   VideoEditorController? get videoController => _videoController;
   VideoPlayerController? get previewController => _previewController;
   String? get activeFilePath => _activeFilePath;
+
+  /// Id of the clip the active preview controller has been synced to.
+  String? get activePreviewClipId => _activePreviewClipId;
+
+  /// True while transition previews are being rendered in the background.
+  bool get isRenderingTransitions =>
+      _transitionRenderingSignature != null || _transitionRenderQueue.isNotEmpty;
+
+  /// Progress (0..1) of the transition currently being rendered.
+  double get transitionRenderProgress => _transitionRenderProgress;
+
+  /// Transitions still waiting to be rendered, including the current one.
+  int get transitionRendersPending =>
+      _transitionRenderQueue.length +
+      (_transitionRenderingSignature != null ? 1 : 0);
+
+  /// True when [transitionId] has an up-to-date pre-rendered clip.
+  bool hasRenderedTransition(String transitionId) {
+    for (final t in _currentProject?.transitions ?? const <Transition>[]) {
+      if (t.id == transitionId) return _renderedFileFor(t) != null;
+    }
+    return false;
+  }
+
+  /// The player showing the pre-rendered clip of [transitionId], when that
+  /// clip is what the preview should display right now.
+  VideoPlayerController? renderedTransitionControllerFor(String transitionId) {
+    final controller = _transitionClipController;
+    if (_renderedTransitionShownId != transitionId ||
+        controller == null ||
+        !controller.value.isInitialized) {
+      return null;
+    }
+    return controller;
+  }
+
+  /// Timeline position extrapolated from the playback clock right now.
+  /// [currentPosition] only advances on the ~33 ms timeline timer; this is
+  /// smooth enough to drive per-frame animations such as transition previews.
+  Duration get smoothPosition {
+    final start = _playbackStartTime;
+    final startPosition = _playbackStartPosition;
+    if (!_isPlaying ||
+        _timelineTimer == null ||
+        start == null ||
+        startPosition == null) {
+      return _currentPosition;
+    }
+    final position = startPosition + DateTime.now().difference(start);
+    if (position < _currentPosition) return _currentPosition;
+    final max = totalDuration;
+    return position > max ? max : position;
+  }
 
   /// While the user drags the timeline during playback, playback is
   /// suspended internally but still reported as "playing" so the UI does not
@@ -592,14 +670,23 @@ class VideoEditorProvider extends ChangeNotifier {
   Future<VideoPlayerController?> ensurePreviewController(
       String filePath) async {
     if (!_previewControllers.containsKey(filePath)) {
+      // Evict before registering the new controller: once it is in the map
+      // the LRU treats it as known and nothing is ever released, which leaves
+      // one hardware decoder per clip alive (fatal with 4K footage).
+      await _manageControllerMemory(filePath);
       final controller = VideoPlayerController.file(
         File(filePath),
         videoPlayerOptions: VideoPlayerOptions(mixWithOthers: true),
       );
       await controller.initialize();
       await controller.setVolume(0.0);
+      final existing = _previewControllers[filePath];
+      if (existing != null) {
+        // Another caller created it while we were initializing.
+        await controller.dispose();
+        return existing;
+      }
       _previewControllers[filePath] = controller;
-      unawaited(_manageControllerMemory(filePath));
     }
     return _previewControllers[filePath];
   }
@@ -608,6 +695,7 @@ class VideoEditorProvider extends ChangeNotifier {
     final controllers = <VideoPlayerController>{
       if (_previewController != null) _previewController!,
       ..._previewControllers.values,
+      if (_transitionClipController != null) _transitionClipController!,
     };
 
     for (final controller in controllers) {
@@ -1230,6 +1318,8 @@ class VideoEditorProvider extends ChangeNotifier {
   }
 
   void _scheduleAutoSave() {
+    // Every edit goes through here: re-render transitions it may affect.
+    _scheduleTransitionRenders();
     _autoSaveTimer?.cancel();
     _autoSaveTimer = Timer(const Duration(milliseconds: 800), () async {
       await _autoSaveProject();
@@ -1579,7 +1669,9 @@ class VideoEditorProvider extends ChangeNotifier {
 
       var canStartTimeline = true;
 
-      final clip = _clipAtTimeline(_currentPosition);
+      final clip = _renderedTransitionAt(_currentPosition) != null
+          ? null // the rendered transition clip takes over on the first tick
+          : _clipAtTimeline(_currentPosition);
       if (clip != null) {
         if (clip.mediaType == MediaType.video && clip.videoFile != null) {
           final synced = await _syncVideoForRequestedPlayback(
@@ -1834,9 +1926,15 @@ class VideoEditorProvider extends ChangeNotifier {
     Duration position,
     Transition transition,
     VideoClip clip1,
-    VideoClip clip2,
-  ) {
-    final start = transitionPreviewPrewarmStart(transition, clip1, clip2);
+    VideoClip clip2, {
+    Duration minimumLead = const Duration(milliseconds: 800),
+  }) {
+    final start = transitionPreviewPrewarmStart(
+      transition,
+      clip1,
+      clip2,
+      minimumLead: minimumLead,
+    );
     final end = transitionPreviewVisualEnd(transition, clip2);
     return position >= start && position < end;
   }
@@ -2228,6 +2326,42 @@ class VideoEditorProvider extends ChangeNotifier {
     required int attempt,
   }) async {
     if (serial != _seekSyncSerial) return;
+
+    // Inside a rendered transition the preview shows the rendered clip.
+    final renderedTransition = _renderedTransitionAt(_currentPosition);
+    if (renderedTransition != null) {
+      if (_isPlaying) {
+        // The first timeline tick enters the rendered clip at this offset.
+        if (_renderedTransitionShownId != renderedTransition.id) {
+          _renderedTransitionShownId = null;
+        }
+        _activePreviewClipId = null;
+        final rendered = _transitionClipController;
+        if (rendered != null && rendered.value.isInitialized) {
+          await rendered.pause();
+        }
+        if (serial != _seekSyncSerial) return;
+        if (resumeWhenSynced) _startTimelineClock();
+      } else {
+        await _previewController?.pause();
+        await _previewController?.setVolume(0.0);
+        final shown =
+            await _showRenderedTransitionStill(renderedTransition, serial);
+        if (serial != _seekSyncSerial) return;
+        if (!shown) _renderedTransitionShownId = null;
+      }
+      unawaited(_syncAudioPlayback(force: true));
+      notifyListeners();
+      return;
+    }
+    if (_renderedTransitionShownId != null) {
+      _renderedTransitionShownId = null;
+      final rendered = _transitionClipController;
+      if (rendered != null && rendered.value.isInitialized) {
+        unawaited(rendered.pause());
+        unawaited(rendered.setVolume(0.0));
+      }
+    }
 
     final clip = _clipAtTimeline(_currentPosition);
     var needsVideoSync = false;
@@ -3834,7 +3968,6 @@ class VideoEditorProvider extends ChangeNotifier {
     if (_currentProject == null) return;
     recordUndo();
     _currentProject = _currentProject!.addTransition(transition);
-    _transitionPrewarmedControllerKeys.clear();
     _scheduleAutoSave();
     notifyListeners();
   }
@@ -3843,7 +3976,6 @@ class VideoEditorProvider extends ChangeNotifier {
     if (_currentProject == null) return;
     recordUndo();
     _currentProject = _currentProject!.updateTransition(transitionId, updated);
-    _transitionPrewarmedControllerKeys.clear();
     _scheduleAutoSave();
     notifyListeners();
   }
@@ -3852,7 +3984,6 @@ class VideoEditorProvider extends ChangeNotifier {
     if (_currentProject == null) return;
     recordUndo();
     _currentProject = _currentProject!.removeTransition(transitionId);
-    _transitionPrewarmedControllerKeys.clear();
     _scheduleAutoSave();
     notifyListeners();
   }
@@ -3914,7 +4045,6 @@ class VideoEditorProvider extends ChangeNotifier {
     _playbackRecoverySerial++;
     _playbackRecoveryInFlight = false;
     _transitionPrewarmInFlight.clear();
-    _transitionPrewarmedControllerKeys.clear();
     _currentPosition = Duration.zero;
     _selectedTextOverlayId = null;
     _selectedAudioOverlayId = null;
@@ -3925,6 +4055,7 @@ class VideoEditorProvider extends ChangeNotifier {
 
   Future<void> _disposeControllers() async {
     _stopTimelineClock();
+    _clearTransitionRenders();
     _seekPauseTimer?.cancel();
     _deferredSeekSyncTimer?.cancel();
     _previewController?.removeListener(_videoPositionListener);
@@ -4006,8 +4137,28 @@ class VideoEditorProvider extends ChangeNotifier {
     // If we're inside a transition window, drive preview using clip2
     // to avoid running two decoders simultaneously (reduces lag).
     final activeTransition = _getActiveTransitionAt(_currentPosition);
+    if (_renderedTransitionShownId != null &&
+        _renderedTransitionShownId != activeTransition?.id) {
+      _finishRenderedTransition();
+    }
     if (activeTransition != null) {
+      if (_isPlaying && _playRenderedTransition(activeTransition)) {
+        // The pre-rendered clip (with its own audio) is on screen.
+        unawaited(_syncAudioPlayback());
+        return;
+      }
       final clip2 = _clipById(activeTransition.clipId2);
+      if (_isPlaying &&
+          clip2 != null &&
+          _activeTransitionId != activeTransition.id &&
+          _handOverToPrewarmedController(clip2)) {
+        // Seamless switch: the incoming clip's decoder was parked on its first
+        // frame ahead of time, so just start it and keep the clock running.
+        _activeTransitionId = activeTransition.id;
+        unawaited(_applyPreviewVolumeForCurrentPosition());
+        unawaited(_syncAudioPlayback());
+        return;
+      }
       if (_isPlaying &&
           clip2 != null &&
           clip2.mediaType == MediaType.video &&
@@ -4217,9 +4368,24 @@ class VideoEditorProvider extends ChangeNotifier {
       final clip1 = _clipById(transition.clipId1);
       final clip2 = _clipById(transition.clipId2);
       if (clip1 == null || clip2 == null) continue;
-      if (!isTransitionPreviewPrewarmAt(now, transition, clip1, clip2)) {
+      if (!isTransitionPreviewPrewarmAt(
+        now,
+        transition,
+        clip1,
+        clip2,
+        minimumLead: _transitionControllerPrewarmLead,
+      )) {
         continue;
       }
+
+      // With a rendered clip the incoming decoder is only needed once the
+      // transition is over, so park it at the end of the window instead.
+      final renderedFile = _renderedFileFor(transition);
+      if (renderedFile != null &&
+          _renderedTransitionShownId != transition.id) {
+        unawaited(_prewarmRenderedTransitionClip(renderedFile));
+      }
+
       if (clip2.mediaType != MediaType.video || clip2.videoFile == null) {
         continue;
       }
@@ -4232,43 +4398,652 @@ class VideoEditorProvider extends ChangeNotifier {
         continue;
       }
 
-      final key =
-          '${transition.id}|$clip2Path|${clip2.trimStart.inMilliseconds}';
-      if (_transitionPrewarmedControllerKeys.contains(key) ||
-          _transitionPrewarmInFlight.contains(key)) {
+      final target = renderedFile != null
+          ? _renderedHandoverSourcePosition(transition, clip2)
+          : clip2.trimStart;
+      final key = '${transition.id}|$clip2Path|${target.inMilliseconds}';
+      if (_transitionPrewarmInFlight.contains(key) ||
+          _isControllerParkedAt(clip2Path, target)) {
         continue;
       }
 
       _transitionPrewarmInFlight.add(key);
-      unawaited(_prewarmTransitionController(clip2, clip2Path, key));
+      unawaited(_prewarmTransitionController(clip2, clip2Path, key, target));
     }
+  }
+
+  /// Makes the prewarmed controller of [clip] the active one and starts it
+  /// without pausing the timeline clock, the way NLEs cut into a clip whose
+  /// decoder is already primed. Returns false (and changes nothing) when the
+  /// controller is not parked on the clip's first frame; the caller then
+  /// falls back to the regular hold-and-sync path.
+  bool _handOverToPrewarmedController(VideoClip clip) {
+    if (clip.mediaType != MediaType.video || clip.videoFile == null) {
+      return false;
+    }
+    if (_previewSyncInFlight || _playbackRecoveryInFlight) return false;
+    final videoPath = _resolvePlaybackPath(clip);
+    if (videoPath == null || videoPath == _activeFilePath) return false;
+    if (!_isControllerParkedAt(videoPath, clip.trimStart)) return false;
+
+    final controller = _previewControllers[videoPath]!;
+    final expected = calculateSourcePositionForTimeline(clip, _currentPosition);
+    final lead = expected - controller.value.position;
+    if (lead < -const Duration(milliseconds: 40) ||
+        lead > const Duration(milliseconds: 250)) {
+      return false;
+    }
+
+    final old = _previewController;
+    old?.removeListener(_videoPositionListener);
+    if (old != null && old.value.isInitialized) {
+      unawaited(old.pause());
+      unawaited(old.setVolume(0.0));
+    }
+    _previewController = controller;
+    _activeFilePath = videoPath;
+    _activePreviewClipId = clip.id;
+    controller.addListener(_videoPositionListener);
+    _lruAccessList
+      ..remove(videoPath)
+      ..add(videoPath);
+
+    // The timer tick that crossed the cut is up to one tick past the clip
+    // start; pull the playhead back onto the frame the decoder is showing so
+    // video and timeline start in lock-step (a sub-frame, invisible rewind).
+    if (lead > Duration.zero) {
+      final aligned = clip.startTime +
+          timelineLengthForSource(
+            controller.value.position - clip.trimStart,
+            clip.playbackSpeed,
+          );
+      if (aligned >= clip.startTime && aligned < _currentPosition) {
+        _currentPosition = aligned;
+        _updateTimelineClock();
+      }
+    }
+
+    if ((controller.value.playbackSpeed - clip.playbackSpeed).abs() > 0.001) {
+      unawaited(controller.setPlaybackSpeed(clip.playbackSpeed));
+    }
+    unawaited(controller.play());
+    return true;
+  }
+
+  /// True when the controller for [videoPath] is initialized, paused and
+  /// sitting on [sourceTarget], ready to be started.
+  bool _isControllerParkedAt(String videoPath, Duration sourceTarget) {
+    final controller = _previewControllers[videoPath];
+    if (controller == null) return false;
+    final value = controller.value;
+    if (!value.isInitialized || value.hasError || value.isPlaying) {
+      return false;
+    }
+    final target = clampSourcePositionForVideo(sourceTarget, value.duration);
+    return (value.position - target).abs() <= const Duration(milliseconds: 40);
   }
 
   Future<void> _prewarmTransitionController(
     VideoClip clip,
     String videoPath,
     String key,
+    Duration sourceTarget,
   ) async {
     try {
       final controller = await ensurePreviewController(videoPath);
       if (controller == null || !controller.value.isInitialized) return;
+      // It may have become the active controller while initializing.
+      if (identical(controller, _previewController)) return;
 
       await controller.setVolume(0.0);
+      if (controller.value.isPlaying) await controller.pause();
       final target = clampSourcePositionForVideo(
-        clip.trimStart,
+        sourceTarget,
         controller.value.duration,
       );
       if ((controller.value.position - target).abs() >
           const Duration(milliseconds: 40)) {
+        // A paused seek decodes and renders the frame into the texture, so
+        // the hand-over shows it instantly.
         await controller.seekTo(target);
       }
-      await controller.pause();
-      _transitionPrewarmedControllerKeys.add(key);
+      if ((controller.value.playbackSpeed - clip.playbackSpeed).abs() >
+          0.001) {
+        await controller.setPlaybackSpeed(clip.playbackSpeed);
+      }
     } catch (_) {
       // Prewarming is best effort; active playback sync still handles misses.
     } finally {
       _transitionPrewarmInFlight.remove(key);
     }
+  }
+
+  // ── Pre-rendered transitions: rendering ─────────────────────────────────
+
+  /// Everything that changes how a transition renders. A new signature means
+  /// the rendered clip is stale and gets rendered again.
+  String? _transitionRenderSignature(Transition t) {
+    final project = _currentProject;
+    if (project == null) return null;
+    final clip1 = _clipById(t.clipId1);
+    final clip2 = _clipById(t.clipId2);
+    if (clip1 == null || clip2 == null) return null;
+
+    String clipSignature(VideoClip c) {
+      final own = _clipColorFilters[c.id];
+      final filter =
+          (own != null && own.hasFilters) ? own : project.colorFilter;
+      return [
+        c.mediaType.name,
+        _resolvePlaybackPath(c) ?? c.imageFile?.path,
+        c.trimStart.inMilliseconds,
+        c.trimEnd.inMilliseconds,
+        (c.endTime - c.startTime).inMilliseconds,
+        c.playbackSpeed,
+        c.rotation,
+        c.isMirrored,
+        c.cropRect,
+        c.volume,
+        c.isMuted,
+        c.chromaKeySettings?.toJson(),
+        filter.toJson(),
+      ].join('|');
+    }
+
+    return [
+      t.type.name,
+      t.duration.inMilliseconds,
+      project.outputFrameRate,
+      project.outputResolution,
+      clipSignature(clip1),
+      clipSignature(clip2),
+    ].join('#');
+  }
+
+  /// Rendered clip of [t], if it is ready and still matches the timeline.
+  String? _renderedFileFor(Transition t) {
+    final signature = _transitionRenderSignature(t);
+    return signature == null ? null : _transitionRenderFiles[signature];
+  }
+
+  /// The active transition at [position] when its rendered clip is ready.
+  Transition? _renderedTransitionAt(Duration position) {
+    final t = _getActiveTransitionAt(position);
+    if (t == null || _renderedFileFor(t) == null) return null;
+    return t;
+  }
+
+  /// Source position of the incoming clip when the transition window ends,
+  /// where its decoder is parked while the rendered clip plays.
+  Duration _renderedHandoverSourcePosition(Transition t, VideoClip clip2) {
+    final target =
+        clip2.trimStart + sourceLengthForTimeline(t.duration, clip2.playbackSpeed);
+    return target > clip2.trimEnd ? clip2.trimEnd : target;
+  }
+
+  void _scheduleTransitionRenders() {
+    _transitionRenderDebounce?.cancel();
+    _transitionRenderDebounce =
+        Timer(const Duration(milliseconds: 300), _refreshTransitionRenderQueue);
+  }
+
+  void _refreshTransitionRenderQueue() {
+    final project = _currentProject;
+    if (project == null) return;
+
+    final ordered = List<Transition>.from(project.transitions);
+    ordered.sort((a, b) {
+      final ca = _clipById(a.clipId2)?.startTime ?? Duration.zero;
+      final cb = _clipById(b.clipId2)?.startTime ?? Duration.zero;
+      return ca.compareTo(cb);
+    });
+
+    final live = <String>{};
+    final wanted = <String>[];
+    for (final t in ordered) {
+      final signature = _transitionRenderSignature(t);
+      if (signature == null) continue;
+      live.add(signature);
+      if (_transitionRenderFiles.containsKey(signature) ||
+          _failedTransitionRenders.contains(signature) ||
+          _transitionRenderingSignature == signature) {
+        continue;
+      }
+      wanted.add(t.id);
+    }
+
+    // Forget renders of transitions that were removed or edited.
+    final stale = _transitionRenderFiles.keys
+        .where((signature) => !live.contains(signature))
+        .toList();
+    for (final signature in stale) {
+      final file = _transitionRenderFiles.remove(signature)!;
+      if (file != _transitionClipPath) _deleteQuietly(file);
+    }
+
+    _transitionRenderQueue
+      ..clear()
+      ..addAll(wanted);
+    notifyListeners();
+    unawaited(_runTransitionRenderWorker());
+  }
+
+  Future<void> _runTransitionRenderWorker() async {
+    if (_transitionRenderingSignature != null) return;
+    final generation = _transitionRenderGeneration;
+
+    while (_transitionRenderQueue.isNotEmpty) {
+      final transitionId = _transitionRenderQueue.removeAt(0);
+      final project = _currentProject;
+      if (project == null || generation != _transitionRenderGeneration) break;
+
+      Transition? transition;
+      for (final t in project.transitions) {
+        if (t.id == transitionId) transition = t;
+      }
+      if (transition == null) continue;
+      final clip1 = _clipById(transition.clipId1);
+      final clip2 = _clipById(transition.clipId2);
+      final signature = _transitionRenderSignature(transition);
+      if (clip1 == null ||
+          clip2 == null ||
+          signature == null ||
+          _transitionRenderFiles.containsKey(signature)) {
+        continue;
+      }
+
+      _transitionRenderingSignature = signature;
+      _transitionRenderProgress = 0.0;
+      notifyListeners();
+
+      String? result;
+      try {
+        final dir = Directory(p.join(
+            (await getTemporaryDirectory()).path, 'transition_previews'));
+        if (!await dir.exists()) await dir.create(recursive: true);
+        final out = p.join(dir.path,
+            'transition_${transition.id}_${DateTime.now().microsecondsSinceEpoch}.mp4');
+        result = await ExportService.renderTransitionPreview(
+          project: project,
+          transition: transition,
+          clip1: clip1,
+          clip2: clip2,
+          outputPath: out,
+          clipColorFilters: Map.of(_clipColorFilters),
+          onProgress: _onTransitionRenderProgress,
+        );
+        if (result != null && !File(result).existsSync()) result = null;
+      } catch (e) {
+        debugPrint('Transition preview render failed: $e');
+        result = null;
+      }
+
+      _transitionRenderingSignature = null;
+      if (generation != _transitionRenderGeneration) {
+        if (result != null) _deleteQuietly(result);
+        break;
+      }
+
+      // Keep it only if the timeline still matches what was rendered.
+      String? currentSignature;
+      for (final t in _currentProject?.transitions ?? const <Transition>[]) {
+        if (t.id == transitionId) currentSignature = _transitionRenderSignature(t);
+      }
+      if (result == null) {
+        _failedTransitionRenders.add(signature);
+      } else if (currentSignature == signature) {
+        _transitionRenderFiles[signature] = result;
+      } else {
+        _deleteQuietly(result);
+      }
+      notifyListeners();
+    }
+
+    if (_transitionRenderingSignature == null &&
+        generation == _transitionRenderGeneration) {
+      _transitionRenderProgress = 0.0;
+      notifyListeners();
+    }
+  }
+
+  void _onTransitionRenderProgress(double progress) {
+    _transitionRenderProgress = progress.clamp(0.0, 1.0);
+    final now = DateTime.now();
+    if (now.difference(_lastRenderProgressNotify) >
+        const Duration(milliseconds: 120)) {
+      _lastRenderProgressNotify = now;
+      notifyListeners();
+    }
+  }
+
+  void _deleteQuietly(String file) {
+    try {
+      final f = File(file);
+      if (f.existsSync()) f.deleteSync();
+    } catch (_) {}
+  }
+
+  /// Drops every rendered transition and its player (project closed).
+  void _clearTransitionRenders() {
+    _transitionRenderGeneration++;
+    _transitionRenderDebounce?.cancel();
+    _transitionRenderQueue.clear();
+    _transitionRenderingSignature = null;
+    _transitionRenderProgress = 0.0;
+    for (final file in _transitionRenderFiles.values) {
+      _deleteQuietly(file);
+    }
+    _transitionRenderFiles.clear();
+    _failedTransitionRenders.clear();
+    _renderedTransitionShownId = null;
+    _renderedTransitionEnterInFlight = false;
+    final controller = _transitionClipController;
+    _transitionClipController = null;
+    _transitionClipPath = null;
+    _transitionClipLoad = null;
+    unawaited(controller?.dispose());
+  }
+
+  // ── Pre-rendered transitions: playback ──────────────────────────────────
+
+  /// Loads the rendered clip [file] into the transition player.
+  Future<VideoPlayerController?> _ensureTransitionClip(String file) async {
+    if (_transitionClipPath == file && _transitionClipController != null) {
+      final load = _transitionClipLoad;
+      if (load != null) {
+        try {
+          await load;
+        } catch (_) {}
+      }
+      final c = _transitionClipController;
+      return (c != null && _transitionClipPath == file && c.value.isInitialized)
+          ? c
+          : null;
+    }
+
+    final old = _transitionClipController;
+    if (old != null) {
+      _renderedTransitionShownId = null;
+      notifyListeners();
+      // Let the preview drop its VideoPlayer before disposing.
+      Future<void>.delayed(const Duration(milliseconds: 500), old.dispose);
+    }
+
+    final controller = VideoPlayerController.file(
+      File(file),
+      videoPlayerOptions: VideoPlayerOptions(mixWithOthers: true),
+    );
+    _transitionClipController = controller;
+    _transitionClipPath = file;
+    final load = controller.initialize().then((_) => controller.setVolume(0.0));
+    _transitionClipLoad = load;
+    try {
+      await load;
+    } catch (e) {
+      debugPrint('Could not load rendered transition: $e');
+      if (identical(_transitionClipController, controller)) {
+        _transitionClipController = null;
+        _transitionClipPath = null;
+      }
+      unawaited(controller.dispose());
+      return null;
+    } finally {
+      if (identical(_transitionClipLoad, load)) _transitionClipLoad = null;
+    }
+    return identical(_transitionClipController, controller) ? controller : null;
+  }
+
+  bool _renderedClipPrewarmInFlight = false;
+
+  /// Loads the upcoming rendered clip and parks it on its first frame.
+  Future<void> _prewarmRenderedTransitionClip(String file) async {
+    final current = _transitionClipController;
+    if (_transitionClipPath == file &&
+        current != null &&
+        current.value.isInitialized &&
+        !current.value.isPlaying &&
+        current.value.position <= const Duration(milliseconds: 40)) {
+      return;
+    }
+    if (_renderedClipPrewarmInFlight || _renderedTransitionEnterInFlight) {
+      return;
+    }
+    _renderedClipPrewarmInFlight = true;
+    try {
+      final controller = await _ensureTransitionClip(file);
+      if (controller == null || _renderedTransitionShownId != null) return;
+      if (controller.value.isPlaying) await controller.pause();
+      if (controller.value.position > const Duration(milliseconds: 40)) {
+        await controller.seekTo(Duration.zero);
+      }
+    } catch (_) {
+      // Best effort; entering the transition loads it if needed.
+    } finally {
+      _renderedClipPrewarmInFlight = false;
+    }
+  }
+
+  /// Plays the rendered clip of [t] while the playhead is in its window.
+  /// Returns false to fall back to the live preview.
+  bool _playRenderedTransition(Transition t) {
+    final file = _renderedFileFor(t);
+    final clip2 = _clipById(t.clipId2);
+    if (file == null || clip2 == null) {
+      if (_renderedTransitionShownId == t.id) _renderedTransitionShownId = null;
+      return false;
+    }
+
+    final controller = _transitionClipController;
+    final loaded = controller != null &&
+        _transitionClipPath == file &&
+        controller.value.isInitialized;
+
+    if (_renderedTransitionEnterInFlight) return true;
+    if (_renderedTransitionShownId == t.id &&
+        loaded &&
+        (controller.value.isPlaying ||
+            // Finished a frame before the window closes: hold its last frame.
+            controller.value.position >=
+                controller.value.duration - const Duration(milliseconds: 60))) {
+      return true;
+    }
+    // The live preview already took this pass of the transition.
+    if (_activeTransitionId == t.id && _renderedTransitionShownId != t.id) {
+      return false;
+    }
+
+    final offset = _currentPosition - clip2.startTime;
+    if (loaded &&
+        _renderedTransitionShownId != t.id &&
+        !controller.value.isPlaying &&
+        controller.value.position <= const Duration(milliseconds: 40) &&
+        offset >= Duration.zero &&
+        offset <= const Duration(milliseconds: 250)) {
+      // Normal case: the playhead just crossed the cut and the clip is parked
+      // on its first frame. Start it without stopping the clock and pull the
+      // playhead back onto that frame (a sub-frame, invisible rewind).
+      _activeTransitionId = t.id;
+      _renderedTransitionShownId = t.id;
+      if (offset > Duration.zero) {
+        _currentPosition = clip2.startTime;
+        _updateTimelineClock();
+      }
+      unawaited(controller.setVolume(_videoMasterVolume.clamp(0.0, 1.0)));
+      unawaited(controller.play());
+      unawaited(_parkIncomingClipBehindRenderedTransition(t, clip2));
+      notifyListeners();
+      return true;
+    }
+
+    // Entering mid-window (seek, resume, late load): hold the clock briefly.
+    unawaited(_enterRenderedTransitionMidWindow(t, clip2, file));
+    return true;
+  }
+
+  Future<void> _enterRenderedTransitionMidWindow(
+    Transition t,
+    VideoClip clip2,
+    String file,
+  ) async {
+    _renderedTransitionEnterInFlight = true;
+    final serial = _seekSyncSerial;
+    _stopTimelineClock();
+    _activeTransitionId = t.id;
+    var started = false;
+    try {
+      final controller = await _ensureTransitionClip(file);
+      if (controller == null) return;
+      await _parkIncomingClipBehindRenderedTransition(t, clip2);
+      if (serial != _seekSyncSerial || !_isPlaying) return;
+
+      final offset = _currentPosition - clip2.startTime;
+      final end = controller.value.duration;
+      var target = offset < Duration.zero ? Duration.zero : offset;
+      if (target > end) target = end;
+      if ((controller.value.position - target).abs() >
+          const Duration(milliseconds: 40)) {
+        await controller.seekTo(target);
+        await _waitForSeekToLand(controller,
+            isCurrent: () => serial == _seekSyncSerial && _isPlaying);
+      }
+      if (serial != _seekSyncSerial || !_isPlaying) return;
+
+      _renderedTransitionShownId = t.id;
+      await controller.setVolume(_videoMasterVolume.clamp(0.0, 1.0));
+      await controller.play();
+      started = true;
+    } catch (e) {
+      debugPrint('Error entering rendered transition: $e');
+    } finally {
+      _renderedTransitionEnterInFlight = false;
+      if (!started && _renderedTransitionShownId == t.id && _isPlaying) {
+        _renderedTransitionShownId = null;
+      }
+      if (_isPlaying && serial == _seekSyncSerial && _timelineTimer == null) {
+        _startTimelineClock();
+      }
+      notifyListeners();
+    }
+  }
+
+  /// While the rendered clip plays, pause the outgoing decoder and park the
+  /// incoming clip's decoder at the end of the window, so playback continues
+  /// seamlessly when the transition is over (this also covers both halves of
+  /// a split clip, which share one decoder).
+  Future<void> _parkIncomingClipBehindRenderedTransition(
+    Transition t,
+    VideoClip clip2,
+  ) async {
+    final old = _previewController;
+    if (old != null && old.value.isInitialized) {
+      await old.pause();
+      await old.setVolume(0.0);
+    }
+    if (clip2.mediaType != MediaType.video || clip2.videoFile == null) {
+      _activePreviewClipId = clip2.id;
+      return;
+    }
+    final videoPath = _resolvePlaybackPath(clip2);
+    if (videoPath == null) return;
+
+    final controller = await ensurePreviewController(videoPath);
+    if (controller == null || !controller.value.isInitialized) return;
+    if (_renderedTransitionShownId != t.id && _activeTransitionId != t.id) {
+      return; // superseded (seek / pause)
+    }
+    if (controller.value.isPlaying) await controller.pause();
+    await controller.setVolume(0.0);
+    final target = clampSourcePositionForVideo(
+      _renderedHandoverSourcePosition(t, clip2),
+      controller.value.duration,
+    );
+    if ((controller.value.position - target).abs() >
+        const Duration(milliseconds: 40)) {
+      await controller.seekTo(target);
+    }
+    if ((controller.value.playbackSpeed - clip2.playbackSpeed).abs() > 0.001) {
+      await controller.setPlaybackSpeed(clip2.playbackSpeed);
+    }
+
+    if (!identical(_previewController, controller)) {
+      _previewController?.removeListener(_videoPositionListener);
+      _previewController = controller;
+      _activeFilePath = videoPath;
+      controller.addListener(_videoPositionListener);
+      _lruAccessList
+        ..remove(videoPath)
+        ..add(videoPath);
+    }
+    _activePreviewClipId = clip2.id;
+  }
+
+  /// The playhead left a rendered transition: stop the rendered clip and
+  /// start the incoming clip's decoder, which is parked on this exact frame.
+  void _finishRenderedTransition() {
+    _renderedTransitionShownId = null;
+    final rendered = _transitionClipController;
+    if (rendered != null && rendered.value.isInitialized) {
+      unawaited(rendered.pause());
+      unawaited(rendered.setVolume(0.0));
+    }
+    if (!_isPlaying) return;
+
+    final clip = _clipAtTimeline(_currentPosition);
+    if (clip == null || clip.mediaType != MediaType.video) return;
+    final videoPath = _resolvePlaybackPath(clip);
+    final controller = _previewController;
+    if (videoPath != null &&
+        videoPath == _activeFilePath &&
+        controller != null &&
+        controller.value.isInitialized &&
+        !controller.value.isPlaying &&
+        !_previewSyncInFlight &&
+        !_playbackRecoveryInFlight) {
+      final expected = calculateSourcePositionForTimeline(clip, _currentPosition);
+      final lead = expected - controller.value.position;
+      if (lead >= -const Duration(milliseconds: 40) &&
+          lead <= const Duration(milliseconds: 250)) {
+        if (lead > Duration.zero) {
+          final aligned = clip.startTime +
+              timelineLengthForSource(
+                controller.value.position - clip.trimStart,
+                clip.playbackSpeed,
+              );
+          if (aligned >= clip.startTime && aligned < _currentPosition) {
+            _currentPosition = aligned;
+            _updateTimelineClock();
+          }
+        }
+        if ((controller.value.playbackSpeed - clip.playbackSpeed).abs() >
+            0.001) {
+          unawaited(controller.setPlaybackSpeed(clip.playbackSpeed));
+        }
+        unawaited(controller.play());
+        _activePreviewClipId = clip.id;
+        return;
+      }
+    }
+    // Not parked where expected: the regular sync path takes over.
+    _activePreviewClipId = null;
+  }
+
+  /// Paused / scrubbing inside a rendered transition: show its frame.
+  Future<bool> _showRenderedTransitionStill(Transition t, int serial) async {
+    final file = _renderedFileFor(t);
+    final clip2 = _clipById(t.clipId2);
+    if (file == null || clip2 == null) return false;
+    final controller = await _ensureTransitionClip(file);
+    if (controller == null || serial != _seekSyncSerial) return false;
+    if (controller.value.isPlaying) await controller.pause();
+    await controller.setVolume(0.0);
+    final offset = _currentPosition - clip2.startTime;
+    final end = controller.value.duration;
+    var target = offset < Duration.zero ? Duration.zero : offset;
+    if (target > end) target = end;
+    await controller.seekTo(target);
+    if (serial != _seekSyncSerial) return false;
+    _renderedTransitionShownId = t.id;
+    return true;
   }
 
   Transition? _getActiveTransitionAt(Duration now) {
@@ -4555,6 +5330,7 @@ class VideoEditorProvider extends ChangeNotifier {
 
       // Pre-load all audio players for this project
       await _preloadAllAudioPlayers();
+      _scheduleTransitionRenders();
 
       notifyListeners();
     }

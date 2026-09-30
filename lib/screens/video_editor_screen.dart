@@ -3,6 +3,7 @@ import 'dart:math' as math;
 import 'dart:ui' as ui;
 import 'package:flutter/material.dart';
 import 'package:flutter/foundation.dart';
+import 'package:flutter/scheduler.dart' show Ticker;
 import 'package:provider/provider.dart';
 import 'package:video_player/video_player.dart';
 import 'package:file_picker/file_picker.dart';
@@ -219,7 +220,13 @@ class _VideoEditorScreenState extends State<VideoEditorScreen>
   // Fraction of total editor height for the bottom panel (timeline + toolbar).
   double _bottomPanelFraction = 0.60;
   static const double _dividerHeight = 10.0;
-  final Map<String, _TransitionFrameCacheEntry> _transitionFrameCache = {};
+  // Decoded transition stills keyed by '<path>|<timeMs>' (null = failed).
+  final Map<String, ui.Image?> _transitionFrames = {};
+  final Set<String> _transitionFramesLoading = {};
+  final List<_TransitionFrameRequest> _transitionFrameQueue = [];
+  final Set<String> _precachedTransitionImages = {};
+  bool _transitionFrameWorkerRunning = false;
+  static const int _transitionFrameMaxSize = 1280;
 
   String _normalizeMp4Path(String path) {
     if (path.toLowerCase().endsWith('.mp4')) return path;
@@ -319,6 +326,11 @@ class _VideoEditorScreenState extends State<VideoEditorScreen>
   @override
   void dispose() {
     WidgetsBinding.instance.removeObserver(this);
+    _transitionFrameQueue.clear();
+    for (final image in _transitionFrames.values) {
+      image?.dispose();
+    }
+    _transitionFrames.clear();
     super.dispose();
   }
 
@@ -1386,6 +1398,15 @@ class _VideoEditorScreenState extends State<VideoEditorScreen>
                               ),
                             ),
                           ),
+                        ),
+                      ),
+                    if (provider.hasProject && provider.isRenderingTransitions)
+                      Positioned(
+                        top: 10,
+                        right: 10,
+                        child: _TransitionRenderBadge(
+                          progress: provider.transitionRenderProgress,
+                          pending: provider.transitionRendersPending,
                         ),
                       ),
                   ],
@@ -2739,14 +2760,6 @@ class _VideoEditorScreenState extends State<VideoEditorScreen>
     return null;
   }
 
-  String _transitionPreviewCacheKey(
-    Transition transition,
-    VideoClip clip1,
-    VideoClip clip2,
-  ) {
-    return '${transition.id}|${clip1.id}|${clip2.id}';
-  }
-
   String? _transitionPlaybackPath(VideoClip clip) {
     if (clip.mediaType != MediaType.video || clip.videoFile == null) {
       return null;
@@ -2769,165 +2782,231 @@ class _VideoEditorScreenState extends State<VideoEditorScreen>
     return position.inMilliseconds < 0 ? 0 : position.inMilliseconds;
   }
 
-  void _prewarmTransitionFrames(_ResolvedTransitionPreview preview) {
-    final cacheKey = _transitionPreviewCacheKey(
-      preview.transition,
-      preview.clip1,
-      preview.clip2,
-    );
-    final entry = _transitionFrameCache.putIfAbsent(
-      cacheKey,
-      () => _TransitionFrameCacheEntry(),
-    );
-
-    _queueTransitionFrameLoad(
-      cacheKey: cacheKey,
-      entry: entry,
-      clip: preview.clip1,
-      isClip1: true,
-      lastFrame: true,
-    );
-    _queueTransitionFrameLoad(
-      cacheKey: cacheKey,
-      entry: entry,
-      clip: preview.clip2,
-      isClip1: false,
-      lastFrame: false,
-    );
-  }
-
-  void _queueTransitionFrameLoad({
-    required String cacheKey,
-    required _TransitionFrameCacheEntry entry,
-    required VideoClip clip,
-    required bool isClip1,
-    required bool lastFrame,
-  }) {
+  /// Cache key of the still frame a transition needs from [clip]: the last
+  /// frame of the outgoing clip (the exporter freezes it the same way) or the
+  /// first frame of the incoming one. Null for clips that are not videos.
+  String? _transitionFrameKey(VideoClip clip, {required bool lastFrame}) {
     final path = _transitionPlaybackPath(clip);
-    if (path == null) {
-      entry.markResolved(isClip1, null, null);
-      return;
-    }
-
-    final timeMs = _transitionStaticFrameTimeMs(clip, lastFrame: lastFrame);
-    final frameKey = '$path|$timeMs';
-    if (entry.hasFrameRequest(isClip1, frameKey)) return;
-
-    entry.markLoading(isClip1, frameKey);
-    unawaited(_loadTransitionFrame(
-      cacheKey: cacheKey,
-      frameKey: frameKey,
-      path: path,
-      timeMs: timeMs,
-      isClip1: isClip1,
-    ));
+    if (path == null) return null;
+    return '$path|${_transitionStaticFrameTimeMs(clip, lastFrame: lastFrame)}';
   }
 
-  Future<void> _loadTransitionFrame({
-    required String cacheKey,
-    required String frameKey,
-    required String path,
-    required int timeMs,
-    required bool isClip1,
-  }) async {
-    Uint8List? bytes;
-    try {
-      bytes = await VideoThumbnail.thumbnailData(
-        video: path,
-        imageFormat: ImageFormat.PNG,
-        timeMs: timeMs,
-        quality: 75,
-      );
-    } catch (_) {
-      bytes = null;
+  /// Queues the still frame for [clip] unless it is cached or loading.
+  /// [urgent] requests (the transition the playhead is approaching) jump the
+  /// queue. Returns the frame's cache key.
+  String? _requestTransitionFrame(
+    VideoClip clip, {
+    required bool lastFrame,
+    bool urgent = false,
+  }) {
+    if (clip.mediaType == MediaType.image) {
+      final file = clip.imageFile;
+      if (file != null && _precachedTransitionImages.add(file.path)) {
+        // Decode it now so the first transition frame is not blank.
+        unawaited(precacheImage(FileImage(file), context).catchError((_) {}));
+      }
+      return null;
     }
 
-    if (!mounted) return;
-    final entry = _transitionFrameCache[cacheKey];
-    if (entry == null || !entry.matchesFrameKey(isClip1, frameKey)) return;
-    setState(() {
-      entry.markResolved(isClip1, frameKey, bytes);
-    });
+    final key = _transitionFrameKey(clip, lastFrame: lastFrame);
+    if (key == null) return null;
+    if (_transitionFrames.containsKey(key)) return key;
+
+    final queued = _transitionFrameQueue.indexWhere((r) => r.key == key);
+    if (_transitionFramesLoading.contains(key)) return key;
+    if (queued >= 0) {
+      if (urgent && queued > 0) {
+        _transitionFrameQueue.insert(0, _transitionFrameQueue.removeAt(queued));
+      }
+      return key;
+    }
+
+    final request = _TransitionFrameRequest(
+      key: key,
+      path: _transitionPlaybackPath(clip)!,
+      timeMs: _transitionStaticFrameTimeMs(clip, lastFrame: lastFrame),
+    );
+    if (urgent) {
+      _transitionFrameQueue.insert(0, request);
+    } else {
+      _transitionFrameQueue.add(request);
+    }
+    unawaited(_runTransitionFrameWorker());
+    return key;
+  }
+
+  /// Extracts transition stills ahead of time so nothing is decoded when the
+  /// playhead reaches a transition. While playing, only transitions in the
+  /// next few seconds are fetched to keep the decoder free for playback.
+  void _prefetchTransitionFrames(
+    VideoEditorProvider provider,
+    _ResolvedTransitionPreview? upcoming,
+  ) {
+    final project = provider.currentProject;
+    if (project == null) return;
+
+    if (upcoming != null &&
+        !provider.hasRenderedTransition(upcoming.transition.id)) {
+      _requestTransitionFrame(upcoming.clip1, lastFrame: true, urgent: true);
+      _requestTransitionFrame(upcoming.clip2, lastFrame: false, urgent: true);
+    }
+
+    final playing = provider.isPlaying;
+    final position = provider.currentPosition;
+    const lookAhead = Duration(seconds: 10);
+    final needed = <String>{};
+
+    for (final transition in project.transitions) {
+      final clip1 = _clipByIdOrNull(project, transition.clipId1);
+      final clip2 = _clipByIdOrNull(project, transition.clipId2);
+      if (clip1 == null || clip2 == null) continue;
+
+      final k1 = _transitionFrameKey(clip1, lastFrame: true);
+      final k2 = _transitionFrameKey(clip2, lastFrame: false);
+      if (k1 != null) needed.add(k1);
+      if (k2 != null) needed.add(k2);
+
+      // Rendered transitions never need the live stills.
+      if (provider.hasRenderedTransition(transition.id)) continue;
+      if (playing) {
+        final until = clip2.startTime - position;
+        if (until < -transition.duration || until > lookAhead) continue;
+      }
+      _requestTransitionFrame(clip1, lastFrame: true);
+      _requestTransitionFrame(clip2, lastFrame: false);
+    }
+
+    if (!playing) {
+      // Drop stills of transitions that were removed or re-trimmed.
+      final stale =
+          _transitionFrames.keys.where((k) => !needed.contains(k)).toList();
+      for (final key in stale) {
+        _transitionFrames.remove(key)?.dispose();
+      }
+      _transitionFrameQueue.removeWhere((r) => !needed.contains(r.key));
+    }
+  }
+
+  static VideoClip? _clipByIdOrNull(VideoProject project, String id) {
+    for (final clip in project.videoClips) {
+      if (clip.id == id) return clip;
+    }
+    return null;
+  }
+
+  /// Decodes queued stills one at a time (parallel extractions would fight
+  /// the playback decoder, which is what made 4K transitions stall).
+  Future<void> _runTransitionFrameWorker() async {
+    if (_transitionFrameWorkerRunning) return;
+    _transitionFrameWorkerRunning = true;
+    try {
+      while (_transitionFrameQueue.isNotEmpty && mounted) {
+        final request = _transitionFrameQueue.removeAt(0);
+        if (_transitionFrames.containsKey(request.key)) continue;
+        _transitionFramesLoading.add(request.key);
+
+        ui.Image? image;
+        try {
+          // Downscaled JPEG: a full-resolution PNG of a 4K frame takes
+          // seconds to encode and decode and is far larger than the preview.
+          final bytes = await VideoThumbnail.thumbnailData(
+            video: request.path,
+            imageFormat: ImageFormat.JPEG,
+            timeMs: request.timeMs,
+            maxWidth: _transitionFrameMaxSize,
+            maxHeight: _transitionFrameMaxSize,
+            quality: 90,
+          );
+          if (bytes != null) {
+            final codec = await ui.instantiateImageCodec(bytes);
+            image = (await codec.getNextFrame()).image;
+            codec.dispose();
+          }
+        } catch (_) {
+          image = null;
+        }
+
+        _transitionFramesLoading.remove(request.key);
+        if (!mounted) {
+          image?.dispose();
+          return;
+        }
+        setState(() {
+          _transitionFrames.remove(request.key)?.dispose();
+          _transitionFrames[request.key] = image;
+        });
+      }
+    } finally {
+      _transitionFrameWorkerRunning = false;
+    }
   }
 
   Widget _buildFilteredMedia(VideoEditorProvider provider,
       {bool isPreviewMode = false}) {
-    // Use per-clip filter if available, otherwise fall back to project-wide filter
-    final currentClipForFilter = provider.currentVideoClip;
-    final ColorFilter colorFilter;
-    final clipFilter = currentClipForFilter != null
-        ? provider.clipColorFilters[currentClipForFilter.id]
-        : null;
-    if (clipFilter != null && clipFilter.hasFilters) {
-      colorFilter = clipFilter;
-    } else {
-      // Same fallback as the exporter: project-wide filter when the clip has
-      // no filter of its own.
-      colorFilter =
-          provider.currentProject?.colorFilter ?? const ColorFilter();
-    }
-    final selectedClipId = provider.selectedVideoClipId;
     final currentClip = provider.currentVideoClip;
-    double rotation = 0.0;
-    bool isMirrored = false;
-
-    // Only use selected clip's rotation when that specific clip is currently playing
-    // This ensures each clip maintains its own independent rotation
-    if (!isPreviewMode && provider.currentProject != null) {
-      if (selectedClipId != null && currentClip?.id == selectedClipId) {
-        // Selected clip is currently playing - use its rotation for editing
-        rotation = currentClip!.rotation;
-        isMirrored = currentClip.isMirrored;
-      } else if (currentClip != null) {
-        // Either no clip selected, or selected clip is not currently playing
-        // Use the currently playing clip's own rotation
-        rotation = currentClip.rotation;
-        isMirrored = currentClip.isMirrored;
-      }
-    }
-
-    Widget mediaWidget;
     if (currentClip == null) {
       return Container(color: AppColors.background);
     }
 
     final transitionPreview = _resolveTransitionPreview(provider);
-    if (transitionPreview != null) {
-      _prewarmTransitionFrames(transitionPreview);
-    }
+    _prefetchTransitionFrames(provider, transitionPreview);
 
-    if (transitionPreview != null && transitionPreview.isActive) {
-      final outputRes =
-          provider.currentProject?.outputResolution ?? const Size(1920, 1080);
-      final transitionAspectRatio = outputRes.height == 0
-          ? 16.0 / 9.0
-          : outputRes.width / outputRes.height;
-      final cacheKey = _transitionPreviewCacheKey(
-        transitionPreview.transition,
-        transitionPreview.clip1,
-        transitionPreview.clip2,
-      );
-      final frameCache = _transitionFrameCache[cacheKey];
+    final cropEditorOpen = !isPreviewMode && provider.showCropEditor;
 
-      mediaWidget = Center(
-        child: AspectRatio(
-          aspectRatio: transitionAspectRatio,
-          child: _TransitionPreview(
-            provider: provider,
-            transition: transitionPreview.transition,
-            clip1: transitionPreview.clip1,
-            clip2: transitionPreview.clip2,
-            clip1FrameBytes: frameCache?.clip1FrameBytes,
-            clip2FrameBytes: frameCache?.clip2FrameBytes,
-            progress: VideoEditorProvider.transitionPreviewProgress(
-              provider.currentPosition,
-              transitionPreview.transition,
-              transitionPreview.clip2,
+    if (transitionPreview != null &&
+        transitionPreview.isActive &&
+        !cropEditorOpen) {
+      // Pre-rendered transition: a finished clip made by the exporter's own
+      // filters (rotation, crop, color and the xfade are already baked in).
+      final rendered = provider
+          .renderedTransitionControllerFor(transitionPreview.transition.id);
+      if (rendered != null) {
+        var aspectRatio = rendered.value.aspectRatio;
+        if ((rendered.value.rotationCorrection % 180) != 0) {
+          aspectRatio = 1 / aspectRatio;
+        }
+        return SizedBox.expand(
+          child: ColoredBox(
+            color: Colors.black,
+            child: Center(
+              child: AspectRatio(
+                aspectRatio: aspectRatio,
+                child: VideoPlayer(rendered, key: ValueKey(rendered)),
+              ),
             ),
+          ),
+        );
+      }
+
+      final clip1Key =
+          _transitionFrameKey(transitionPreview.clip1, lastFrame: true);
+      final clip2Key =
+          _transitionFrameKey(transitionPreview.clip2, lastFrame: false);
+
+      // Fill the preview canvas exactly like normal playback does. Forcing
+      // the project aspect ratio here resized the picture at the start and
+      // end of every transition, which looked like a built-in zoom.
+      return SizedBox.expand(
+        child: _TransitionPreview(
+          provider: provider,
+          transition: transitionPreview.transition,
+          clip1: transitionPreview.clip1,
+          clip2: transitionPreview.clip2,
+          clip1Frame: clip1Key == null ? null : _transitionFrames[clip1Key],
+          clip2Frame: clip2Key == null ? null : _transitionFrames[clip2Key],
+          // Each side keeps its own rotation, filter and crop, as in export.
+          decorate: (clip, media) => _decorateClipMedia(
+            provider,
+            clip,
+            media,
+            isPreviewMode: isPreviewMode,
           ),
         ),
       );
-    } else if (currentClip.mediaType == MediaType.image &&
+    }
+
+    Widget mediaWidget;
+    if (currentClip.mediaType == MediaType.image &&
         currentClip.imageFile != null) {
       final outputRes =
           provider.currentProject?.outputResolution ?? const Size(1080, 1920);
@@ -2940,6 +3019,7 @@ class _VideoEditorScreenState extends State<VideoEditorScreen>
             currentClip.imageFile!,
             fit: BoxFit.contain,
             alignment: Alignment.center,
+            gaplessPlayback: true,
             key: ValueKey(currentClip.id),
           ),
         ),
@@ -2966,6 +3046,98 @@ class _VideoEditorScreenState extends State<VideoEditorScreen>
         ),
       );
     }
+
+    if (!cropEditorOpen) {
+      return _decorateClipMedia(
+        provider,
+        currentClip,
+        mediaWidget,
+        isPreviewMode: isPreviewMode,
+      );
+    }
+
+    final filteredMedia = _decorateClipMedia(
+      provider,
+      currentClip,
+      mediaWidget,
+      isPreviewMode: isPreviewMode,
+      applyCrop: false,
+    );
+
+    VideoClip? clipForCrop;
+    if (provider.selectedVideoClipId != null &&
+        provider.currentProject != null) {
+      try {
+        clipForCrop = provider.currentProject!.videoClips.firstWhere(
+          (c) => c.id == provider.selectedVideoClipId,
+        );
+      } catch (_) {
+        clipForCrop = currentClip;
+      }
+    } else {
+      clipForCrop = currentClip;
+    }
+    final cropRect = clipForCrop.cropRect ?? const Rect.fromLTWH(0, 0, 1, 1);
+
+    return LayoutBuilder(
+      builder: (context, constraints) {
+        final width = constraints.maxWidth;
+        final height = constraints.maxHeight;
+        final absRect = Rect.fromLTRB(
+          cropRect.left * width,
+          cropRect.top * height,
+          cropRect.right * width,
+          cropRect.bottom * height,
+        );
+        return Stack(
+          children: [
+            SizedBox.expand(child: filteredMedia),
+            ClipPath(
+              clipper: _OverlayClipper(absRect),
+              child: Container(
+                color: AppColors.background.withOpacity(0.6),
+              ),
+            ),
+            Positioned.fromRect(
+              rect: absRect,
+              child: CustomPaint(
+                painter: GridPainter(),
+              ),
+            ),
+            _buildCropHandles(constraints, cropRect, provider),
+          ],
+        );
+      },
+    );
+  }
+
+  /// Applies one clip's own look (mirror, rotation, color filter, chroma key
+  /// and crop) to [media]. Normal playback decorates the clip at the
+  /// playhead; a transition decorates each of its two clips separately.
+  Widget _decorateClipMedia(
+    VideoEditorProvider provider,
+    VideoClip clip,
+    Widget media, {
+    required bool isPreviewMode,
+    bool applyCrop = true,
+  }) {
+    // Use per-clip filter if available, otherwise fall back to the
+    // project-wide filter (same fallback as the exporter).
+    final ColorFilter colorFilter;
+    final clipFilter = provider.clipColorFilters[clip.id];
+    if (clipFilter != null && clipFilter.hasFilters) {
+      colorFilter = clipFilter;
+    } else {
+      colorFilter =
+          provider.currentProject?.colorFilter ?? const ColorFilter();
+    }
+    final selectedClipId = provider.selectedVideoClipId;
+
+    // Each clip keeps its own independent rotation.
+    final double rotation = isPreviewMode ? 0.0 : clip.rotation;
+    final bool isMirrored = !isPreviewMode && clip.isMirrored;
+
+    Widget mediaWidget = media;
 
     if (isMirrored) {
       mediaWidget = Transform(
@@ -3012,14 +3184,14 @@ class _VideoEditorScreenState extends State<VideoEditorScreen>
 
     // ============ CHROMA KEY PREVIEW SUPPORT ============
     // Apply chroma key effect - show background behind video.
-    // Use per-clip settings at the playhead; fall back to the editor draft only
-    // when the chroma panel is open on the clip currently being previewed.
+    // Use per-clip settings; fall back to the editor draft only when the
+    // chroma panel is open on this clip.
     final chromaKeySettings =
         (provider.editorPanelMode == EditorPanelMode.chromaKey &&
                 selectedClipId != null &&
-                currentClip.id == selectedClipId)
+                clip.id == selectedClipId)
             ? provider.currentChromaKeySettings
-            : currentClip.chromaKeySettings;
+            : clip.chromaKeySettings;
     if (chromaKeySettings != null && chromaKeySettings.enabled) {
       final backgrounds = provider.currentProject?.chromaKeyBackgrounds ?? [];
       if (backgrounds.isNotEmpty) {
@@ -3086,98 +3258,45 @@ class _VideoEditorScreenState extends State<VideoEditorScreen>
     }
     // ============ END CHROMA KEY PREVIEW ============
 
-    VideoClip? clipForCrop;
-    if (!isPreviewMode &&
-        provider.showCropEditor &&
-        provider.selectedVideoClipId != null &&
-        provider.currentProject != null) {
-      try {
-        clipForCrop = provider.currentProject!.videoClips.firstWhere(
-          (c) => c.id == provider.selectedVideoClipId,
-        );
-      } catch (_) {
-        clipForCrop = provider.currentVideoClip;
-      }
-    } else {
-      clipForCrop = provider.currentVideoClip;
-    }
+    final crop = clip.cropRect;
+    if (!applyCrop || crop == null) return mediaWidget;
 
     final filteredMedia = mediaWidget;
-    final cropRect = clipForCrop?.cropRect ?? const Rect.fromLTWH(0, 0, 1, 1);
-
-    if (!isPreviewMode && provider.showCropEditor) {
-      return LayoutBuilder(
-        builder: (context, constraints) {
-          final width = constraints.maxWidth;
-          final height = constraints.maxHeight;
-          final absRect = Rect.fromLTRB(
-            cropRect.left * width,
-            cropRect.top * height,
-            cropRect.right * width,
-            cropRect.bottom * height,
-          );
-          return Stack(
-            children: [
-              SizedBox.expand(child: filteredMedia),
-              ClipPath(
-                clipper: _OverlayClipper(absRect),
-                child: Container(
-                  color: AppColors.background.withOpacity(0.6),
-                ),
-              ),
-              Positioned.fromRect(
-                rect: absRect,
-                child: CustomPaint(
-                  painter: GridPainter(),
-                ),
-              ),
-              _buildCropHandles(constraints, cropRect, provider),
-            ],
-          );
-        },
-      );
-    } else {
-      if (clipForCrop != null && clipForCrop.cropRect != null) {
-        final crop = clipForCrop.cropRect!;
-        return LayoutBuilder(
-          builder: (context, constraints) {
-            final originalRect = Rect.fromLTRB(
-              crop.left * constraints.maxWidth,
-              crop.top * constraints.maxHeight,
-              crop.right * constraints.maxWidth,
-              crop.bottom * constraints.maxHeight,
-            );
-            if (originalRect.width <= 0 || originalRect.height <= 0) {
-              return filteredMedia;
-            }
-            final center =
-                Offset(constraints.maxWidth / 2, constraints.maxHeight / 2);
-            // The exporter crops this region and scales it to fit the output
-            // frame, so enlarge it the same way here.
-            final fitScale = math.min(
-              constraints.maxWidth / originalRect.width,
-              constraints.maxHeight / originalRect.height,
-            );
-            return SizedBox.expand(
-              child: ClipRect(
-                child: Transform(
-                  transform: Matrix4.identity()
-                    ..translate(center.dx, center.dy)
-                    ..scale(fitScale, fitScale)
-                    ..translate(
-                        -originalRect.center.dx, -originalRect.center.dy),
-                  child: ClipPath(
-                    clipper: _RectClipper(originalRect),
-                    child: SizedBox.expand(child: filteredMedia),
-                  ),
-                ),
-              ),
-            );
-          },
+    return LayoutBuilder(
+      builder: (context, constraints) {
+        final originalRect = Rect.fromLTRB(
+          crop.left * constraints.maxWidth,
+          crop.top * constraints.maxHeight,
+          crop.right * constraints.maxWidth,
+          crop.bottom * constraints.maxHeight,
         );
-      }
-      return filteredMedia;
-    }
+        if (originalRect.width <= 0 || originalRect.height <= 0) {
+          return filteredMedia;
+        }
+        final center =
+            Offset(constraints.maxWidth / 2, constraints.maxHeight / 2);
+        // The exporter crops this region and scales it to fit the output
+        // frame, so enlarge it the same way here.
+        final fitScale = math.min(
+          constraints.maxWidth / originalRect.width,
+          constraints.maxHeight / originalRect.height,
+        );
+        return SizedBox.expand(
+          child: ClipRect(
+            child: Transform(
+              transform: Matrix4.identity()
+                ..translate(center.dx, center.dy)
+                ..scale(fitScale, fitScale)
+                ..translate(-originalRect.center.dx, -originalRect.center.dy),
+              child: ClipPath(
+                clipper: _RectClipper(originalRect),
+                child: SizedBox.expand(child: filteredMedia),
+              ),
+            ),
+          ),
+        );
+      },
+    );
   }
 
   /// Scale applied after rotating the preview so the rotated frame fits the
@@ -3666,74 +3785,130 @@ class _ResolvedTransitionPreview {
   });
 }
 
-class _TransitionFrameCacheEntry {
-  Uint8List? clip1FrameBytes;
-  Uint8List? clip2FrameBytes;
-  String? clip1FrameKey;
-  String? clip2FrameKey;
-  bool clip1Loading = false;
-  bool clip2Loading = false;
-  bool clip1Resolved = false;
-  bool clip2Resolved = false;
+/// Small pill shown over the preview while transitions are pre-rendered for
+/// smooth playback.
+class _TransitionRenderBadge extends StatelessWidget {
+  final double progress;
+  final int pending;
 
-  bool hasFrameRequest(bool isClip1, String frameKey) {
-    if (isClip1) {
-      return clip1FrameKey == frameKey && (clip1Loading || clip1Resolved);
-    }
-    return clip2FrameKey == frameKey && (clip2Loading || clip2Resolved);
-  }
+  const _TransitionRenderBadge({required this.progress, required this.pending});
 
-  bool matchesFrameKey(bool isClip1, String frameKey) {
-    return isClip1 ? clip1FrameKey == frameKey : clip2FrameKey == frameKey;
-  }
-
-  void markLoading(bool isClip1, String frameKey) {
-    if (isClip1) {
-      clip1FrameKey = frameKey;
-      clip1FrameBytes = null;
-      clip1Loading = true;
-      clip1Resolved = false;
-    } else {
-      clip2FrameKey = frameKey;
-      clip2FrameBytes = null;
-      clip2Loading = true;
-      clip2Resolved = false;
-    }
-  }
-
-  void markResolved(bool isClip1, String? frameKey, Uint8List? bytes) {
-    if (isClip1) {
-      clip1FrameKey = frameKey;
-      clip1FrameBytes = bytes;
-      clip1Loading = false;
-      clip1Resolved = true;
-    } else {
-      clip2FrameKey = frameKey;
-      clip2FrameBytes = bytes;
-      clip2Loading = false;
-      clip2Resolved = true;
-    }
+  @override
+  Widget build(BuildContext context) {
+    final percent = (progress * 100).clamp(0, 100).round();
+    final label = pending > 1
+        ? 'Rendering transitions ($pending) $percent%'
+        : 'Rendering transition $percent%';
+    return IgnorePointer(
+      child: Container(
+        padding: const EdgeInsets.symmetric(horizontal: 10, vertical: 6),
+        decoration: BoxDecoration(
+          color: Colors.black.withValues(alpha: 0.65),
+          borderRadius: BorderRadius.circular(14),
+        ),
+        child: Row(
+          mainAxisSize: MainAxisSize.min,
+          children: [
+            SizedBox(
+              width: 14,
+              height: 14,
+              child: CircularProgressIndicator(
+                strokeWidth: 2,
+                value: progress > 0.02 ? progress : null,
+                color: AppColors.primary,
+                backgroundColor: Colors.white24,
+              ),
+            ),
+            const SizedBox(width: 8),
+            Text(
+              label,
+              style: const TextStyle(
+                color: Colors.white,
+                fontSize: 11.5,
+                fontWeight: FontWeight.w600,
+              ),
+            ),
+          ],
+        ),
+      ),
+    );
   }
 }
 
-class _TransitionPreview extends StatelessWidget {
+class _TransitionFrameRequest {
+  final String key;
+  final String path;
+  final int timeMs;
+
+  const _TransitionFrameRequest({
+    required this.key,
+    required this.path,
+    required this.timeMs,
+  });
+}
+
+typedef _ClipDecorator = Widget Function(VideoClip clip, Widget media);
+
+/// Live transition preview. The outgoing clip is its frozen last frame and
+/// the incoming clip plays live, which is exactly what the exporter renders.
+/// Progress is re-evaluated on every vsync from the playback clock, so the
+/// animation runs at display rate instead of the 30 Hz timeline timer.
+class _TransitionPreview extends StatefulWidget {
   final VideoEditorProvider provider;
   final Transition transition;
   final VideoClip clip1;
   final VideoClip clip2;
-  final Uint8List? clip1FrameBytes;
-  final Uint8List? clip2FrameBytes;
-  final double progress;
+  final ui.Image? clip1Frame;
+  final ui.Image? clip2Frame;
+  final _ClipDecorator decorate;
 
   const _TransitionPreview({
     required this.provider,
     required this.transition,
     required this.clip1,
     required this.clip2,
-    required this.clip1FrameBytes,
-    required this.clip2FrameBytes,
-    required this.progress,
+    required this.clip1Frame,
+    required this.clip2Frame,
+    required this.decorate,
   });
+
+  @override
+  State<_TransitionPreview> createState() => _TransitionPreviewState();
+}
+
+class _TransitionPreviewState extends State<_TransitionPreview>
+    with SingleTickerProviderStateMixin {
+  late final Ticker _ticker;
+
+  @override
+  void initState() {
+    super.initState();
+    _ticker = createTicker((_) {
+      if (mounted) setState(() {});
+    });
+    _syncTicker();
+  }
+
+  @override
+  void didUpdateWidget(covariant _TransitionPreview oldWidget) {
+    super.didUpdateWidget(oldWidget);
+    _syncTicker();
+  }
+
+  @override
+  void dispose() {
+    _ticker.dispose();
+    super.dispose();
+  }
+
+  void _syncTicker() {
+    final playing = widget.provider.isPlaying;
+    if (playing && !_ticker.isActive) {
+      _ticker.start();
+    } else if (!playing && _ticker.isActive) {
+      _ticker.stop();
+    }
+  }
 
   String? _playbackPath(VideoClip clip) {
     if (clip.mediaType != MediaType.video || clip.videoFile == null) {
@@ -3747,110 +3922,105 @@ class _TransitionPreview extends StatelessWidget {
     return clip.videoFile!.path;
   }
 
-  bool _isProviderShowingClip(VideoClip clip) {
+  /// The active controller when it is currently synced to [clip].
+  VideoPlayerController? _liveControllerFor(VideoClip clip, VideoClip other) {
+    final provider = widget.provider;
     final path = _playbackPath(clip);
     final controller = provider.previewController;
-    return path != null &&
-        provider.activeFilePath == path &&
-        controller != null &&
-        controller.value.isInitialized;
+    if (path == null ||
+        controller == null ||
+        !controller.value.isInitialized ||
+        provider.activeFilePath != path) {
+      return null;
+    }
+    // Both sides of a split share one file: trust the decoder only once it
+    // has been synced to this side.
+    if (path == _playbackPath(other)) {
+      return provider.activePreviewClipId == clip.id ? controller : null;
+    }
+    return controller;
   }
 
-  bool _clipReady(VideoClip clip, {required bool isClip1}) {
-    if (clip.mediaType == MediaType.image) {
-      return clip.imageFile != null;
-    }
-    if (!isClip1 && _isProviderShowingClip(clip)) return true;
-    return isClip1 ? clip1FrameBytes != null : clip2FrameBytes != null;
-  }
-
-  Widget _buildClipChild(VideoClip clip, {required bool isClip1}) {
-    if (clip.mediaType == MediaType.image && clip.imageFile != null) {
-      return ColoredBox(
-        color: Colors.black,
-        child: Center(
-          child: Image.file(
-            clip.imageFile!,
-            fit: BoxFit.contain,
-            width: double.infinity,
-            height: double.infinity,
-            alignment: Alignment.center,
-            key: ValueKey(clip.id),
-          ),
-        ),
-      );
-    }
-
-    if (!isClip1 && clip.mediaType == MediaType.video) {
-      final controller = provider.previewController;
-      if (_isProviderShowingClip(clip) && controller != null) {
-        return _buildVideoPlayer(controller);
-      }
-    }
-
-    final bytes = isClip1 ? clip1FrameBytes : clip2FrameBytes;
-    if (clip.mediaType == MediaType.video && bytes != null) {
-      return ColoredBox(
-        color: Colors.black,
-        child: Center(
-          child: Image.memory(
-            bytes,
-            fit: BoxFit.contain,
-            width: double.infinity,
-            height: double.infinity,
-            alignment: Alignment.center,
-            gaplessPlayback: true,
-          ),
-        ),
-      );
-    }
-
-    return Container(color: AppColors.background);
+  Widget _buildStill(ui.Image image) {
+    return SizedBox.expand(
+      child: RawImage(
+        image: image,
+        fit: BoxFit.contain,
+        alignment: Alignment.center,
+        filterQuality: FilterQuality.medium,
+      ),
+    );
   }
 
   Widget _buildVideoPlayer(VideoPlayerController controller) {
-    if (controller.value.isInitialized) {
-      var aspectRatio = controller.value.aspectRatio;
-      final rotationDeg = controller.value.rotationCorrection;
-      if ((rotationDeg % 180) != 0) {
-        aspectRatio = 1 / aspectRatio;
-      }
-      return ColoredBox(
-        color: Colors.black,
-        child: Center(
-          child: AspectRatio(
-            aspectRatio: aspectRatio,
-            child: VideoPlayer(controller, key: ValueKey(controller)),
-          ),
+    var aspectRatio = controller.value.aspectRatio;
+    final rotationDeg = controller.value.rotationCorrection;
+    if ((rotationDeg % 180) != 0) {
+      aspectRatio = 1 / aspectRatio;
+    }
+    return Center(
+      child: AspectRatio(
+        aspectRatio: aspectRatio,
+        child: VideoPlayer(controller, key: ValueKey(controller)),
+      ),
+    );
+  }
+
+  Widget _buildClipChild(VideoClip clip, {required bool isClip1}) {
+    Widget content;
+    if (clip.mediaType == MediaType.image && clip.imageFile != null) {
+      content = SizedBox.expand(
+        child: Image.file(
+          clip.imageFile!,
+          fit: BoxFit.contain,
+          alignment: Alignment.center,
+          gaplessPlayback: true,
+          key: ValueKey(clip.id),
         ),
       );
+    } else {
+      final other = isClip1 ? widget.clip2 : widget.clip1;
+      final still = isClip1 ? widget.clip1Frame : widget.clip2Frame;
+      final live = _liveControllerFor(clip, other);
+      if (isClip1) {
+        // Frozen last frame, like the export. Until it is decoded, fall back
+        // to the decoder if it is still parked on the outgoing clip.
+        content = still != null
+            ? _buildStill(still)
+            : (live != null
+                ? _buildVideoPlayer(live)
+                : const SizedBox.expand());
+      } else {
+        content = live != null
+            ? _buildVideoPlayer(live)
+            : (still != null ? _buildStill(still) : const SizedBox.expand());
+      }
     }
-    return Container(color: AppColors.background);
+
+    return RepaintBoundary(
+      child: ColoredBox(
+        color: Colors.black,
+        child: widget.decorate(clip, content),
+      ),
+    );
   }
 
   @override
   Widget build(BuildContext context) {
-    final childA = RepaintBoundary(
-      child: _buildClipChild(clip1, isClip1: true),
-    );
-    final childB = RepaintBoundary(
-      child: _buildClipChild(clip2, isClip1: false),
+    final progress = VideoEditorProvider.transitionPreviewProgress(
+      widget.provider.smoothPosition,
+      widget.transition,
+      widget.clip2,
     );
 
-    final aReady = _clipReady(clip1, isClip1: true);
-    final bReady = _clipReady(clip2, isClip1: false);
-    if (!aReady || !bReady) {
-      return aReady ? childA : Container(color: AppColors.background);
-    }
-
-    // Delegate to the modular transition engine.
-    // The factory applies easeInOut by default for smooth 60 FPS playback.
-    return TransitionFactory.buildWithCurve(
-      type: transition.type,
-      linearT: progress,
-      childA: childA,
-      childB: childB,
-      curve: Curves.easeInOut,
+    // Clip so pushes, rotations and scales never paint outside the preview.
+    return ClipRect(
+      child: TransitionFactory.buildWithCurve(
+        type: widget.transition.type,
+        linearT: progress,
+        childA: _buildClipChild(widget.clip1, isClip1: true),
+        childB: _buildClipChild(widget.clip2, isClip1: false),
+      ),
     );
   }
 }

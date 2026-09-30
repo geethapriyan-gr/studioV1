@@ -152,7 +152,13 @@ class ExportService {
       }
     }
     clip ??= project.videoClips.firstOrNull;
+    return _aspectForClip(project, clip);
+  }
 
+  /// Display aspect ratio of [clip] as the preview shows it (rotation
+  /// metadata applied; image clips use the project's output aspect).
+  static Future<double> _aspectForClip(
+      VideoProject project, VideoClip? clip) async {
     // The preview shows image clips in a box with the project's output aspect.
     if (clip != null && clip.mediaType == MediaType.image) {
       final res = project.outputResolution;
@@ -2933,7 +2939,10 @@ class ExportService {
   static Future<String?> _executeFFmpeg(
       String command, Function(double)? onProgress,
       {double? duration, String? outputPath}) async {
-    if (_cancelled) return null;
+    // Preview renders run beside the export: they ignore its cancel flag and
+    // must not become the session that "Cancel export" stops.
+    final isPreviewRender = Zone.current[_previewRenderZoneKey] == true;
+    if (_cancelled && !isPreviewRender) return null;
 
     try {
       final completer = Completer<String?>();
@@ -2966,12 +2975,158 @@ class ExportService {
           }
         },
       ).then((session) {
-        _currentSession = session;
+        if (!isPreviewRender) _currentSession = session;
       });
 
       return await completer.future;
     } catch (e) {
       return null;
+    }
+  }
+
+  static const Symbol _previewRenderZoneKey = #studioVTransitionPreviewRender;
+
+  /// Renders the transition into [clip2] exactly as the export does — the
+  /// outgoing clip's last frame blended into the start of the incoming clip
+  /// with the same xfade and the same per-clip crop, rotation, speed, filter
+  /// and chroma key — but small, so the editor can simply play it back
+  /// instead of compositing two full-resolution decoders live.
+  ///
+  /// The frame uses [clip2]'s display aspect, which is the preview canvas
+  /// shape while the transition is on screen. Returns [outputPath], or null
+  /// when rendering failed.
+  static Future<String?> renderTransitionPreview({
+    required VideoProject project,
+    required Transition transition,
+    required VideoClip clip1,
+    required VideoClip clip2,
+    required String outputPath,
+    Map<String, ColorFilter>? clipColorFilters,
+    int maxDimension = 960,
+    void Function(double progress)? onProgress,
+  }) {
+    return runZoned(
+      () => _renderTransitionPreview(
+        project: project,
+        transition: transition,
+        clip1: clip1,
+        clip2: clip2,
+        outputPath: outputPath,
+        clipColorFilters: clipColorFilters ?? const {},
+        maxDimension: maxDimension,
+        onProgress: onProgress,
+      ),
+      zoneValues: {_previewRenderZoneKey: true},
+    );
+  }
+
+  static Future<String?> _renderTransitionPreview({
+    required VideoProject project,
+    required Transition transition,
+    required VideoClip clip1,
+    required VideoClip clip2,
+    required String outputPath,
+    required Map<String, ColorFilter> clipColorFilters,
+    required int maxDimension,
+    void Function(double progress)? onProgress,
+  }) async {
+    final fps = project.outputFrameRate <= 0
+        ? _defaultTargetFps
+        : project.outputFrameRate.toDouble();
+
+    // Same transition length the exporter uses (whole frames, and short
+    // enough to leave the incoming clip a couple of frames of its own).
+    final clip2Len = (clip2.endTime - clip2.startTime).inMilliseconds / 1000.0;
+    var sd = transition.duration.inMilliseconds / 1000.0;
+    final maxSd = clip2Len - 2.0 / fps;
+    if (sd > maxSd) sd = maxSd;
+    sd = (sd * fps).floor() / fps;
+    if (sd < 1.0 / fps) return null;
+
+    final aspect = await _aspectForClip(project, clip2);
+    int w, h;
+    if (aspect >= 1.0) {
+      w = maxDimension;
+      h = (maxDimension / aspect).round();
+    } else {
+      h = maxDimension;
+      w = (maxDimension * aspect).round();
+    }
+    w = math.max(2, (w ~/ 2) * 2);
+    h = math.max(2, (h ~/ 2) * 2);
+
+    ColorFilter filterFor(VideoClip clip) {
+      final own = clipColorFilters[clip.id] ?? project.colorFilter;
+      return own.hasFilters ? own : project.colorFilter;
+    }
+
+    Duration secsToDuration(double s) =>
+        Duration(microseconds: (s * 1000000).round());
+    double safeSpeed(VideoClip c) =>
+        (c.playbackSpeed.isNaN || c.playbackSpeed <= 0) ? 1.0 : c.playbackSpeed;
+
+    final tempDir = await getTemporaryDirectory();
+    final workDir = Directory(path.join(tempDir.path,
+        'transition_render_${DateTime.now().microsecondsSinceEpoch}'));
+    await workDir.create(recursive: true);
+
+    try {
+      // 1. Outgoing clip: only its last half second is needed for the
+      //    frozen last frame.
+      final clip1Window = clip1.trimmedDuration.inMicroseconds / 1000000.0;
+      final tailSource = math.min(clip1Window, 0.5 * safeSpeed(clip1));
+      final tailClip = clip1.copyWith(
+          trimStart: clip1.trimEnd - secsToDuration(tailSource));
+      final tail = await _processClipComprehensive(
+          tailClip, workDir, 0, w, h, fps, 23, 'ultrafast', _softwareEncoder,
+          (p) => onProgress?.call(0.35 * p.clamp(0.0, 1.0)),
+          colorFilter: filterFor(clip1));
+      if (tail == null) return null;
+
+      final lastFrame = path.join(workDir.path, 'last_frame.png');
+      final lf = await _executeFFmpeg(
+          '-y -sseof -1 -i "$tail" -an -update 1 "$lastFrame"', null,
+          outputPath: lastFrame);
+      if (lf == null) return null;
+      onProgress?.call(0.4);
+
+      // 2. Incoming clip: just the transition window (+2 frames of margin).
+      final headTimeline = math.min(clip2Len, sd + 2.0 / fps);
+      var headEnd =
+          clip2.trimStart + secsToDuration(headTimeline * safeSpeed(clip2));
+      if (headEnd > clip2.trimEnd) headEnd = clip2.trimEnd;
+      final headClip = clip2.copyWith(trimEnd: headEnd);
+      final head = await _processClipComprehensive(
+          headClip, workDir, 1, w, h, fps, 23, 'ultrafast', _softwareEncoder,
+          (p) => onProgress?.call(0.4 + 0.4 * p.clamp(0.0, 1.0)),
+          colorFilter: filterFor(clip2));
+      if (head == null) return null;
+
+      // 3. Blend, with the exporter's exact xfade. Short GOP so scrubbing
+      //    inside the transition seeks instantly.
+      final sds = _secs(sd);
+      final xfadeName = _mapToFfmpegXfade(transition.type);
+      final cmd = '-y -loop 1 -framerate $fps -t $sds -i "$lastFrame" '
+          '-t $sds -i "$head" '
+          '-filter_complex "'
+          '[0:v]scale=$w:$h,setsar=1,format=yuv420p,settb=AVTB,setpts=PTS-STARTPTS,fps=$fps[ta];'
+          '[1:v]setsar=1,format=yuv420p,settb=AVTB,setpts=PTS-STARTPTS,fps=$fps[tb];'
+          '[ta][tb]xfade=transition=$xfadeName:duration=$sds:offset=0,format=yuv420p[tv];'
+          '[1:a]asetpts=PTS-STARTPTS[tau]" '
+          '-map "[tv]" -map "[tau]" -c:v $_softwareEncoder -preset ultrafast '
+          '-tune fastdecode -g 5 -threads 0 -crf 23 -c:a aac -ar 44100 -ac 2 '
+          '-movflags +faststart -t $sds "$outputPath"';
+      final out = await _executeFFmpeg(cmd,
+          (p) => onProgress?.call(0.8 + 0.2 * p.clamp(0.0, 1.0)),
+          outputPath: outputPath, duration: sd);
+      onProgress?.call(1.0);
+      return out;
+    } catch (_) {
+      return null;
+    } finally {
+      try {
+        await workDir.delete(recursive: true);
+      } catch (_) {}
     }
   }
 
