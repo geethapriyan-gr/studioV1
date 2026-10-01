@@ -199,7 +199,7 @@ class _AudioRecorderWidgetState extends State<AudioRecorderWidget> {
           Row(
             mainAxisAlignment: MainAxisAlignment.spaceBetween,
             children: [
-              const Text(
+              Text(
                 'Record Audio',
                 style: TextStyle(
                   color: AppColors.textPrimary,
@@ -236,7 +236,7 @@ class _AudioRecorderWidgetState extends State<AudioRecorderWidget> {
               ),
             ),
             child: _isProcessing
-                ? const Center(
+                ? Center(
                     child: CircularProgressIndicator(
                       color: AppColors.audioTrack,
                       strokeWidth: 2,
@@ -271,7 +271,7 @@ class _AudioRecorderWidgetState extends State<AudioRecorderWidget> {
           // Timer display
           Text(
             _formatDuration(_recordingDuration),
-            style: const TextStyle(
+            style: TextStyle(
               color: AppColors.textPrimary,
               fontSize: 32,
               fontWeight: FontWeight.w300,
@@ -308,7 +308,7 @@ class _AudioRecorderWidgetState extends State<AudioRecorderWidget> {
                   onPressed: _cancelRecording,
                   style: OutlinedButton.styleFrom(
                     foregroundColor: AppColors.textTertiary,
-                    side: const BorderSide(color: AppColors.border),
+                    side: BorderSide(color: AppColors.border),
                     padding: const EdgeInsets.symmetric(
                         horizontal: 16, vertical: 10),
                   ),
@@ -334,7 +334,7 @@ class _AudioRecorderWidgetState extends State<AudioRecorderWidget> {
           // Help text
           if (!_isRecording) ...[
             const SizedBox(height: 12),
-            const Text(
+            Text(
               ' buttonTap the above to start recording your voice or audio',
               textAlign: TextAlign.center,
               style: TextStyle(

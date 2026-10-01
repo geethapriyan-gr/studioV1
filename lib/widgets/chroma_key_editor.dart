@@ -35,7 +35,7 @@ class _ChromaKeyEditorState extends State<ChromaKeyEditor> {
                 child: Row(
                   mainAxisAlignment: MainAxisAlignment.spaceBetween,
                   children: [
-                    const Text(
+                    Text(
                       'Chroma Key',
                       style: TextStyle(
                         color: AppColors.textPrimary,
@@ -44,7 +44,7 @@ class _ChromaKeyEditorState extends State<ChromaKeyEditor> {
                       ),
                     ),
                     IconButton(
-                      icon: const Icon(Icons.refresh,
+                      icon: Icon(Icons.refresh,
                           color: AppColors.textTertiary, size: 18),
                       onPressed: () => provider.resetChromaKey(),
                       tooltip: 'Reset',
@@ -67,7 +67,7 @@ class _ChromaKeyEditorState extends State<ChromaKeyEditor> {
                       const SizedBox(height: 4),
 
                       // ── Background Section ────────────────────────────────
-                      const Text(
+                      Text(
                         'Background',
                         style: TextStyle(
                             color: AppColors.textTertiary, fontSize: 11),
@@ -106,7 +106,7 @@ class _ChromaKeyEditorState extends State<ChromaKeyEditor> {
 
                       // Available backgrounds list
                       if (backgrounds.isNotEmpty) ...[
-                        const Text(
+                        Text(
                           'Available Backgrounds',
                           style: TextStyle(
                               color: AppColors.textTertiary, fontSize: 11),
@@ -139,7 +139,7 @@ class _ChromaKeyEditorState extends State<ChromaKeyEditor> {
                       const SizedBox(height: 16),
 
                       // ── Key Color Section ─────────────────────────────────
-                      const Text(
+                      Text(
                         'Key Color',
                         style: TextStyle(
                             color: AppColors.textTertiary, fontSize: 11),
@@ -152,7 +152,7 @@ class _ChromaKeyEditorState extends State<ChromaKeyEditor> {
                       const SizedBox(height: 16),
 
                       // ── Keying Parameters ─────────────────────────────────
-                      const Text(
+                      Text(
                         'Keying Parameters',
                         style: TextStyle(
                             color: AppColors.textTertiary, fontSize: 11),
@@ -186,7 +186,7 @@ class _ChromaKeyEditorState extends State<ChromaKeyEditor> {
                       const SizedBox(height: 16),
 
                       // ── Position & Scale ──────────────────────────────────
-                      const Text(
+                      Text(
                         'Position & Scale',
                         style: TextStyle(
                             color: AppColors.textTertiary, fontSize: 11),
@@ -248,10 +248,10 @@ class _ChromaKeyEditorState extends State<ChromaKeyEditor> {
                           children: [
                             Row(
                               children: [
-                                const Icon(Icons.tips_and_updates_outlined,
+                                Icon(Icons.tips_and_updates_outlined,
                                     color: AppColors.primary, size: 16),
                                 const SizedBox(width: 8),
-                                const Text(
+                                Text(
                                   'Tips for best results',
                                   style: TextStyle(
                                     color: AppColors.textSecondary,
@@ -262,7 +262,7 @@ class _ChromaKeyEditorState extends State<ChromaKeyEditor> {
                               ],
                             ),
                             const SizedBox(height: 8),
-                            const Text(
+                            Text(
                               '• Start with Similarity ~0.30 and Blend ~0.05\n'
                               '• Increase Similarity to remove more green\n'
                               '• Increase Blend to soften harsh edges\n'
@@ -305,14 +305,14 @@ class _ChromaKeyEditorState extends State<ChromaKeyEditor> {
               value: provider.chromaKeyProcessingProgress,
               backgroundColor: AppColors.surfaceLight,
               valueColor:
-                  const AlwaysStoppedAnimation<Color>(AppColors.primary),
+                  AlwaysStoppedAnimation<Color>(AppColors.primary),
               minHeight: 6,
             ),
           ),
           const SizedBox(height: 8),
           Text(
             'Processing… ${(provider.chromaKeyProcessingProgress * 100).toInt()}%',
-            style: const TextStyle(
+            style: TextStyle(
                 color: AppColors.textTertiary, fontSize: 12),
           ),
           const SizedBox(height: 8),
@@ -374,7 +374,7 @@ class _ChromaKeyEditorState extends State<ChromaKeyEditor> {
               )
             ],
           ),
-          child: const Row(
+          child: Row(
             mainAxisAlignment: MainAxisAlignment.center,
             children: [
               Icon(
@@ -457,7 +457,7 @@ class _ChromaKeyEditorState extends State<ChromaKeyEditor> {
             const SizedBox(height: 6),
             Text(
               label,
-              style: const TextStyle(
+              style: TextStyle(
                 color: AppColors.textSecondary,
                 fontSize: 10,
                 fontWeight: FontWeight.w400,
@@ -489,12 +489,12 @@ class _ChromaKeyEditorState extends State<ChromaKeyEditor> {
               width: 80,
               height: 60,
               child: isVideo
-                  ? const Icon(Icons.videocam_outlined,
+                  ? Icon(Icons.videocam_outlined,
                       color: AppColors.textTertiary, size: 28)
                   : Image.file(
                       File(path),
                       fit: BoxFit.cover,
-                      errorBuilder: (_, __, ___) => const Icon(
+                      errorBuilder: (_, __, ___) => Icon(
                         Icons.broken_image_outlined,
                         color: AppColors.textTertiary,
                       ),
@@ -505,13 +505,13 @@ class _ChromaKeyEditorState extends State<ChromaKeyEditor> {
           Expanded(
             child: Text(
               p.basename(path),
-              style: const TextStyle(
+              style: TextStyle(
                   color: AppColors.textSecondary, fontSize: 12),
               overflow: TextOverflow.ellipsis,
             ),
           ),
           IconButton(
-            icon: const Icon(Icons.close,
+            icon: Icon(Icons.close,
                 color: AppColors.textTertiary, size: 18),
             onPressed: () => provider.updateChromaKeySettings(
               backgroundPath: null,
@@ -563,7 +563,7 @@ class _ChromaKeyEditorState extends State<ChromaKeyEditor> {
                 child: isVideo
                     ? Container(
                         color: AppColors.surfaceLight,
-                        child: const Icon(Icons.videocam_outlined,
+                        child: Icon(Icons.videocam_outlined,
                             color: AppColors.textTertiary, size: 28),
                       )
                     : Image.file(
@@ -571,7 +571,7 @@ class _ChromaKeyEditorState extends State<ChromaKeyEditor> {
                         fit: BoxFit.cover,
                         errorBuilder: (_, __, ___) => Container(
                           color: AppColors.surfaceLight,
-                          child: const Icon(Icons.broken_image_outlined,
+                          child: Icon(Icons.broken_image_outlined,
                               color: AppColors.textTertiary),
                         ),
                       ),

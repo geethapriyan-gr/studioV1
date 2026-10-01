@@ -167,7 +167,7 @@ class _DraggableStickerWidgetState extends State<_DraggableStickerWidget> {
             child: Container(
               width: 40,
               height: 40,
-              decoration: const BoxDecoration(
+              decoration: BoxDecoration(
                 color: AppColors.primary,
                 shape: BoxShape.circle,
                 boxShadow: [BoxShadow(blurRadius: 4, color: Colors.black26)],

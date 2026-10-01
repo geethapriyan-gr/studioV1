@@ -2,6 +2,7 @@ import 'package:flutter/material.dart';
 import 'dart:math' as math;
 import 'dart:typed_data';
 import 'package:provider/provider.dart';
+import 'package:flutter/services.dart' show HapticFeedback;
 
 import '../providers/video_editor_provider.dart';
 import '../models/video_project.dart';
@@ -23,7 +24,8 @@ class OverlayClipDragData {
 class TimelineWidget extends StatefulWidget {
   const TimelineWidget({super.key});
 
-  static void showMixerDialog(BuildContext context, VideoEditorProvider provider) {
+  static void showMixerDialog(
+      BuildContext context, VideoEditorProvider provider) {
     final dialogWidth = math.min(ResponsiveUtil.screenWidth * 0.85, 320.0);
     showDialog(
       context: context,
@@ -36,9 +38,9 @@ class TimelineWidget extends StatefulWidget {
               backgroundColor: AppColors.surface,
               shape: RoundedRectangleBorder(
                 borderRadius: BorderRadius.circular(12),
-                side: const BorderSide(color: AppColors.border),
+                side: BorderSide(color: AppColors.border),
               ),
-              title: const Text('Audio Mixer',
+              title: Text('Audio Mixer',
                   style: TextStyle(color: AppColors.textPrimary)),
               content: SizedBox(
                 width: dialogWidth,
@@ -140,6 +142,75 @@ class _TimelineWidgetState extends State<TimelineWidget>
   bool _isUserScrolling = false;
   Duration? _lastSyncedPosition;
 
+  // ─── Snapping ───────────────────────────────────────────────
+  // While scrubbing, the playhead sticks to clip / text / sticker / audio
+  // edges within a few pixels, with a haptic tick on each new edge.
+  static const double _snapDistancePx = 10;
+  List<int> _snapPointsMs = const [];
+  Object? _snapSource;
+  int? _currentSnapMs;
+  final ValueNotifier<bool> _playheadSnapped = ValueNotifier(false);
+
+  List<int> _snapPoints(VideoEditorProvider provider) {
+    final project = provider.currentProject;
+    if (identical(project, _snapSource)) return _snapPointsMs;
+    _snapSource = project;
+    final set = <int>{0};
+    if (project != null) {
+      void add(Duration a, Duration b) {
+        set.add(a.inMilliseconds);
+        set.add(b.inMilliseconds);
+      }
+
+      for (final c in project.videoClips) {
+        add(c.startTime, c.endTime);
+      }
+      for (final c in project.overlayClips) {
+        add(c.startTime, c.endTime);
+      }
+      for (final t in project.textOverlays) {
+        add(t.startTime, t.endTime);
+      }
+      for (final s in project.stickers) {
+        add(s.startTime, s.endTime);
+      }
+      for (final a in project.audioOverlays) {
+        add(a.startTime, a.endTime);
+      }
+      set.add(provider.totalDuration.inMilliseconds);
+    }
+    _snapPointsMs = set.toList()..sort();
+    return _snapPointsMs;
+  }
+
+  /// Nearest snap point within [_snapDistancePx] of [ms], if any.
+  int? _snapTarget(VideoEditorProvider provider, int ms) {
+    final points = _snapPoints(provider);
+    if (points.isEmpty || _timelineScale <= 0) return null;
+    final threshold = _snapDistancePx / _timelineScale;
+    int? best;
+    var bestDist = double.infinity;
+    for (final p in points) {
+      final d = (p - ms).abs().toDouble();
+      if (d <= threshold && d < bestDist) {
+        best = p;
+        bestDist = d;
+      }
+    }
+    return best;
+  }
+
+  /// Zooms so the whole project fits the timeline width (keeping the
+  /// playhead time centred).
+  void _fitAll(VideoEditorProvider provider) {
+    final totalMs = provider.totalDuration.inMilliseconds;
+    if (totalMs <= 0 || _viewportWidth <= 0) return;
+    HapticFeedback.selectionClick();
+    _zoomAnimController.stop();
+    _captureZoomCenter();
+    _animateZoomTo((_viewportWidth * 0.86) / totalMs);
+  }
+
   // Frame thumbnail cache for timeline preview (global, path-based)
   final VideoThumbnailService _thumbnailService = VideoThumbnailService();
   // Track which video paths are currently loading thumbnails
@@ -188,6 +259,7 @@ class _TimelineWidgetState extends State<TimelineWidget>
   void dispose() {
     _scrollController.removeListener(_onScrollChanged);
     _scrollController.dispose();
+    _playheadSnapped.dispose();
     _zoomAnimController.removeListener(_onZoomAnimTick);
     _zoomAnimController.dispose();
     super.dispose();
@@ -307,6 +379,13 @@ class _TimelineWidgetState extends State<TimelineWidget>
         if (position > maxDuration) {
           position = maxDuration;
         }
+        final snap = _snapTarget(provider, position.inMilliseconds);
+        if (snap != null) {
+          position = Duration(milliseconds: snap);
+          if (_currentSnapMs != snap) HapticFeedback.selectionClick();
+        }
+        _currentSnapMs = snap;
+        _playheadSnapped.value = snap != null;
         provider.seekTo(position);
         _lastSyncedPosition = position;
       }
@@ -326,6 +405,19 @@ class _TimelineWidgetState extends State<TimelineWidget>
       // Fires after the drag and any fling have settled.
       if (_isUserScrolling) {
         _isUserScrolling = false;
+        // Land exactly on the snapped edge.
+        final snap = _currentSnapMs;
+        if (snap != null && _scrollController.hasClients) {
+          final target = (snap * _timelineScale)
+              .clamp(0.0, _scrollController.position.maxScrollExtent);
+          WidgetsBinding.instance.addPostFrameCallback((_) {
+            if (_scrollController.hasClients) {
+              _scrollController.jumpTo(target);
+            }
+          });
+        }
+        _currentSnapMs = null;
+        _playheadSnapped.value = false;
         Provider.of<VideoEditorProvider>(context, listen: false).endScrub();
       }
     }
@@ -445,7 +537,7 @@ class _TimelineWidgetState extends State<TimelineWidget>
       builder: (context, provider, child) {
         _thumbnailService.setPlaybackActive(provider.isPlaying);
         if (!provider.hasProject) {
-          return const Center(
+          return Center(
             child: Text(
               'No project loaded',
               style: TextStyle(color: AppColors.textTertiary, fontSize: 13),
@@ -579,6 +671,12 @@ class _TimelineWidgetState extends State<TimelineWidget>
                           ),
                         ),
                         _buildCenteredPlayhead(),
+                        // Fit the whole project in view.
+                        Positioned(
+                          right: 6,
+                          top: 2,
+                          child: _FitAllButton(onTap: () => _fitAll(provider)),
+                        ),
                       ],
                     ),
                   ),
@@ -597,37 +695,55 @@ class _TimelineWidgetState extends State<TimelineWidget>
       top: 0,
       bottom: 0,
       child: IgnorePointer(
-        child: Column(
-          children: [
-            Container(
-              width: 12,
-              height: 12,
-              decoration: const BoxDecoration(
-                color: AppColors.primary,
-                shape: BoxShape.circle,
-              ),
-              child: const Icon(
-                Icons.arrow_drop_down,
-                color: AppColors.textPrimary,
-                size: 10,
-              ),
+        child: ValueListenableBuilder<bool>(
+          valueListenable: _playheadSnapped,
+          builder: (context, snapped, child) => AnimatedContainer(
+            duration: const Duration(milliseconds: 120),
+            decoration: BoxDecoration(
+              boxShadow: snapped
+                  ? [
+                      BoxShadow(
+                        color: AppColors.primaryLight.withValues(alpha: 0.9),
+                        blurRadius: 10,
+                        spreadRadius: 1,
+                      ),
+                    ]
+                  : const [],
             ),
-            Expanded(
-              child: Container(
-                width: 2,
+            child: child,
+          ),
+          child: Column(
+            children: [
+              Container(
+                width: 12,
+                height: 12,
                 decoration: BoxDecoration(
                   color: AppColors.primary,
-                  boxShadow: [
-                    BoxShadow(
-                      color: AppColors.primary.withOpacity(0.4),
-                      blurRadius: 4,
-                      spreadRadius: 0,
-                    ),
-                  ],
+                  shape: BoxShape.circle,
+                ),
+                child: Icon(
+                  Icons.arrow_drop_down,
+                  color: AppColors.textPrimary,
+                  size: 10,
                 ),
               ),
-            ),
-          ],
+              Expanded(
+                child: Container(
+                  width: 2,
+                  decoration: BoxDecoration(
+                    color: AppColors.primary,
+                    boxShadow: [
+                      BoxShadow(
+                        color: AppColors.primary.withOpacity(0.4),
+                        blurRadius: 4,
+                        spreadRadius: 0,
+                      ),
+                    ],
+                  ),
+                ),
+              ),
+            ],
+          ),
         ),
       ),
     );
@@ -636,14 +752,13 @@ class _TimelineWidgetState extends State<TimelineWidget>
   Widget _buildTimelineHeader(VideoEditorProvider provider) {
     return Container(
       height: ResponsiveUtil.getHeight(40),
-      decoration: const BoxDecoration(
+      decoration: BoxDecoration(
         color: AppColors.surface,
         border: Border(bottom: BorderSide(color: AppColors.border, width: 1)),
       ),
       alignment: Alignment.centerLeft,
       child: Padding(
-        padding: EdgeInsets.symmetric(
-            horizontal: ResponsiveUtil.paddingMedium),
+        padding: EdgeInsets.symmetric(horizontal: ResponsiveUtil.paddingMedium),
         child: Text(
           'Timeline',
           style: TextStyle(
@@ -679,7 +794,7 @@ class _TimelineWidgetState extends State<TimelineWidget>
         children: [
           Container(
             height: _timelineHeight,
-            decoration: const BoxDecoration(
+            decoration: BoxDecoration(
               border:
                   Border(bottom: BorderSide(color: AppColors.border, width: 1)),
             ),
@@ -692,7 +807,9 @@ class _TimelineWidgetState extends State<TimelineWidget>
             ),
           for (int i = 0; i < stickerAllocation.trackCount; i++)
             _buildTrackControlPanel(
-              stickerAllocation.trackCount > 1 ? 'Sticker ${i + 1}' : 'Stickers',
+              stickerAllocation.trackCount > 1
+                  ? 'Sticker ${i + 1}'
+                  : 'Stickers',
               Icons.emoji_emotions,
               () => _openStickerPanel(provider),
             ),
@@ -737,7 +854,7 @@ class _TimelineWidgetState extends State<TimelineWidget>
               const SizedBox(height: 2),
               Text(
                 title,
-                style: const TextStyle(
+                style: TextStyle(
                   color: AppColors.textTertiary,
                   fontSize: 8,
                   fontWeight: FontWeight.w500,
@@ -752,7 +869,7 @@ class _TimelineWidgetState extends State<TimelineWidget>
                     color: AppColors.primary.withOpacity(0.2),
                     shape: BoxShape.circle,
                   ),
-                  child: const Icon(
+                  child: Icon(
                     Icons.add,
                     size: 12,
                     color: AppColors.primary,
@@ -825,7 +942,7 @@ class _TimelineWidgetState extends State<TimelineWidget>
         height: 48,
         decoration: BoxDecoration(
           borderRadius: BorderRadius.circular(10),
-          gradient: const LinearGradient(
+          gradient: LinearGradient(
             begin: Alignment.topLeft,
             end: Alignment.bottomRight,
             colors: [
@@ -841,7 +958,7 @@ class _TimelineWidgetState extends State<TimelineWidget>
             ),
           ],
         ),
-        child: const Center(
+        child: Center(
           child: Icon(Icons.add, color: AppColors.textPrimary, size: 20),
         ),
       ),
@@ -861,7 +978,7 @@ class _TimelineWidgetState extends State<TimelineWidget>
 
     return Container(
       height: _timelineHeight,
-      decoration: const BoxDecoration(
+      decoration: BoxDecoration(
         color: AppColors.surfaceLight,
         border: Border(bottom: BorderSide(color: AppColors.border, width: 1)),
       ),
@@ -1010,8 +1127,8 @@ class _TimelineWidgetState extends State<TimelineWidget>
     return indicators;
   }
 
-  Widget _buildTextOverlayTrack(
-      VideoEditorProvider provider, int trackIndex, TrackAllocationResult textAllocation) {
+  Widget _buildTextOverlayTrack(VideoEditorProvider provider, int trackIndex,
+      TrackAllocationResult textAllocation) {
     return DragTarget<TextOverlay>(
       key: ValueKey('text_track_$trackIndex'),
       onWillAcceptWithDetails: (_) => true,
@@ -1061,8 +1178,8 @@ class _TimelineWidgetState extends State<TimelineWidget>
     );
   }
 
-  Widget _buildOverlayTrack(
-      VideoEditorProvider provider, int trackIndex, TrackAllocationResult overlayAllocation) {
+  Widget _buildOverlayTrack(VideoEditorProvider provider, int trackIndex,
+      TrackAllocationResult overlayAllocation) {
     return DragTarget<OverlayClipDragData>(
       key: ValueKey('overlay_track_$trackIndex'),
       onWillAcceptWithDetails: (_) => true,
@@ -1118,8 +1235,8 @@ class _TimelineWidgetState extends State<TimelineWidget>
     );
   }
 
-  Widget _buildStickerTrack(
-      VideoEditorProvider provider, int trackIndex, TrackAllocationResult stickerAllocation) {
+  Widget _buildStickerTrack(VideoEditorProvider provider, int trackIndex,
+      TrackAllocationResult stickerAllocation) {
     return DragTarget<StickerModel>(
       key: ValueKey('sticker_track_$trackIndex'),
       onWillAcceptWithDetails: (_) => true,
@@ -1140,7 +1257,8 @@ class _TimelineWidgetState extends State<TimelineWidget>
 
         final trackStickers = (provider.currentProject?.stickers ?? [])
             .where((sticker) =>
-                (stickerAllocation.itemToTrackMap[sticker.id] ?? 0) == trackIndex)
+                (stickerAllocation.itemToTrackMap[sticker.id] ?? 0) ==
+                trackIndex)
             .toList();
 
         return Container(
@@ -1201,8 +1319,7 @@ class _TimelineWidgetState extends State<TimelineWidget>
                 child: Center(
                   child: Text(
                     'Sticker',
-                    style: const TextStyle(
-                        color: AppColors.textPrimary, fontSize: 9),
+                    style: TextStyle(color: AppColors.textPrimary, fontSize: 9),
                     overflow: TextOverflow.ellipsis,
                   ),
                 ),
@@ -1234,8 +1351,7 @@ class _TimelineWidgetState extends State<TimelineWidget>
                 child: Center(
                   child: Text(
                     'Sticker',
-                    style: const TextStyle(
-                        color: AppColors.textPrimary, fontSize: 9),
+                    style: TextStyle(color: AppColors.textPrimary, fontSize: 9),
                     overflow: TextOverflow.ellipsis,
                   ),
                 ),
@@ -1265,12 +1381,12 @@ class _TimelineWidgetState extends State<TimelineWidget>
                 child: Container(
                   width: 8,
                   margin: const EdgeInsets.only(left: 8),
-                  decoration: const BoxDecoration(
+                  decoration: BoxDecoration(
                     color: AppColors.textPrimary,
                     borderRadius:
                         BorderRadius.horizontal(left: Radius.circular(3)),
                   ),
-                  child: const Icon(Icons.chevron_left,
+                  child: Icon(Icons.chevron_left,
                       size: 8, color: AppColors.background),
                 ),
               ),
@@ -1296,12 +1412,12 @@ class _TimelineWidgetState extends State<TimelineWidget>
                 child: Container(
                   width: 8,
                   margin: const EdgeInsets.only(right: 8),
-                  decoration: const BoxDecoration(
+                  decoration: BoxDecoration(
                     color: AppColors.textPrimary,
                     borderRadius:
                         BorderRadius.horizontal(right: Radius.circular(3)),
                   ),
-                  child: const Icon(Icons.chevron_right,
+                  child: Icon(Icons.chevron_right,
                       size: 8, color: AppColors.background),
                 ),
               ),
@@ -1312,8 +1428,8 @@ class _TimelineWidgetState extends State<TimelineWidget>
     );
   }
 
-  Widget _buildAudioOverlayTrack(
-      VideoEditorProvider provider, int trackIndex, TrackAllocationResult audioAllocation) {
+  Widget _buildAudioOverlayTrack(VideoEditorProvider provider, int trackIndex,
+      TrackAllocationResult audioAllocation) {
     return DragTarget<AudioOverlay>(
       key: ValueKey('audio_track_$trackIndex'),
       onWillAcceptWithDetails: (_) => true,
@@ -1361,9 +1477,8 @@ class _TimelineWidgetState extends State<TimelineWidget>
                   ),
                   child: const SizedBox.shrink(),
                 ),
-                ...trackAudios
-                    .map(
-                        (overlay) => _buildAudioOverlayWidget(overlay, provider)),
+                ...trackAudios.map(
+                    (overlay) => _buildAudioOverlayWidget(overlay, provider)),
               ],
             ),
           ),
@@ -1413,7 +1528,7 @@ class _TimelineWidgetState extends State<TimelineWidget>
                     ),
                   ],
                 ),
-                child: const Stack(
+                child: Stack(
                   children: [
                     Center(
                       child: Column(
@@ -1494,7 +1609,7 @@ class _TimelineWidgetState extends State<TimelineWidget>
                         child: Row(
                           mainAxisSize: MainAxisSize.min,
                           children: [
-                            const Icon(Icons.layers,
+                            Icon(Icons.layers,
                                 color: AppColors.textPrimary, size: 9),
                             const SizedBox(width: 2),
                             Text(
@@ -1542,33 +1657,37 @@ class _TimelineWidgetState extends State<TimelineWidget>
                 onHorizontalDragUpdate: (details) {
                   final deltaMs = (details.delta.dx / _timelineScale).round();
                   final delta = Duration(milliseconds: deltaMs);
-                  final isImage = clip.mediaType == MediaType.image || clip.imageFile != null;
-                  
+                  final isImage = clip.mediaType == MediaType.image ||
+                      clip.imageFile != null;
+
                   if (isImage) {
                     final newStartTime = clip.startTime + delta;
                     if (newStartTime < Duration.zero ||
-                        newStartTime >= clip.endTime - const Duration(milliseconds: 100)) {
+                        newStartTime >=
+                            clip.endTime - const Duration(milliseconds: 100)) {
                       return;
                     }
                     provider.trimOverlayClip(clip.id, delta, clip.trimEnd);
                   } else {
                     final newTrimStart = clip.trimStart + delta;
                     if (newTrimStart < clip.sourceStart ||
-                        newTrimStart >= clip.trimEnd - const Duration(milliseconds: 100)) {
+                        newTrimStart >=
+                            clip.trimEnd - const Duration(milliseconds: 100)) {
                       return;
                     }
-                    provider.trimOverlayClip(clip.id, newTrimStart, clip.trimEnd);
+                    provider.trimOverlayClip(
+                        clip.id, newTrimStart, clip.trimEnd);
                   }
                 },
                 child: Container(
                   width: 8,
                   margin: const EdgeInsets.only(left: 8),
-                  decoration: const BoxDecoration(
+                  decoration: BoxDecoration(
                     color: AppColors.textPrimary,
                     borderRadius:
                         BorderRadius.horizontal(left: Radius.circular(3)),
                   ),
-                  child: const Icon(Icons.chevron_left,
+                  child: Icon(Icons.chevron_left,
                       size: 8, color: AppColors.background),
                 ),
               ),
@@ -1583,10 +1702,12 @@ class _TimelineWidgetState extends State<TimelineWidget>
                 onHorizontalDragUpdate: (details) {
                   final deltaMs = (details.delta.dx / _timelineScale).round();
                   final delta = Duration(milliseconds: deltaMs);
-                  final isImage = clip.mediaType == MediaType.image || clip.imageFile != null;
-                  
+                  final isImage = clip.mediaType == MediaType.image ||
+                      clip.imageFile != null;
+
                   final newTrimEnd = clip.trimEnd + delta;
-                  if (newTrimEnd <= clip.trimStart + const Duration(milliseconds: 100)) {
+                  if (newTrimEnd <=
+                      clip.trimStart + const Duration(milliseconds: 100)) {
                     return;
                   }
                   if (!isImage && newTrimEnd > clip.sourceEnd) {
@@ -1597,12 +1718,12 @@ class _TimelineWidgetState extends State<TimelineWidget>
                 child: Container(
                   width: 8,
                   margin: const EdgeInsets.only(right: 8),
-                  decoration: const BoxDecoration(
+                  decoration: BoxDecoration(
                     color: AppColors.textPrimary,
                     borderRadius:
                         BorderRadius.horizontal(right: Radius.circular(3)),
                   ),
-                  child: const Icon(Icons.chevron_right,
+                  child: Icon(Icons.chevron_right,
                       size: 8, color: AppColors.background),
                 ),
               ),
@@ -1672,7 +1793,7 @@ class _TimelineWidgetState extends State<TimelineWidget>
                     ),
                   ],
                 ),
-                child: const Stack(
+                child: Stack(
                   children: [
                     Center(
                       child: Column(
@@ -1851,7 +1972,7 @@ class _TimelineWidgetState extends State<TimelineWidget>
                     maxLines: 1,
                     overflow: TextOverflow.ellipsis,
                     textAlign: TextAlign.center,
-                    style: const TextStyle(
+                    style: TextStyle(
                       color: AppColors.textPrimary,
                       fontSize: 8,
                       fontWeight: FontWeight.w700,
@@ -1898,12 +2019,12 @@ class _TimelineWidgetState extends State<TimelineWidget>
                 child: Container(
                   width: 8,
                   margin: const EdgeInsets.only(left: 8),
-                  decoration: const BoxDecoration(
+                  decoration: BoxDecoration(
                     color: AppColors.textPrimary,
                     borderRadius:
                         BorderRadius.horizontal(left: Radius.circular(3)),
                   ),
-                  child: const Icon(Icons.chevron_left,
+                  child: Icon(Icons.chevron_left,
                       size: 8, color: AppColors.background),
                 ),
               ),
@@ -1954,12 +2075,12 @@ class _TimelineWidgetState extends State<TimelineWidget>
                 child: Container(
                   width: 8,
                   margin: const EdgeInsets.only(right: 8),
-                  decoration: const BoxDecoration(
+                  decoration: BoxDecoration(
                     color: AppColors.textPrimary,
                     borderRadius:
                         BorderRadius.horizontal(right: Radius.circular(3)),
                   ),
-                  child: const Icon(Icons.chevron_right,
+                  child: Icon(Icons.chevron_right,
                       size: 8, color: AppColors.background),
                 ),
               ),
@@ -2020,11 +2141,11 @@ class _TimelineWidgetState extends State<TimelineWidget>
                             borderRadius: BorderRadius.circular(10),
                             border: Border.all(color: AppColors.border),
                           ),
-                          child: const Icon(Icons.swap_horiz,
+                          child: Icon(Icons.swap_horiz,
                               color: AppColors.textPrimary, size: 18),
                         ),
                         const SizedBox(width: 10),
-                        const Expanded(
+                        Expanded(
                           child: Text(
                             'Transitions',
                             style: TextStyle(
@@ -2102,7 +2223,7 @@ class _TimelineWidgetState extends State<TimelineWidget>
                                     maxLines: 1,
                                     overflow: TextOverflow.ellipsis,
                                     textAlign: TextAlign.center,
-                                    style: const TextStyle(
+                                    style: TextStyle(
                                       color: AppColors.textPrimary,
                                       fontSize: 10,
                                       fontWeight: FontWeight.w600,
@@ -2119,7 +2240,7 @@ class _TimelineWidgetState extends State<TimelineWidget>
                     Row(
                       mainAxisAlignment: MainAxisAlignment.spaceBetween,
                       children: [
-                        const Text(
+                        Text(
                           'Duration',
                           style: TextStyle(
                             color: AppColors.textSecondary,
@@ -2129,7 +2250,7 @@ class _TimelineWidgetState extends State<TimelineWidget>
                         ),
                         Text(
                           '${selectedDuration.inMilliseconds}ms',
-                          style: const TextStyle(
+                          style: TextStyle(
                             color: AppColors.textSecondary,
                             fontSize: 12,
                             fontWeight: FontWeight.w600,
@@ -2543,8 +2664,7 @@ class _TimelineWidgetState extends State<TimelineWidget>
                 child: Center(
                   child: Text(
                     overlay.text,
-                    style: const TextStyle(
-                        color: AppColors.textPrimary, fontSize: 9),
+                    style: TextStyle(color: AppColors.textPrimary, fontSize: 9),
                     overflow: TextOverflow.ellipsis,
                   ),
                 ),
@@ -2578,8 +2698,7 @@ class _TimelineWidgetState extends State<TimelineWidget>
                 child: Center(
                   child: Text(
                     overlay.text,
-                    style: const TextStyle(
-                        color: AppColors.textPrimary, fontSize: 9),
+                    style: TextStyle(color: AppColors.textPrimary, fontSize: 9),
                     overflow: TextOverflow.ellipsis,
                   ),
                 ),
@@ -2613,12 +2732,12 @@ class _TimelineWidgetState extends State<TimelineWidget>
                 child: Container(
                   width: 8,
                   margin: const EdgeInsets.only(left: 8),
-                  decoration: const BoxDecoration(
+                  decoration: BoxDecoration(
                     color: AppColors.textPrimary,
                     borderRadius:
                         BorderRadius.horizontal(left: Radius.circular(3)),
                   ),
-                  child: const Icon(Icons.chevron_left,
+                  child: Icon(Icons.chevron_left,
                       size: 8, color: AppColors.background),
                 ),
               ),
@@ -2649,12 +2768,12 @@ class _TimelineWidgetState extends State<TimelineWidget>
                 child: Container(
                   width: 8,
                   margin: const EdgeInsets.only(right: 8),
-                  decoration: const BoxDecoration(
+                  decoration: BoxDecoration(
                     color: AppColors.textPrimary,
                     borderRadius:
                         BorderRadius.horizontal(right: Radius.circular(3)),
                   ),
-                  child: const Icon(Icons.chevron_right,
+                  child: Icon(Icons.chevron_right,
                       size: 8, color: AppColors.background),
                 ),
               ),
@@ -2742,7 +2861,7 @@ class _TimelineWidgetState extends State<TimelineWidget>
                         height: _trackHeight - 12,
                       );
                     } else {
-                      return const Center(
+                      return Center(
                         child: Icon(Icons.audiotrack,
                             size: 14, color: AppColors.textPrimary),
                       );
@@ -2780,12 +2899,12 @@ class _TimelineWidgetState extends State<TimelineWidget>
                 child: Container(
                   width: 8,
                   margin: const EdgeInsets.only(left: 8),
-                  decoration: const BoxDecoration(
+                  decoration: BoxDecoration(
                     color: AppColors.textPrimary,
                     borderRadius:
                         BorderRadius.horizontal(left: Radius.circular(3)),
                   ),
-                  child: const Icon(Icons.chevron_left,
+                  child: Icon(Icons.chevron_left,
                       size: 8, color: AppColors.background),
                 ),
               ),
@@ -2816,12 +2935,12 @@ class _TimelineWidgetState extends State<TimelineWidget>
                 child: Container(
                   width: 8,
                   margin: const EdgeInsets.only(right: 8),
-                  decoration: const BoxDecoration(
+                  decoration: BoxDecoration(
                     color: AppColors.textPrimary,
                     borderRadius:
                         BorderRadius.horizontal(right: Radius.circular(3)),
                   ),
-                  child: const Icon(Icons.chevron_right,
+                  child: Icon(Icons.chevron_right,
                       size: 8, color: AppColors.background),
                 ),
               ),
@@ -2844,11 +2963,12 @@ class _TimelineWidgetState extends State<TimelineWidget>
       } catch (_) {}
     }
 
-    final bool hasOverlayVideoSelection = provider.selectedOverlayClipId != null &&
-        (provider.currentProject?.overlayClips.any((c) =>
-                c.id == provider.selectedOverlayClipId &&
-                c.mediaType == MediaType.video) ??
-            false);
+    final bool hasOverlayVideoSelection =
+        provider.selectedOverlayClipId != null &&
+            (provider.currentProject?.overlayClips.any((c) =>
+                    c.id == provider.selectedOverlayClipId &&
+                    c.mediaType == MediaType.video) ??
+                false);
     VideoClip? selectedOverlayClip;
     if (hasOverlayVideoSelection) {
       try {
@@ -2861,7 +2981,7 @@ class _TimelineWidgetState extends State<TimelineWidget>
 
     return Container(
       height: 60,
-      decoration: const BoxDecoration(
+      decoration: BoxDecoration(
         color: AppColors.surface,
         border: Border(bottom: BorderSide(color: AppColors.border, width: 1)),
       ),
@@ -2903,12 +3023,10 @@ class _TimelineWidgetState extends State<TimelineWidget>
                 : null,
             tooltip: 'Delete',
             color: hasItemSelection ? AppColors.error : null,
-            backgroundColor: hasItemSelection
-                ? AppColors.error.withOpacity(0.15)
-                : null,
-            borderColor: hasItemSelection
-                ? AppColors.error.withOpacity(0.5)
-                : null,
+            backgroundColor:
+                hasItemSelection ? AppColors.error.withOpacity(0.15) : null,
+            borderColor:
+                hasItemSelection ? AppColors.error.withOpacity(0.5) : null,
           ),
           _buildControlButton(
             icon: Icons.redo,
@@ -2917,9 +3035,10 @@ class _TimelineWidgetState extends State<TimelineWidget>
           ),
           if (hasOverlayVideoSelection && selectedOverlayClip != null) ...[
             _buildControlButton(
-              icon: selectedOverlayClip.isMuted || selectedOverlayClip.volume == 0
-                  ? Icons.volume_off_outlined
-                  : Icons.volume_up_outlined,
+              icon:
+                  selectedOverlayClip.isMuted || selectedOverlayClip.volume == 0
+                      ? Icons.volume_off_outlined
+                      : Icons.volume_up_outlined,
               onPressed: () => _showOverlayVolumeDialog(
                 context,
                 provider,
@@ -3010,12 +3129,13 @@ class _TimelineWidgetState extends State<TimelineWidget>
                                 : (currentVol == 0
                                     ? Icons.volume_mute_rounded
                                     : Icons.volume_up_rounded),
-                            color: isMuted ? AppColors.error : AppColors.primary,
+                            color:
+                                isMuted ? AppColors.error : AppColors.primary,
                             size: 20,
                           ),
                         ),
                         const SizedBox(width: 12),
-                        const Expanded(
+                        Expanded(
                           child: Text(
                             'Overlay Volume',
                             style: TextStyle(
@@ -3066,7 +3186,7 @@ class _TimelineWidgetState extends State<TimelineWidget>
                     Row(
                       mainAxisAlignment: MainAxisAlignment.spaceBetween,
                       children: [
-                        const Text(
+                        Text(
                           'Volume Level',
                           style: TextStyle(
                             color: AppColors.textSecondary,
@@ -3094,8 +3214,9 @@ class _TimelineWidgetState extends State<TimelineWidget>
                             const RoundSliderThumbShape(enabledThumbRadius: 9),
                         overlayShape:
                             const RoundSliderOverlayShape(overlayRadius: 18),
-                        activeTrackColor:
-                            isMuted ? AppColors.textTertiary : AppColors.primary,
+                        activeTrackColor: isMuted
+                            ? AppColors.textTertiary
+                            : AppColors.primary,
                         inactiveTrackColor: AppColors.primary.withOpacity(0.2),
                         thumbColor: Colors.white,
                         overlayColor: AppColors.primary.withOpacity(0.15),
@@ -3143,7 +3264,7 @@ class _TimelineWidgetState extends State<TimelineWidget>
                             },
                             style: OutlinedButton.styleFrom(
                               foregroundColor: AppColors.textSecondary,
-                              side: const BorderSide(color: AppColors.border),
+                              side: BorderSide(color: AppColors.border),
                               padding: const EdgeInsets.symmetric(vertical: 12),
                               shape: RoundedRectangleBorder(
                                 borderRadius: BorderRadius.circular(10),
@@ -3374,7 +3495,7 @@ class _TimelineWidgetState extends State<TimelineWidget>
               color: AppColors.border.withOpacity(0.5),
               borderRadius: BorderRadius.circular(2),
             ),
-            child: const Center(
+            child: Center(
               child: Icon(Icons.block, color: AppColors.textTertiary, size: 10),
             ),
           ),
@@ -3402,7 +3523,7 @@ class _TimelineWidgetState extends State<TimelineWidget>
                 color: AppColors.border.withOpacity(0.5),
                 borderRadius: BorderRadius.circular(2),
               ),
-              child: const Center(
+              child: Center(
                 child:
                     Icon(Icons.block, color: AppColors.textTertiary, size: 10),
               ),
@@ -3431,7 +3552,7 @@ class _TimelineWidgetState extends State<TimelineWidget>
         offset.dy + button.size.height + 200,
       ),
       items: [
-        const PopupMenuItem(
+        PopupMenuItem(
           value: 'duplicate',
           child: Row(
             children: [
@@ -3442,7 +3563,7 @@ class _TimelineWidgetState extends State<TimelineWidget>
             ],
           ),
         ),
-        const PopupMenuItem(
+        PopupMenuItem(
           value: 'extract_audio',
           child: Row(
             children: [
@@ -3457,7 +3578,7 @@ class _TimelineWidgetState extends State<TimelineWidget>
       elevation: 8,
       shape: RoundedRectangleBorder(
         borderRadius: BorderRadius.circular(8),
-        side: const BorderSide(color: AppColors.border),
+        side: BorderSide(color: AppColors.border),
       ),
     ).then((value) {
       if (value == 'duplicate') {
@@ -3488,13 +3609,13 @@ class _TimelineWidgetState extends State<TimelineWidget>
         backgroundColor: AppColors.surface,
         shape: RoundedRectangleBorder(
           borderRadius: BorderRadius.circular(12),
-          side: const BorderSide(color: AppColors.border),
+          side: BorderSide(color: AppColors.border),
         ),
-        title: const Text('Delete Item',
-            style: TextStyle(color: AppColors.textPrimary)),
+        title:
+            Text('Delete Item', style: TextStyle(color: AppColors.textPrimary)),
         content: Text(
           'Are you sure you want to delete the selected $itemLabel?',
-          style: const TextStyle(color: AppColors.textSecondary),
+          style: TextStyle(color: AppColors.textSecondary),
         ),
         actions: [
           TextButton(
@@ -3545,18 +3666,18 @@ class TimeRulerPainter extends CustomPainter {
       60000, // 1 min
       30000, // 30s
       10000, // 10s
-      5000,  // 5s
-      2000,  // 2s
-      1000,  // 1s
-      500,   // 500ms
-      200,   // 200ms
-      100,   // 100ms
-      50,    // 50ms
-      20,    // 20ms
-      10,    // 10ms
-      5,     // 5ms
-      2,     // 2ms
-      1,     // 1ms
+      5000, // 5s
+      2000, // 2s
+      1000, // 1s
+      500, // 500ms
+      200, // 200ms
+      100, // 100ms
+      50, // 50ms
+      20, // 20ms
+      10, // 10ms
+      5, // 5ms
+      2, // 2ms
+      1, // 1ms
     ];
 
     // Find the smallest major interval that is >= 60 pixels wide
@@ -3599,7 +3720,8 @@ class TimeRulerPainter extends CustomPainter {
       final double x = ms * pxPerMs;
       final int msInt = ms.round();
       final bool isMajor = msInt % majorMs == 0;
-      final bool isMedium = divisor == 10 && (msInt % (majorMs ~/ 2) == 0) && !isMajor;
+      final bool isMedium =
+          divisor == 10 && (msInt % (majorMs ~/ 2) == 0) && !isMajor;
 
       if (isMajor) {
         canvas.drawLine(
@@ -3614,16 +3736,19 @@ class TimeRulerPainter extends CustomPainter {
 
         String timeText;
         if (majorMs < 1000) {
-          timeText = '${minutes.toString().padLeft(2, '0')}:${seconds.toString().padLeft(2, '0')}.${remainingMs.toString().padLeft(3, '0')}';
+          timeText =
+              '${minutes.toString().padLeft(2, '0')}:${seconds.toString().padLeft(2, '0')}.${remainingMs.toString().padLeft(3, '0')}';
         } else if (remainingMs > 0) {
-          timeText = '${seconds.toString()}.${(remainingMs ~/ 100).toString()}s';
+          timeText =
+              '${seconds.toString()}.${(remainingMs ~/ 100).toString()}s';
         } else {
-          timeText = '${minutes.toString().padLeft(2, '0')}:${seconds.toString().padLeft(2, '0')}';
+          timeText =
+              '${minutes.toString().padLeft(2, '0')}:${seconds.toString().padLeft(2, '0')}';
         }
 
         textPainter.text = TextSpan(
           text: timeText,
-          style: const TextStyle(
+          style: TextStyle(
             color: AppColors.textTertiary,
             fontSize: 9,
             fontWeight: FontWeight.w500,
@@ -3653,5 +3778,42 @@ class TimeRulerPainter extends CustomPainter {
     return oldDelegate.currentPosition != currentPosition ||
         oldDelegate.duration != duration ||
         oldDelegate.scale != scale;
+  }
+}
+
+/// Small "Fit" pill over the timeline: zooms so the whole project is visible.
+class _FitAllButton extends StatelessWidget {
+  final VoidCallback onTap;
+  const _FitAllButton({required this.onTap});
+
+  @override
+  Widget build(BuildContext context) {
+    return Material(
+      color: AppColors.surfaceLight.withValues(alpha: 0.92),
+      shape: StadiumBorder(side: BorderSide(color: AppColors.border)),
+      child: InkWell(
+        customBorder: const StadiumBorder(),
+        onTap: onTap,
+        child: Padding(
+          padding: const EdgeInsets.symmetric(horizontal: 10, vertical: 5),
+          child: Row(
+            mainAxisSize: MainAxisSize.min,
+            children: [
+              Icon(Icons.fit_screen_rounded,
+                  size: 15, color: AppColors.textSecondary),
+              const SizedBox(width: 4),
+              Text(
+                'Fit',
+                style: TextStyle(
+                  color: AppColors.textSecondary,
+                  fontSize: 11,
+                  fontWeight: FontWeight.w600,
+                ),
+              ),
+            ],
+          ),
+        ),
+      ),
+    );
   }
 }

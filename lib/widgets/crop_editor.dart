@@ -196,7 +196,7 @@ class _CropEditorState extends State<CropEditor> {
       builder: (context, provider, child) {
         final clipId = provider.selectedVideoClipId;
         if (clipId == null) {
-          return const Center(
+          return Center(
             child: Text(
               "Select a video clip to enable cropping",
               style: TextStyle(color: AppColors.textTertiary, fontSize: 13),
@@ -215,7 +215,7 @@ class _CropEditorState extends State<CropEditor> {
                 child: Row(
                   mainAxisAlignment: MainAxisAlignment.spaceBetween,
                   children: [
-                    const Text(
+                    Text(
                       "Crop & Rotate",
                       style: TextStyle(
                         color: AppColors.textPrimary,
@@ -224,7 +224,7 @@ class _CropEditorState extends State<CropEditor> {
                       ),
                     ),
                     IconButton(
-                      icon: const Icon(Icons.refresh,
+                      icon: Icon(Icons.refresh,
                           color: AppColors.textTertiary, size: 18),
                       onPressed: () {
                         _resetCrop();
@@ -248,7 +248,7 @@ class _CropEditorState extends State<CropEditor> {
                       // ============ ROTATION CONTROLS SECTION ============
 
                       // Quick Actions - Rotate & Mirror
-                      const Text(
+                      Text(
                         'Quick Actions',
                         style: TextStyle(
                             color: AppColors.textTertiary, fontSize: 11),
@@ -278,7 +278,7 @@ class _CropEditorState extends State<CropEditor> {
                       const SizedBox(height: 16),
 
                       // Fine Rotation Control
-                      const Text(
+                      Text(
                         'Rotation',
                         style: TextStyle(
                             color: AppColors.textTertiary, fontSize: 11),
@@ -327,7 +327,7 @@ class _CropEditorState extends State<CropEditor> {
                                   margin: const EdgeInsets.all(4),
                                   decoration: BoxDecoration(
                                     borderRadius: BorderRadius.circular(4),
-                                    gradient: const LinearGradient(
+                                    gradient: LinearGradient(
                                       colors: [
                                         AppColors.primary,
                                         AppColors.accent
@@ -336,7 +336,7 @@ class _CropEditorState extends State<CropEditor> {
                                       end: Alignment.centerRight,
                                     ),
                                   ),
-                                  child: const Center(
+                                  child: Center(
                                     child: Text(
                                       "F",
                                       style: TextStyle(
@@ -356,7 +356,7 @@ class _CropEditorState extends State<CropEditor> {
                                 children: [
                                   Text(
                                     'Angle: ${_currentRotation.toInt()}°',
-                                    style: const TextStyle(
+                                    style: TextStyle(
                                         color: AppColors.textPrimary,
                                         fontSize: 12,
                                         fontWeight: FontWeight.w500),
@@ -366,7 +366,7 @@ class _CropEditorState extends State<CropEditor> {
                                     _currentMirrored
                                         ? 'Mirrored'
                                         : 'Normal',
-                                    style: const TextStyle(
+                                    style: TextStyle(
                                         color: AppColors.textTertiary,
                                         fontSize: 10),
                                   ),
@@ -383,7 +383,7 @@ class _CropEditorState extends State<CropEditor> {
 
                       // ============ PLAYBACK SPEED SECTION ============
 
-                      const Text(
+                      Text(
                         'Playback Speed',
                         style: TextStyle(
                             color: AppColors.textTertiary, fontSize: 11),
@@ -452,7 +452,7 @@ class _CropEditorState extends State<CropEditor> {
 
                       // ============ REVERSE SECTION ============
 
-                      const Text(
+                      Text(
                         'Reverse Playback',
                         style: TextStyle(
                             color: AppColors.textTertiary, fontSize: 11),
@@ -576,7 +576,7 @@ class _CropEditorState extends State<CropEditor> {
           width: 44,
           child: Text(
             label,
-            style: const TextStyle(color: AppColors.textTertiary, fontSize: 10),
+            style: TextStyle(color: AppColors.textTertiary, fontSize: 10),
           ),
         ),
         Expanded(

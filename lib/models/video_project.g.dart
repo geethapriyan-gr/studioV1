@@ -30,13 +30,20 @@ class TextOverlayAdapter extends TypeAdapter<TextOverlay> {
       opacity: fields[10] as double,
       fontStyle: fields[11] as FontStyleEnum,
       textAlign: fields[12] as TextAlignEnum,
+      // Fields 13+ were added later; older projects read the defaults.
+      animIn: fields[13] as String? ?? 'none',
+      animOut: fields[14] as String? ?? 'none',
+      boxColor: fields[15] as Color?,
+      outlineColor: fields[16] as Color?,
+      outlineWidth: (fields[17] as num?)?.toDouble() ?? 0,
+      shadow: fields[18] as bool? ?? true,
     );
   }
 
   @override
   void write(BinaryWriter writer, TextOverlay obj) {
     writer
-      ..writeByte(13)
+      ..writeByte(19)
       ..writeByte(0)
       ..write(obj.id)
       ..writeByte(1)
@@ -62,7 +69,19 @@ class TextOverlayAdapter extends TypeAdapter<TextOverlay> {
       ..writeByte(11)
       ..write(obj.fontStyle)
       ..writeByte(12)
-      ..write(obj.textAlign);
+      ..write(obj.textAlign)
+      ..writeByte(13)
+      ..write(obj.animIn)
+      ..writeByte(14)
+      ..write(obj.animOut)
+      ..writeByte(15)
+      ..write(obj.boxColor)
+      ..writeByte(16)
+      ..write(obj.outlineColor)
+      ..writeByte(17)
+      ..write(obj.outlineWidth)
+      ..writeByte(18)
+      ..write(obj.shadow);
   }
 
   @override

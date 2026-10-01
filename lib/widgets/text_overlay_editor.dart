@@ -5,6 +5,7 @@ import '../providers/video_editor_provider.dart';
 import '../models/video_project.dart';
 import '../main.dart' show AppColors;
 import 'modern_slider.dart';
+import '../utils/text_overlay_painter.dart';
 
 class TextOverlayEditor extends StatefulWidget {
   const TextOverlayEditor({super.key});
@@ -27,19 +28,57 @@ class _TextOverlayEditorState extends State<TextOverlayEditor> {
   bool _isBold = false;
   bool _isItalic = false;
   TextAlign _textAlign = TextAlign.center;
-  bool _hasOutline = false;
-  bool _hasShadow = false;
+  // Look & motion (box, outline, shadow, in/out animation).
+  Color? _boxColor;
+  Color? _outlineColor;
+  double _outlineWidth = 3;
+  bool _shadow = true;
+  String _animIn = TextAnimations.none;
+  String _animOut = TextAnimations.none;
+  Offset _position = const Offset(0.5, 0.5);
 
-  // Font family options from Google Fonts
-  final Map<String, TextStyle Function()> _fontFamilies = {
-    'Roboto': () => GoogleFonts.roboto(),
-    'Averia Libre': () => GoogleFonts.averiaLibre(),
-    'Lato': () => GoogleFonts.lato(),
-    'Comic Neue': () => GoogleFonts.comicNeue(),
-    'Actor': () => GoogleFonts.actor(),
-    'Odor Mean Chey': () => GoogleFonts.odorMeanChey(),
-    'Nabla': () => GoogleFonts.nabla(),
+  // Fonts (bundled in assets/google_fonts, so they work offline).
+  static const List<String> _fontNames = [
+    'Roboto',
+    'Poppins',
+    'Montserrat',
+    'Bebas Neue',
+    'Anton',
+    'Oswald',
+    'Playfair Display',
+    'Lobster',
+    'Pacifico',
+    'Dancing Script',
+    'Caveat',
+    'Permanent Marker',
+    'Righteous',
+    'Space Mono',
+    'Lato',
+    'Comic Neue',
+    'Averia Libre',
+    'Actor',
+    'Odor Mean Chey',
+    'Nabla',
+  ];
+  late final Map<String, TextStyle Function()> _fontFamilies = {
+    for (final name in _fontNames) name: () => GoogleFonts.getFont(name),
   };
+
+  static const List<Color> _boxColors = [
+    Color(0x99000000),
+    Color(0xE6FFFFFF),
+    Color(0xCC7C3AED),
+    Color(0xE6FACC15),
+    Color(0xE6EF4444),
+    Color(0xE622C55E),
+  ];
+  static const List<Color> _outlineColors = [
+    Colors.black,
+    Colors.white,
+    Color(0xFFEC4899),
+    Color(0xFF22D3EE),
+    Color(0xFFFACC15),
+  ];
 
   final List<Color> _colors = [
     Colors.white,
@@ -115,6 +154,15 @@ class _TextOverlayEditorState extends State<TextOverlayEditor> {
                     .inSeconds
                     .toDouble()
                     .clamp(1.0, 60.0);
+            _boxColor = currentOverlay.boxColor;
+            _outlineColor = currentOverlay.outlineColor;
+            if (currentOverlay.outlineWidth > 0) {
+              _outlineWidth = currentOverlay.outlineWidth;
+            }
+            _shadow = currentOverlay.shadow;
+            _animIn = currentOverlay.animIn;
+            _animOut = currentOverlay.animOut;
+            _position = currentOverlay.position;
             provider.clearTextPreview();
           } else {
             _textController.clear();
@@ -124,8 +172,13 @@ class _TextOverlayEditorState extends State<TextOverlayEditor> {
             _isBold = false;
             _isItalic = false;
             _textAlign = TextAlign.center;
-            _hasOutline = false;
-            _hasShadow = false;
+            _boxColor = null;
+            _outlineColor = null;
+            _outlineWidth = 3;
+            _shadow = true;
+            _animIn = TextAnimations.none;
+            _animOut = TextAnimations.none;
+            _position = const Offset(0.5, 0.5);
             _durationSeconds = 3.0;
             provider.clearTextPreview();
           }
@@ -133,7 +186,7 @@ class _TextOverlayEditorState extends State<TextOverlayEditor> {
         }
 
         return Container(
-          decoration: const BoxDecoration(
+          decoration: BoxDecoration(
             color: AppColors.surface,
             border: Border(top: BorderSide(color: AppColors.border, width: 1)),
           ),
@@ -163,7 +216,7 @@ class _TextOverlayEditorState extends State<TextOverlayEditor> {
                           style: _getTextStyle(fontSize: 14),
                           cursorColor: AppColors.primary,
                           textAlign: _textAlign,
-                          decoration: const InputDecoration(
+                          decoration: InputDecoration(
                             hintText: 'Type text here...',
                             hintStyle: TextStyle(
                                 color: AppColors.textTertiary, fontSize: 13),
@@ -176,19 +229,7 @@ class _TextOverlayEditorState extends State<TextOverlayEditor> {
                             if (selId != null) {
                               _updateSelectedOverlay(provider);
                             } else {
-                              provider.setTextPreview(
-                                val,
-                                _fontSize,
-                                _textColor,
-                                fontFamily: _selectedFontFamily,
-                                fontWeight: _isBold
-                                    ? FontWeight.bold
-                                    : FontWeight.normal,
-                                fontStyle: _isItalic
-                                    ? FontStyle.italic
-                                    : FontStyle.normal,
-                                textAlign: _textAlign,
-                              );
+                              _commit(provider, selId);
                             }
                           },
                         ),
@@ -222,7 +263,11 @@ class _TextOverlayEditorState extends State<TextOverlayEditor> {
                   ],
                 ),
 
-                const SizedBox(height: 16),
+                const SizedBox(height: 14),
+                _buildSectionLabel(Icons.auto_awesome_rounded, 'Quick styles'),
+                _buildPresets(provider, selId),
+
+                const SizedBox(height: 14),
 
                 // Font Style Selection
                 SizedBox(
@@ -242,18 +287,7 @@ class _TextOverlayEditorState extends State<TextOverlayEditor> {
                           if (selId != null) {
                             _updateSelectedOverlay(provider);
                           } else {
-                            provider.setTextPreview(
-                              _textController.text,
-                              _fontSize,
-                              _textColor,
-                              fontFamily: styleLabel,
-                              fontWeight:
-                                  _isBold ? FontWeight.bold : FontWeight.normal,
-                              fontStyle: _isItalic
-                                  ? FontStyle.italic
-                                  : FontStyle.normal,
-                              textAlign: _textAlign,
-                            );
+                            _commit(provider, selId);
                           }
                         },
                         child: Container(
@@ -306,7 +340,7 @@ class _TextOverlayEditorState extends State<TextOverlayEditor> {
                 Column(
                   crossAxisAlignment: CrossAxisAlignment.start,
                   children: [
-                    const Padding(
+                    Padding(
                       padding: EdgeInsets.only(bottom: 8.0),
                       child: Row(
                         children: [
@@ -338,19 +372,7 @@ class _TextOverlayEditorState extends State<TextOverlayEditor> {
                               if (selId != null) {
                                 _updateSelectedOverlay(provider);
                               } else {
-                                provider.setTextPreview(
-                                  _textController.text,
-                                  _fontSize,
-                                  color,
-                                  fontFamily: _selectedFontFamily,
-                                  fontWeight: _isBold
-                                      ? FontWeight.bold
-                                      : FontWeight.normal,
-                                  fontStyle: _isItalic
-                                      ? FontStyle.italic
-                                      : FontStyle.normal,
-                                  textAlign: _textAlign,
-                                );
+                                _commit(provider, selId);
                               }
                             },
                             child: Container(
@@ -396,18 +418,7 @@ class _TextOverlayEditorState extends State<TextOverlayEditor> {
                           if (selId != null) {
                             _updateSelectedOverlay(provider);
                           } else {
-                            provider.setTextPreview(
-                              _textController.text,
-                              _fontSize,
-                              _textColor,
-                              fontFamily: _selectedFontFamily,
-                              fontWeight:
-                                  _isBold ? FontWeight.bold : FontWeight.normal,
-                              fontStyle: _isItalic
-                                  ? FontStyle.italic
-                                  : FontStyle.normal,
-                              textAlign: _textAlign,
-                            );
+                            _commit(provider, selId);
                           }
                         },
                       ),
@@ -422,25 +433,25 @@ class _TextOverlayEditorState extends State<TextOverlayEditor> {
                           if (selId != null) {
                             _updateSelectedOverlay(provider);
                           } else {
-                            provider.setTextPreview(
-                              _textController.text,
-                              _fontSize,
-                              _textColor,
-                              fontFamily: _selectedFontFamily,
-                              fontWeight:
-                                  _isBold ? FontWeight.bold : FontWeight.normal,
-                              fontStyle: _isItalic
-                                  ? FontStyle.italic
-                                  : FontStyle.normal,
-                              textAlign: _textAlign,
-                            );
+                            _commit(provider, selId);
                           }
                         },
                       ),
-
                     ],
                   ),
                 ),
+
+                const SizedBox(height: 14),
+                _buildSectionLabel(Icons.animation_rounded, 'Animation'),
+                _buildAnimationRow(
+                    provider, selId, 'In', _animIn, (v) => _animIn = v),
+                const SizedBox(height: 6),
+                _buildAnimationRow(
+                    provider, selId, 'Out', _animOut, (v) => _animOut = v),
+
+                const SizedBox(height: 14),
+                _buildSectionLabel(Icons.format_paint_rounded, 'Style'),
+                _buildStyleControls(provider, selId),
 
                 const SizedBox(height: 14),
 
@@ -456,17 +467,7 @@ class _TextOverlayEditorState extends State<TextOverlayEditor> {
                     if (selId != null) {
                       _updateSelectedOverlay(provider);
                     } else {
-                      provider.setTextPreview(
-                        _textController.text,
-                        v,
-                        _textColor,
-                        fontFamily: _selectedFontFamily,
-                        fontWeight:
-                            _isBold ? FontWeight.bold : FontWeight.normal,
-                        fontStyle:
-                            _isItalic ? FontStyle.italic : FontStyle.normal,
-                        textAlign: _textAlign,
-                      );
+                      _commit(provider, selId);
                     }
                   },
                 ),
@@ -550,7 +551,7 @@ class _TextOverlayEditorState extends State<TextOverlayEditor> {
     final end = start + Duration(seconds: _durationSeconds.toInt());
     await provider.addTextOverlay(
       text: _textController.text,
-      position: const Offset(0.5, 0.5),
+      position: _position,
       startTime: start,
       endTime: end,
       fontSize: _fontSize,
@@ -559,6 +560,12 @@ class _TextOverlayEditorState extends State<TextOverlayEditor> {
       fontWeight: _isBold ? FontWeight.bold : FontWeight.normal,
       fontStyle: _isItalic ? FontStyle.italic : FontStyle.normal,
       textAlign: _textAlign,
+      animIn: _animIn,
+      animOut: _animOut,
+      boxColor: _boxColor,
+      outlineColor: _outlineColor,
+      outlineWidth: _outlineColor == null ? 0 : _outlineWidth,
+      shadow: _shadow,
     );
     _textController.clear();
     provider.clearTextPreview();
@@ -586,6 +593,415 @@ class _TextOverlayEditorState extends State<TextOverlayEditor> {
       fontStyle: _isItalic ? FontStyle.italic : FontStyle.normal,
       textAlign: _textAlign,
       endTime: newEnd,
+      animIn: _animIn,
+      animOut: _animOut,
+      boxColor: _boxColor,
+      clearBox: _boxColor == null,
+      outlineColor: _outlineColor,
+      clearOutline: _outlineColor == null,
+      outlineWidth: _outlineColor == null ? 0 : _outlineWidth,
+      shadow: _shadow,
+    );
+  }
+
+  // ── Presets, animation and style ──────────────────────────────────────
+
+  /// Applies a change: updates the selected overlay, or the live preview
+  /// of the text being typed.
+  void _commit(VideoEditorProvider provider, String? selId) {
+    if (selId != null) {
+      _updateSelectedOverlay(provider);
+    } else {
+      provider.setTextPreview(
+        _textController.text,
+        _fontSize,
+        _textColor,
+        fontFamily: _selectedFontFamily,
+        fontWeight: _isBold ? FontWeight.bold : FontWeight.normal,
+        fontStyle: _isItalic ? FontStyle.italic : FontStyle.normal,
+        textAlign: _textAlign,
+        position: _position,
+        boxColor: _boxColor,
+        outlineColor: _outlineColor,
+        outlineWidth: _outlineColor == null ? 0 : _outlineWidth,
+        shadow: _shadow,
+      );
+    }
+  }
+
+  Widget _buildSectionLabel(IconData icon, String label) {
+    return Padding(
+      padding: const EdgeInsets.only(bottom: 8),
+      child: Row(
+        children: [
+          Icon(icon, size: 16, color: AppColors.textTertiary),
+          const SizedBox(width: 8),
+          Text(label,
+              style: TextStyle(color: AppColors.textSecondary, fontSize: 12)),
+        ],
+      ),
+    );
+  }
+
+  static const List<_TextPreset> _presets = [
+    _TextPreset(
+      name: 'Title',
+      sample: 'Your Title',
+      font: 'Poppins',
+      size: 210,
+      bold: true,
+      animIn: 'pop',
+      animOut: 'fade',
+      position: Offset(0.12, 0.42),
+    ),
+    _TextPreset(
+      name: 'Lower third',
+      sample: 'Name Surname',
+      font: 'Montserrat',
+      size: 95,
+      bold: true,
+      box: Color(0xCC7C3AED),
+      shadow: false,
+      animIn: 'slide',
+      animOut: 'slide',
+      position: Offset(0.05, 0.78),
+      align: TextAlign.left,
+    ),
+    _TextPreset(
+      name: 'Subtitle',
+      sample: 'Subtitles go here',
+      font: 'Roboto',
+      size: 80,
+      box: Color(0x99000000),
+      shadow: false,
+      animIn: 'fade',
+      animOut: 'fade',
+      position: Offset(0.1, 0.86),
+    ),
+    _TextPreset(
+      name: 'Caption',
+      sample: 'WOW!',
+      font: 'Anton',
+      size: 230,
+      outline: Colors.black,
+      outlineWidth: 4,
+      animIn: 'pop',
+      animOut: 'pop',
+      position: Offset(0.2, 0.12),
+    ),
+    _TextPreset(
+      name: 'Neon',
+      sample: 'Neon Night',
+      font: 'Righteous',
+      size: 170,
+      color: Color(0xFF67E8F9),
+      outline: Color(0xFFEC4899),
+      outlineWidth: 2,
+      animIn: 'fade',
+      animOut: 'fade',
+      position: Offset(0.12, 0.45),
+    ),
+    _TextPreset(
+      name: 'Typewriter',
+      sample: 'Once upon a time…',
+      font: 'Space Mono',
+      size: 105,
+      animIn: 'typewriter',
+      animOut: 'fade',
+      position: Offset(0.08, 0.5),
+      align: TextAlign.left,
+    ),
+    _TextPreset(
+      name: 'Handwritten',
+      sample: 'with love',
+      font: 'Dancing Script',
+      size: 190,
+      color: Color(0xFFFDE68A),
+      animIn: 'slide',
+      animOut: 'fade',
+      position: Offset(0.18, 0.4),
+    ),
+  ];
+
+  void _applyPreset(
+      VideoEditorProvider provider, String? selId, _TextPreset p) {
+    setState(() {
+      _selectedFontFamily = p.font;
+      _fontSize = p.size;
+      _textColor = p.color;
+      _isBold = p.bold;
+      _isItalic = false;
+      _textAlign = p.align;
+      _boxColor = p.box;
+      _outlineColor = p.outline;
+      _outlineWidth = p.outline == null ? 3 : p.outlineWidth;
+      _shadow = p.shadow;
+      _animIn = p.animIn;
+      _animOut = p.animOut;
+      if (selId == null) {
+        _position = p.position;
+        if (_textController.text.trim().isEmpty) {
+          _textController.text = p.sample;
+        }
+      }
+    });
+    _commit(provider, selId);
+  }
+
+  Widget _buildPresets(VideoEditorProvider provider, String? selId) {
+    return SizedBox(
+      height: 64,
+      child: ListView.separated(
+        scrollDirection: Axis.horizontal,
+        itemCount: _presets.length,
+        separatorBuilder: (_, __) => const SizedBox(width: 8),
+        itemBuilder: (context, i) {
+          final p = _presets[i];
+          TextStyle style;
+          try {
+            style = GoogleFonts.getFont(p.font,
+                fontSize: 17,
+                color: p.color,
+                fontWeight: p.bold ? FontWeight.bold : FontWeight.normal);
+          } catch (_) {
+            style = TextStyle(fontSize: 17, color: p.color);
+          }
+          return GestureDetector(
+            onTap: () => _applyPreset(provider, selId, p),
+            child: Container(
+              width: 104,
+              padding: const EdgeInsets.all(6),
+              decoration: BoxDecoration(
+                gradient: LinearGradient(
+                  begin: Alignment.topLeft,
+                  end: Alignment.bottomRight,
+                  colors: [AppColors.surfaceLighter, AppColors.background],
+                ),
+                borderRadius: BorderRadius.circular(12),
+                border: Border.all(color: AppColors.border),
+              ),
+              child: Column(
+                mainAxisAlignment: MainAxisAlignment.center,
+                children: [
+                  Container(
+                    padding: p.box == null
+                        ? EdgeInsets.zero
+                        : const EdgeInsets.symmetric(
+                            horizontal: 6, vertical: 1),
+                    decoration: p.box == null
+                        ? null
+                        : BoxDecoration(
+                            color: p.box,
+                            borderRadius: BorderRadius.circular(4)),
+                    child: Text('Aa',
+                        maxLines: 1,
+                        style: style.copyWith(
+                          shadows: p.outline != null
+                              ? [
+                                  for (final o in const [
+                                    Offset(1, 1),
+                                    Offset(-1, -1),
+                                    Offset(1, -1),
+                                    Offset(-1, 1),
+                                  ])
+                                    Shadow(offset: o, color: p.outline!),
+                                ]
+                              : null,
+                        )),
+                  ),
+                  const SizedBox(height: 4),
+                  Text(p.name,
+                      style: TextStyle(
+                          color: AppColors.textSecondary,
+                          fontSize: 10.5,
+                          fontWeight: FontWeight.w600)),
+                ],
+              ),
+            ),
+          );
+        },
+      ),
+    );
+  }
+
+  Widget _buildAnimationRow(VideoEditorProvider provider, String? selId,
+      String label, String value, void Function(String) set) {
+    return Row(
+      children: [
+        SizedBox(
+          width: 34,
+          child: Text(label,
+              style: TextStyle(
+                  color: AppColors.textTertiary,
+                  fontSize: 11,
+                  fontWeight: FontWeight.w600)),
+        ),
+        Expanded(
+          child: SizedBox(
+            height: 34,
+            child: ListView.separated(
+              scrollDirection: Axis.horizontal,
+              itemCount: TextAnimations.all.length,
+              separatorBuilder: (_, __) => const SizedBox(width: 6),
+              itemBuilder: (context, i) {
+                final (id, name, icon) = TextAnimations.all[i];
+                final selected = value == id;
+                return GestureDetector(
+                  onTap: () {
+                    setState(() => set(id));
+                    _commit(provider, selId);
+                  },
+                  child: AnimatedContainer(
+                    duration: const Duration(milliseconds: 150),
+                    padding: const EdgeInsets.symmetric(horizontal: 10),
+                    decoration: BoxDecoration(
+                      color: selected
+                          ? AppColors.primary.withValues(alpha: 0.2)
+                          : AppColors.surfaceLight,
+                      borderRadius: BorderRadius.circular(17),
+                      border: Border.all(
+                          color:
+                              selected ? AppColors.primary : AppColors.border),
+                    ),
+                    child: Row(
+                      children: [
+                        Icon(icon,
+                            size: 14,
+                            color: selected
+                                ? AppColors.primary
+                                : AppColors.textTertiary),
+                        const SizedBox(width: 4),
+                        Text(name,
+                            style: TextStyle(
+                                color: selected
+                                    ? AppColors.primary
+                                    : AppColors.textSecondary,
+                                fontSize: 11.5,
+                                fontWeight: FontWeight.w600)),
+                      ],
+                    ),
+                  ),
+                );
+              },
+            ),
+          ),
+        ),
+      ],
+    );
+  }
+
+  Widget _buildStyleControls(VideoEditorProvider provider, String? selId) {
+    Widget toggle(String label, IconData icon, bool on, VoidCallback onTap) {
+      return Expanded(
+        child: GestureDetector(
+          onTap: () {
+            onTap();
+            _commit(provider, selId);
+          },
+          child: AnimatedContainer(
+            duration: const Duration(milliseconds: 150),
+            height: 36,
+            decoration: BoxDecoration(
+              color: on
+                  ? AppColors.primary.withValues(alpha: 0.2)
+                  : AppColors.surfaceLight,
+              borderRadius: BorderRadius.circular(8),
+              border:
+                  Border.all(color: on ? AppColors.primary : AppColors.border),
+            ),
+            child: Row(
+              mainAxisAlignment: MainAxisAlignment.center,
+              children: [
+                Icon(icon,
+                    size: 15,
+                    color: on ? AppColors.primary : AppColors.textTertiary),
+                const SizedBox(width: 5),
+                Text(label,
+                    style: TextStyle(
+                        color: on ? AppColors.primary : AppColors.textSecondary,
+                        fontSize: 12,
+                        fontWeight: FontWeight.w600)),
+              ],
+            ),
+          ),
+        ),
+      );
+    }
+
+    Widget swatches(
+        List<Color> colors, Color? current, void Function(Color) pick) {
+      return SizedBox(
+        height: 30,
+        child: ListView.separated(
+          scrollDirection: Axis.horizontal,
+          itemCount: colors.length,
+          separatorBuilder: (_, __) => const SizedBox(width: 8),
+          itemBuilder: (context, i) {
+            final c = colors[i];
+            final selected = current?.toARGB32() == c.toARGB32();
+            return GestureDetector(
+              onTap: () {
+                setState(() => pick(c));
+                _commit(provider, selId);
+              },
+              child: Container(
+                width: 30,
+                decoration: BoxDecoration(
+                  color: c,
+                  shape: BoxShape.circle,
+                  border: Border.all(
+                    color: selected ? AppColors.textPrimary : AppColors.border,
+                    width: selected ? 2.5 : 1,
+                  ),
+                ),
+              ),
+            );
+          },
+        ),
+      );
+    }
+
+    return Column(
+      crossAxisAlignment: CrossAxisAlignment.start,
+      children: [
+        Row(
+          children: [
+            toggle('Box', Icons.rectangle_rounded, _boxColor != null, () {
+              setState(() =>
+                  _boxColor = _boxColor == null ? _boxColors.first : null);
+            }),
+            const SizedBox(width: 8),
+            toggle('Outline', Icons.border_style_rounded, _outlineColor != null,
+                () {
+              setState(() => _outlineColor =
+                  _outlineColor == null ? _outlineColors.first : null);
+            }),
+            const SizedBox(width: 8),
+            toggle('Shadow', Icons.blur_on_rounded, _shadow, () {
+              setState(() => _shadow = !_shadow);
+            }),
+          ],
+        ),
+        if (_boxColor != null) ...[
+          const SizedBox(height: 8),
+          swatches(_boxColors, _boxColor, (c) => _boxColor = c),
+        ],
+        if (_outlineColor != null) ...[
+          const SizedBox(height: 8),
+          swatches(_outlineColors, _outlineColor, (c) => _outlineColor = c),
+          ModernSlider(
+            label: 'Outline width',
+            value: _outlineWidth,
+            min: 1,
+            max: 8,
+            divisions: 14,
+            onChanged: (v) {
+              setState(() => _outlineWidth = v);
+              _commit(provider, selId);
+            },
+          ),
+        ],
+      ],
     );
   }
 
@@ -597,4 +1013,40 @@ class _TextOverlayEditorState extends State<TextOverlayEditor> {
       provider.clearTextPreview();
     }
   }
+}
+
+/// One-tap text look: font, size, colour, box/outline/shadow, animation and
+/// placement.
+class _TextPreset {
+  final String name;
+  final String sample;
+  final String font;
+  final double size;
+  final Color color;
+  final bool bold;
+  final Color? box;
+  final Color? outline;
+  final double outlineWidth;
+  final bool shadow;
+  final String animIn;
+  final String animOut;
+  final Offset position;
+  final TextAlign align;
+
+  const _TextPreset({
+    required this.name,
+    required this.sample,
+    required this.font,
+    required this.size,
+    this.color = Colors.white,
+    this.bold = false,
+    this.box,
+    this.outline,
+    this.outlineWidth = 3,
+    this.shadow = true,
+    this.animIn = 'none',
+    this.animOut = 'none',
+    required this.position,
+    this.align = TextAlign.center,
+  });
 }

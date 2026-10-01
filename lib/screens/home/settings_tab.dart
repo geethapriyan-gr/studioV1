@@ -1,6 +1,8 @@
 import 'package:flutter/material.dart';
 import 'package:share_plus/share_plus.dart';
 
+import '../../main.dart' show AppColors;
+import '../../theme/editor_themes.dart';
 import 'home_models.dart';
 import 'home_prefs.dart';
 import 'home_storage.dart';
@@ -254,10 +256,11 @@ class _SettingsTabState extends State<SettingsTab> {
             value: themeName,
             onTap: _pickTheme,
           ),
-          const _Tile(
+          _Tile(
             icon: Icons.dark_mode_outlined,
             title: 'Editor theme',
-            value: 'Premium Dark',
+            value: EditorThemeData.byId(prefs.editorTheme).name,
+            onTap: () => showEditorThemePicker(context, prefs),
           ),
           _Tile(
             icon: Icons.language_rounded,
@@ -704,6 +707,176 @@ class _TipsTileState extends State<_TipsTile> {
                 ),
         ),
       ],
+    );
+  }
+}
+
+/// Editor theme picker: each option is a miniature of the editor (preview,
+/// timeline and toolbar) drawn in that theme's colours. Picking one applies
+/// it to the whole app immediately.
+Future<void> showEditorThemePicker(BuildContext context, HomePrefs prefs) {
+  return showHomeSheet<void>(
+    context,
+    builder: (ctx) => StatefulBuilder(
+      builder: (ctx, setSheet) => ListView(
+        shrinkWrap: true,
+        padding: const EdgeInsets.fromLTRB(16, 14, 16, 20),
+        children: [
+          const _SheetTitle('Editor theme'),
+          GridView.count(
+            crossAxisCount: 2,
+            shrinkWrap: true,
+            physics: const NeverScrollableScrollPhysics(),
+            mainAxisSpacing: 12,
+            crossAxisSpacing: 12,
+            childAspectRatio: 0.92,
+            children: [
+              for (final t in EditorThemeData.all)
+                _ThemeSwatch(
+                  theme: t,
+                  selected: t.id == prefs.editorTheme,
+                  onTap: () async {
+                    homeHaptic(prefs);
+                    AppColors.apply(t);
+                    await prefs.setEditorTheme(t.id);
+                    setSheet(() {});
+                  },
+                ),
+            ],
+          ),
+        ],
+      ),
+    ),
+  );
+}
+
+class _ThemeSwatch extends StatelessWidget {
+  final EditorThemeData theme;
+  final bool selected;
+  final VoidCallback onTap;
+
+  const _ThemeSwatch({
+    required this.theme,
+    required this.selected,
+    required this.onTap,
+  });
+
+  @override
+  Widget build(BuildContext context) {
+    final t = theme;
+    Widget bar(double w, Color c) => Container(
+          width: w,
+          height: 10,
+          decoration: BoxDecoration(
+            color: c,
+            borderRadius: BorderRadius.circular(3),
+          ),
+        );
+    return GestureDetector(
+      onTap: onTap,
+      child: AnimatedContainer(
+        duration: const Duration(milliseconds: 200),
+        padding: const EdgeInsets.all(3),
+        decoration: BoxDecoration(
+          borderRadius: BorderRadius.circular(18),
+          border: Border.all(
+            color: selected ? t.primary : Colors.white.withValues(alpha: 0.1),
+            width: selected ? 2.5 : 1,
+          ),
+        ),
+        child: ClipRRect(
+          borderRadius: BorderRadius.circular(14),
+          child: ColoredBox(
+            color: t.background,
+            child: Column(
+              children: [
+                // Mini preview area
+                Expanded(
+                  flex: 5,
+                  child: Center(
+                    child: Container(
+                      width: 46,
+                      height: 34,
+                      decoration: BoxDecoration(
+                        borderRadius: BorderRadius.circular(6),
+                        gradient: LinearGradient(
+                          colors: [t.primaryDark, t.primaryLight],
+                        ),
+                      ),
+                      child: const Icon(Icons.play_arrow_rounded,
+                          color: Colors.white, size: 20),
+                    ),
+                  ),
+                ),
+                // Mini timeline
+                Expanded(
+                  flex: 4,
+                  child: Container(
+                    width: double.infinity,
+                    color: t.surface,
+                    padding: const EdgeInsets.fromLTRB(10, 8, 10, 6),
+                    child: Column(
+                      crossAxisAlignment: CrossAxisAlignment.start,
+                      mainAxisAlignment: MainAxisAlignment.spaceEvenly,
+                      children: [
+                        Row(children: [
+                          bar(40, t.primary),
+                          const SizedBox(width: 3),
+                          bar(28, t.primary.withValues(alpha: 0.7)),
+                        ]),
+                        bar(52, t.audioTrack),
+                        Row(
+                          mainAxisAlignment: MainAxisAlignment.spaceBetween,
+                          children: [
+                            for (var i = 0; i < 4; i++)
+                              Container(
+                                width: 16,
+                                height: 12,
+                                decoration: BoxDecoration(
+                                  color: i == 0
+                                      ? t.primary.withValues(alpha: 0.25)
+                                      : t.surfaceLight,
+                                  borderRadius: BorderRadius.circular(3),
+                                  border: Border.all(
+                                      color: i == 0 ? t.primary : t.border),
+                                ),
+                              ),
+                          ],
+                        ),
+                      ],
+                    ),
+                  ),
+                ),
+                Container(
+                  width: double.infinity,
+                  color: t.surfaceLight,
+                  padding:
+                      const EdgeInsets.symmetric(horizontal: 10, vertical: 7),
+                  child: Row(
+                    children: [
+                      Expanded(
+                        child: Text(
+                          t.name,
+                          maxLines: 1,
+                          overflow: TextOverflow.ellipsis,
+                          style: TextStyle(
+                            color: t.textPrimary,
+                            fontWeight: FontWeight.w700,
+                            fontSize: 12.5,
+                          ),
+                        ),
+                      ),
+                      if (selected)
+                        Icon(Icons.check_circle_rounded,
+                            color: t.primary, size: 16),
+                    ],
+                  ),
+                ),
+              ],
+            ),
+          ),
+        ),
+      ),
     );
   }
 }

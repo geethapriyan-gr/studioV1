@@ -44,7 +44,7 @@ class _ModernSliderState extends State<ModernSlider> {
             children: [
               Text(
                 widget.label!,
-                style: const TextStyle(
+                style: TextStyle(
                   color: AppColors.textPrimary,
                   fontSize: 12,
                   fontWeight: FontWeight.w500,
@@ -59,7 +59,7 @@ class _ModernSliderState extends State<ModernSlider> {
                   ),
                   child: Text(
                     _formatValue(widget.value),
-                    style: const TextStyle(
+                    style: TextStyle(
                       color: AppColors.textSecondary,
                       fontSize: 11,
                       fontWeight: FontWeight.w600,

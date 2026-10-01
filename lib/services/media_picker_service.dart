@@ -165,7 +165,7 @@ class _MediaPickerPopup extends StatelessWidget {
   Widget build(BuildContext context) {
     return Container(
       decoration: BoxDecoration(
-        gradient: const LinearGradient(
+        gradient: LinearGradient(
           begin: Alignment.topCenter,
           end: Alignment.bottomCenter,
           colors: [
@@ -217,14 +217,14 @@ class _MediaPickerPopup extends StatelessWidget {
                     ),
                     borderRadius: BorderRadius.circular(10),
                   ),
-                  child: const Icon(
+                  child: Icon(
                     Icons.perm_media_rounded,
                     color: AppColors.primary,
                     size: 20,
                   ),
                 ),
                 const SizedBox(width: 12),
-                const Column(
+                Column(
                   crossAxisAlignment: CrossAxisAlignment.start,
                   children: [
                     Text(
@@ -256,7 +256,7 @@ class _MediaPickerPopup extends StatelessWidget {
             icon: Icons.video_library_rounded,
             title: 'Media Library',
             subtitle: 'Browse built-in images & videos',
-            gradientColors: const [
+            gradientColors: [
               AppColors.primary,
               AppColors.primaryLight,
             ],
@@ -293,7 +293,7 @@ class _MediaPickerPopup extends StatelessWidget {
             icon: Icons.photo_library_rounded,
             title: 'Import From Gallery',
             subtitle: 'Select one or more photos & videos',
-            gradientColors: const [
+            gradientColors: [
               AppColors.accent,
               Color(0xFF06D4A0),
             ],
@@ -368,7 +368,7 @@ class _MediaPickerPopup extends StatelessWidget {
                     side: BorderSide(color: AppColors.border.withOpacity(0.5)),
                   ),
                 ),
-                child: const Text(
+                child: Text(
                   'Cancel',
                   style: TextStyle(
                     color: AppColors.textSecondary,
@@ -476,7 +476,7 @@ class _MediaOptionTileState extends State<_MediaOptionTile> {
                   children: [
                     Text(
                       widget.title,
-                      style: const TextStyle(
+                      style: TextStyle(
                         color: AppColors.textPrimary,
                         fontSize: 15,
                         fontWeight: FontWeight.w600,
@@ -485,7 +485,7 @@ class _MediaOptionTileState extends State<_MediaOptionTile> {
                     const SizedBox(height: 3),
                     Text(
                       widget.subtitle,
-                      style: const TextStyle(
+                      style: TextStyle(
                         color: AppColors.textTertiary,
                         fontSize: 12,
                       ),
@@ -494,7 +494,7 @@ class _MediaOptionTileState extends State<_MediaOptionTile> {
                 ),
               ),
               // Arrow
-              const Icon(
+              Icon(
                 Icons.arrow_forward_ios_rounded,
                 color: AppColors.textTertiary,
                 size: 16,
@@ -549,7 +549,7 @@ class _GalleryTypeOption extends StatelessWidget {
                     children: [
                       Text(
                         label,
-                        style: const TextStyle(
+                        style: TextStyle(
                           color: AppColors.textPrimary,
                           fontSize: 15,
                           fontWeight: FontWeight.w600,
@@ -558,7 +558,7 @@ class _GalleryTypeOption extends StatelessWidget {
                       const SizedBox(height: 2),
                       Text(
                         subtitle,
-                        style: const TextStyle(
+                        style: TextStyle(
                           color: AppColors.textTertiary,
                           fontSize: 12,
                         ),

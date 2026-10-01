@@ -147,7 +147,7 @@ class _TrimEditorState extends State<TrimEditor> {
         final trimMode = provider.trimMode;
 
         if (clipId == null) {
-          return const Center(
+          return Center(
             child: Text(
               "Select a video clip to enable trimming",
               style: TextStyle(color: AppColors.textTertiary, fontSize: 13),
@@ -160,7 +160,7 @@ class _TrimEditorState extends State<TrimEditor> {
           clip = provider.currentProject!.videoClips
               .firstWhere((c) => c.id == clipId);
         } catch (_) {
-          return const Center(
+          return Center(
             child: Text(
               "Select a video clip to enable trimming",
               style: TextStyle(color: AppColors.textTertiary, fontSize: 13),
@@ -181,7 +181,7 @@ class _TrimEditorState extends State<TrimEditor> {
                   children: [
                     Row(
                       children: [
-                        const Text(
+                        Text(
                           "Trim",
                           style: TextStyle(
                             color: AppColors.textPrimary,
@@ -204,7 +204,7 @@ class _TrimEditorState extends State<TrimEditor> {
                       ],
                     ),
                     IconButton(
-                      icon: const Icon(Icons.refresh,
+                      icon: Icon(Icons.refresh,
                           color: AppColors.textTertiary, size: 18),
                       onPressed: _resetTrim,
                       tooltip: "Reset",
@@ -228,14 +228,14 @@ class _TrimEditorState extends State<TrimEditor> {
                         children: [
                           Text(
                             _formatDuration(_getTrimStartDuration(clip)),
-                            style: const TextStyle(
+                            style: TextStyle(
                               color: AppColors.textSecondary,
                               fontSize: 11,
                             ),
                           ),
                           Text(
                             "Duration: ${_formatDuration(_getTrimDuration(clip))}",
-                            style: const TextStyle(
+                            style: TextStyle(
                               color: AppColors.primary,
                               fontSize: 11,
                               fontWeight: FontWeight.w600,
@@ -243,7 +243,7 @@ class _TrimEditorState extends State<TrimEditor> {
                           ),
                           Text(
                             _formatDuration(_getTrimEndDuration(clip)),
-                            style: const TextStyle(
+                            style: TextStyle(
                               color: AppColors.textSecondary,
                               fontSize: 11,
                             ),
@@ -261,7 +261,7 @@ class _TrimEditorState extends State<TrimEditor> {
                       // Instructions
                       Text(
                         _getInstructionText(trimMode),
-                        style: const TextStyle(
+                        style: TextStyle(
                           color: AppColors.textTertiary,
                           fontSize: 11,
                         ),
@@ -377,7 +377,7 @@ class _TrimEditorState extends State<TrimEditor> {
                     height: height,
                     decoration: BoxDecoration(
                       color: AppColors.primary.withOpacity(0.3),
-                      border: const Border(
+                      border: Border(
                         top: BorderSide(color: AppColors.primary, width: 2),
                         bottom: BorderSide(color: AppColors.primary, width: 2),
                       ),

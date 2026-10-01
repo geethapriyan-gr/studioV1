@@ -145,6 +145,10 @@ class HomePrefs extends ChangeNotifier {
   String get defaultAspect => _get<String>('defaultAspect', '9:16');
   Future<void> setDefaultAspect(String v) => _put('defaultAspect', v);
 
+  /// Editor colour theme id (see EditorThemeData.all).
+  String get editorTheme => _get<String>('editorTheme', 'premium');
+  Future<void> setEditorTheme(String v) => _put('editorTheme', v);
+
   String get language => _get<String>('language', 'English');
   Future<void> setLanguage(String v) => _put('language', v);
 

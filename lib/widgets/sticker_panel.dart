@@ -137,14 +137,14 @@ class _StickerPanelState extends State<StickerPanel> {
     return Container(
       height: 56,
       padding: const EdgeInsets.symmetric(horizontal: 16),
-      decoration: const BoxDecoration(
+      decoration: BoxDecoration(
         border: Border(
           bottom: BorderSide(color: AppColors.border, width: 1),
         ),
       ),
       child: Row(
         children: [
-          const Text(
+          Text(
             'Stickers',
             style: TextStyle(
               fontSize: 18,

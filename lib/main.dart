@@ -1,6 +1,8 @@
 import 'dart:async';
 
 import 'package:flutter/material.dart';
+import 'package:flutter/foundation.dart'
+    show LicenseEntryWithLineBreaks, LicenseRegistry;
 import 'package:flutter/services.dart';
 import 'package:just_audio/just_audio.dart';
 import 'package:provider/provider.dart';
@@ -9,47 +11,76 @@ import 'screens/video_editor_screen.dart';
 import 'services/hive_service.dart';
 import 'utils/responsive.dart';
 import 'splash_screen.dart';
+import 'screens/home/home_prefs.dart';
+import 'theme/editor_themes.dart';
 
-// Premium Dark Theme Color Palette
+// Editor colour palette. The values are switched at runtime by
+// [AppColors.apply] when the user picks another editor theme in Settings.
 class AppColors {
-  // Core Background Colors - Deep, rich blacks
-  static const Color background = Color(0xFF0A0A0C);
-  static const Color surface = Color(0xFF111114);
-  static const Color surfaceLight = Color(0xFF18181C);
-  static const Color surfaceLighter = Color(0xFF1F1F24);
+  AppColors._();
 
-  // Accent Colors - Refined purple/violet spectrum
-  static const Color primary = Color(0xFF8B5CF6);
-  static const Color primaryLight = Color(0xFFA78BFA);
-  static const Color primaryDark = Color(0xFF7C3AED);
-  static const Color accent = Color(0xFF06B6D4);
+  // Core Background Colors
+  static Color background = EditorThemeData.premium.background;
+  static Color surface = EditorThemeData.premium.surface;
+  static Color surfaceLight = EditorThemeData.premium.surfaceLight;
+  static Color surfaceLighter = EditorThemeData.premium.surfaceLighter;
+
+  // Accent Colors
+  static Color primary = EditorThemeData.premium.primary;
+  static Color primaryLight = EditorThemeData.premium.primaryLight;
+  static Color primaryDark = EditorThemeData.premium.primaryDark;
+  static Color accent = EditorThemeData.premium.accent;
 
   // Text Colors
-  static const Color textPrimary = Color(0xFFFAFAFA);
-  static const Color textSecondary = Color(0xFFA1A1AA);
-  static const Color textTertiary = Color(0xFF71717A);
+  static Color textPrimary = EditorThemeData.premium.textPrimary;
+  static Color textSecondary = EditorThemeData.premium.textSecondary;
+  static Color textTertiary = EditorThemeData.premium.textTertiary;
 
   // Border & Divider
-  static const Color border = Color(0xFF27272A);
-  static const Color borderLight = Color(0xFF3F3F46);
+  static Color border = EditorThemeData.premium.border;
+  static Color borderLight = EditorThemeData.premium.borderLight;
 
-  // Status Colors
+  // Status Colors (shared by every theme)
   static const Color success = Color(0xFF22C55E);
   static const Color warning = Color(0xFFF59E0B);
   static const Color error = Color(0xFFEF4444);
   static const Color info = Color(0xFF3B82F6);
 
   // Track Colors for Timeline
-  static const Color videoTrack = Color(0xFF8B5CF6);
-  static const Color audioTrack = Color(0xFFF97316);
-  static const Color textTrack = Color(0xFF22C55E);
+  static Color videoTrack = EditorThemeData.premium.primary;
+  static Color audioTrack = EditorThemeData.premium.audioTrack;
+  static Color textTrack = EditorThemeData.premium.textTrack;
+
+  /// The active editor theme; listen to rebuild when it changes.
+  static final ValueNotifier<EditorThemeData> theme =
+      ValueNotifier(EditorThemeData.premium);
+
+  static void apply(EditorThemeData t) {
+    background = t.background;
+    surface = t.surface;
+    surfaceLight = t.surfaceLight;
+    surfaceLighter = t.surfaceLighter;
+    primary = t.primary;
+    primaryLight = t.primaryLight;
+    primaryDark = t.primaryDark;
+    accent = t.accent;
+    textPrimary = t.textPrimary;
+    textSecondary = t.textSecondary;
+    textTertiary = t.textTertiary;
+    border = t.border;
+    borderLight = t.borderLight;
+    videoTrack = t.primary;
+    audioTrack = t.audioTrack;
+    textTrack = t.textTrack;
+    theme.value = t;
+  }
 }
 
 void main() async {
   WidgetsFlutterBinding.ensureInitialized();
 
   // Set premium status bar style
-  SystemChrome.setSystemUIOverlayStyle(const SystemUiOverlayStyle(
+  SystemChrome.setSystemUIOverlayStyle(SystemUiOverlayStyle(
     statusBarColor: Colors.transparent,
     statusBarIconBrightness: Brightness.light,
     systemNavigationBarColor: AppColors.background,
@@ -57,8 +88,31 @@ void main() async {
     systemNavigationBarDividerColor: Colors.transparent,
   ));
 
+  // Fonts in assets/google_fonts are bundled for offline text rendering.
+  LicenseRegistry.addLicense(() async* {
+    yield const LicenseEntryWithLineBreaks(
+      ['google_fonts'],
+      'The text fonts bundled in assets/google_fonts (Roboto, Lato, Poppins, '
+      'Montserrat, Playfair Display, Oswald and others) are licensed by their '
+      'authors under the SIL Open Font License 1.1 or the Apache License 2.0.',
+    );
+  });
+
   // Initialize Hive
   await HiveService.init();
+
+  // Restore the chosen editor theme before the first frame.
+  try {
+    final prefs = await HomePrefs.load();
+    AppColors.apply(EditorThemeData.byId(prefs.editorTheme));
+    SystemChrome.setSystemUIOverlayStyle(SystemUiOverlayStyle(
+      statusBarColor: Colors.transparent,
+      statusBarIconBrightness: Brightness.light,
+      systemNavigationBarColor: AppColors.background,
+      systemNavigationBarIconBrightness: Brightness.light,
+      systemNavigationBarDividerColor: Colors.transparent,
+    ));
+  } catch (_) {}
 
   unawaited(_playStartupSound());
 
@@ -81,8 +135,47 @@ Future<void> _playStartupSound() async {
   }
 }
 
-class VideoEditorApp extends StatelessWidget {
+class VideoEditorApp extends StatefulWidget {
   const VideoEditorApp({super.key});
+
+  @override
+  State<VideoEditorApp> createState() => _VideoEditorAppState();
+}
+
+class _VideoEditorAppState extends State<VideoEditorApp> {
+  @override
+  void initState() {
+    super.initState();
+    AppColors.theme.addListener(_onThemeChanged);
+  }
+
+  @override
+  void dispose() {
+    AppColors.theme.removeListener(_onThemeChanged);
+    super.dispose();
+  }
+
+  /// Applies a new editor theme everywhere without restarting the app:
+  /// the MaterialApp theme is rebuilt, and because many widgets read
+  /// [AppColors] directly, every element is marked for rebuild once.
+  void _onThemeChanged() {
+    SystemChrome.setSystemUIOverlayStyle(SystemUiOverlayStyle(
+      statusBarColor: Colors.transparent,
+      statusBarIconBrightness: Brightness.light,
+      systemNavigationBarColor: AppColors.background,
+      systemNavigationBarIconBrightness: Brightness.light,
+    ));
+    setState(() {});
+    WidgetsBinding.instance.addPostFrameCallback((_) {
+      if (!mounted) return;
+      void rebuild(Element element) {
+        element.markNeedsBuild();
+        element.visitChildren(rebuild);
+      }
+
+      (context as Element).visitChildren(rebuild);
+    });
+  }
 
   @override
   Widget build(BuildContext context) {
@@ -107,7 +200,7 @@ class VideoEditorApp extends StatelessWidget {
     return ThemeData(
       useMaterial3: true,
       brightness: Brightness.dark,
-      colorScheme: const ColorScheme.dark(
+      colorScheme: ColorScheme.dark(
         primary: AppColors.primary,
         primaryContainer: AppColors.primaryDark,
         secondary: AppColors.accent,
@@ -122,7 +215,7 @@ class VideoEditorApp extends StatelessWidget {
       scaffoldBackgroundColor: AppColors.background,
 
       // AppBar Theme - Minimal and clean
-      appBarTheme: const AppBarTheme(
+      appBarTheme: AppBarTheme(
         backgroundColor: AppColors.surface,
         foregroundColor: AppColors.textPrimary,
         elevation: 0,
@@ -173,7 +266,7 @@ class VideoEditorApp extends StatelessWidget {
       ),
 
       // Icon Theme
-      iconTheme: const IconThemeData(
+      iconTheme: IconThemeData(
         color: AppColors.textSecondary,
         size: 20,
       ),
@@ -201,31 +294,31 @@ class VideoEditorApp extends StatelessWidget {
         ),
         enabledBorder: OutlineInputBorder(
           borderRadius: BorderRadius.circular(8),
-          borderSide: const BorderSide(color: AppColors.border, width: 1),
+          borderSide: BorderSide(color: AppColors.border, width: 1),
         ),
         focusedBorder: OutlineInputBorder(
           borderRadius: BorderRadius.circular(8),
-          borderSide: const BorderSide(color: AppColors.primary, width: 1.5),
+          borderSide: BorderSide(color: AppColors.primary, width: 1.5),
         ),
-        hintStyle: const TextStyle(
+        hintStyle: TextStyle(
           color: AppColors.textTertiary,
           fontSize: 13,
         ),
-        labelStyle: const TextStyle(
+        labelStyle: TextStyle(
           color: AppColors.textSecondary,
           fontSize: 13,
         ),
       ),
 
       // Divider Theme
-      dividerTheme: const DividerThemeData(
+      dividerTheme: DividerThemeData(
         color: AppColors.border,
         thickness: 1,
         space: 1,
       ),
 
       // Text Theme - Refined typography
-      textTheme: const TextTheme(
+      textTheme: TextTheme(
         displayLarge: TextStyle(
           fontSize: 28,
           fontWeight: FontWeight.w700,
@@ -308,7 +401,7 @@ class VideoEditorApp extends StatelessWidget {
       ),
 
       // Card Theme
-      cardTheme: const CardThemeData(
+      cardTheme: CardThemeData(
         color: AppColors.surfaceLight,
         elevation: 0,
         margin: EdgeInsets.zero,
@@ -320,21 +413,21 @@ class VideoEditorApp extends StatelessWidget {
         elevation: 0,
         shape: RoundedRectangleBorder(
           borderRadius: BorderRadius.circular(12),
-          side: const BorderSide(color: AppColors.border, width: 1),
+          side: BorderSide(color: AppColors.border, width: 1),
         ),
-        titleTextStyle: const TextStyle(
+        titleTextStyle: TextStyle(
           fontSize: 16,
           fontWeight: FontWeight.w600,
           color: AppColors.textPrimary,
         ),
-        contentTextStyle: const TextStyle(
+        contentTextStyle: TextStyle(
           fontSize: 13,
           color: AppColors.textSecondary,
         ),
       ),
 
       // Bottom Sheet Theme
-      bottomSheetTheme: const BottomSheetThemeData(
+      bottomSheetTheme: BottomSheetThemeData(
         backgroundColor: AppColors.surface,
         elevation: 0,
         shape: RoundedRectangleBorder(
@@ -345,7 +438,7 @@ class VideoEditorApp extends StatelessWidget {
       // Snackbar Theme
       snackBarTheme: SnackBarThemeData(
         backgroundColor: AppColors.surfaceLighter,
-        contentTextStyle: const TextStyle(
+        contentTextStyle: TextStyle(
           color: AppColors.textPrimary,
           fontSize: 13,
         ),
@@ -362,7 +455,7 @@ class VideoEditorApp extends StatelessWidget {
           borderRadius: BorderRadius.circular(6),
           border: Border.all(color: AppColors.border),
         ),
-        textStyle: const TextStyle(
+        textStyle: TextStyle(
           color: AppColors.textPrimary,
           fontSize: 11,
           fontWeight: FontWeight.w500,
@@ -376,9 +469,9 @@ class VideoEditorApp extends StatelessWidget {
         elevation: 0,
         shape: RoundedRectangleBorder(
           borderRadius: BorderRadius.circular(8),
-          side: const BorderSide(color: AppColors.border),
+          side: BorderSide(color: AppColors.border),
         ),
-        textStyle: const TextStyle(
+        textStyle: TextStyle(
           color: AppColors.textPrimary,
           fontSize: 13,
         ),

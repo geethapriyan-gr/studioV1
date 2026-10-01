@@ -22,6 +22,7 @@ import '../services/waveform_service.dart';
 import '../services/hive_service.dart';
 import '../services/video_thumbnail_service.dart';
 import '../utils/track_allocation.dart';
+import '../utils/audio_fades.dart';
 
 class VideoEditorProvider extends ChangeNotifier {
   VideoProject? _currentProject;
@@ -416,6 +417,11 @@ class VideoEditorProvider extends ChangeNotifier {
     FontWeight fontWeight = FontWeight.normal,
     FontStyle fontStyle = FontStyle.normal,
     TextAlign textAlign = TextAlign.center,
+    Offset position = const Offset(0.5, 0.5),
+    Color? boxColor,
+    Color? outlineColor,
+    double outlineWidth = 0,
+    bool shadow = true,
   }) {
     if (text.isEmpty) {
       _previewTextOverlay = null;
@@ -452,7 +458,11 @@ class VideoEditorProvider extends ChangeNotifier {
       _previewTextOverlay = TextOverlay(
         id: 'preview',
         text: text,
-        position: const Offset(0.5, 0.5),
+        position: position,
+        boxColor: boxColor,
+        outlineColor: outlineColor,
+        outlineWidth: outlineWidth,
+        shadow: shadow,
         startTime: Duration.zero,
         endTime: const Duration(seconds: 1),
         fontSize: fontSize,
@@ -2728,6 +2738,12 @@ class VideoEditorProvider extends ChangeNotifier {
     FontWeight fontWeight = FontWeight.normal,
     FontStyle fontStyle = FontStyle.normal,
     TextAlign textAlign = TextAlign.center,
+    String animIn = 'none',
+    String animOut = 'none',
+    Color? boxColor,
+    Color? outlineColor,
+    double outlineWidth = 0,
+    bool shadow = true,
   }) async {
     if (_currentProject == null) return;
 
@@ -2772,6 +2788,12 @@ class VideoEditorProvider extends ChangeNotifier {
       textAlign: textAlignEnum,
       startTime: startTime,
       endTime: endTime,
+      animIn: animIn,
+      animOut: animOut,
+      boxColor: boxColor,
+      outlineColor: outlineColor,
+      outlineWidth: outlineWidth,
+      shadow: shadow,
     );
     recordUndo();
     _currentProject = _currentProject!.addTextOverlay(overlay);
@@ -2793,6 +2815,14 @@ class VideoEditorProvider extends ChangeNotifier {
     Duration? endTime,
     double? rotation,
     double? opacity,
+    String? animIn,
+    String? animOut,
+    Color? boxColor,
+    bool clearBox = false,
+    Color? outlineColor,
+    bool clearOutline = false,
+    double? outlineWidth,
+    bool? shadow,
   }) async {
     if (_currentProject == null) return;
     final overlay =
@@ -2845,6 +2875,14 @@ class VideoEditorProvider extends ChangeNotifier {
       endTime: endTime,
       rotation: rotation,
       opacity: opacity,
+      animIn: animIn,
+      animOut: animOut,
+      boxColor: boxColor,
+      clearBox: clearBox,
+      outlineColor: outlineColor,
+      clearOutline: clearOutline,
+      outlineWidth: outlineWidth,
+      shadow: shadow,
     );
     recordUndo();
     _currentProject =
@@ -5472,8 +5510,10 @@ class VideoEditorProvider extends ChangeNotifier {
           }
           await _configureAudioPlayerSource(player, overlay);
 
-          final effectiveOverlayVolume =
-              (overlay.volume * _audioMasterVolume).clamp(0.0, 1.0);
+          final effectiveOverlayVolume = (overlay.volume *
+                  _audioMasterVolume *
+                  AudioFades.gain(overlay, now))
+              .clamp(0.0, 1.0);
           final lastVol = _lastSetOverlayVolume[id];
           if (lastVol == null ||
               (lastVol - effectiveOverlayVolume).abs() > 0.01) {

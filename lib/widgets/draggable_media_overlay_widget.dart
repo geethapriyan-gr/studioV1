@@ -197,7 +197,7 @@ class _DraggableMediaOverlayState extends State<DraggableMediaOverlay> {
     }
     return Container(
       color: AppColors.surface,
-      child: const Center(
+      child: Center(
         child: Icon(Icons.videocam_outlined, color: AppColors.textTertiary),
       ),
     );

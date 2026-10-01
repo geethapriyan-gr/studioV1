@@ -68,6 +68,21 @@ class TextOverlay {
   final FontStyleEnum fontStyle;
   @HiveField(12)
   final TextAlignEnum textAlign;
+  // In/out animation: 'none' | 'fade' | 'slide' | 'pop' | 'typewriter'.
+  @HiveField(13, defaultValue: 'none')
+  final String animIn;
+  @HiveField(14, defaultValue: 'none')
+  final String animOut;
+  // Rounded background box behind the text (null = none).
+  @HiveField(15)
+  final Color? boxColor;
+  // Text outline (null = none); width in px at font size 24.
+  @HiveField(16)
+  final Color? outlineColor;
+  @HiveField(17, defaultValue: 0.0)
+  final double outlineWidth;
+  @HiveField(18, defaultValue: true)
+  final bool shadow;
 
   TextOverlay({
     required this.id,
@@ -83,6 +98,12 @@ class TextOverlay {
     this.opacity = 1.0,
     this.fontStyle = FontStyleEnum.normal,
     this.textAlign = TextAlignEnum.center,
+    this.animIn = 'none',
+    this.animOut = 'none',
+    this.boxColor,
+    this.outlineColor,
+    this.outlineWidth = 0,
+    this.shadow = true,
   });
 
   TextOverlay copyWith({
@@ -98,6 +119,14 @@ class TextOverlay {
     double? opacity,
     FontStyleEnum? fontStyle,
     TextAlignEnum? textAlign,
+    String? animIn,
+    String? animOut,
+    Color? boxColor,
+    bool clearBox = false,
+    Color? outlineColor,
+    bool clearOutline = false,
+    double? outlineWidth,
+    bool? shadow,
   }) {
     return TextOverlay(
       id: id,
@@ -113,6 +142,13 @@ class TextOverlay {
       opacity: opacity ?? this.opacity,
       fontStyle: fontStyle ?? this.fontStyle,
       textAlign: textAlign ?? this.textAlign,
+      animIn: animIn ?? this.animIn,
+      animOut: animOut ?? this.animOut,
+      boxColor: clearBox ? null : (boxColor ?? this.boxColor),
+      outlineColor:
+          clearOutline ? null : (outlineColor ?? this.outlineColor),
+      outlineWidth: outlineWidth ?? this.outlineWidth,
+      shadow: shadow ?? this.shadow,
     );
   }
 
@@ -158,6 +194,12 @@ class TextOverlay {
       'endTimeMs': endTime.inMilliseconds,
       'rotation': rotation,
       'opacity': opacity,
+      'animIn': animIn,
+      'animOut': animOut,
+      'boxColor': boxColor?.toARGB32(),
+      'outlineColor': outlineColor?.toARGB32(),
+      'outlineWidth': outlineWidth,
+      'shadow': shadow,
     };
   }
 }

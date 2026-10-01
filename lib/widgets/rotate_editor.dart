@@ -82,7 +82,7 @@ class _RotateEditorState extends State<RotateEditor> {
         final selectedClipId = provider.selectedVideoClipId;
 
         if (selectedClipId == null) {
-          return const Center(
+          return Center(
             child: Text(
               'Select a video clip to rotate',
               style: TextStyle(color: AppColors.textTertiary, fontSize: 13),
@@ -97,7 +97,7 @@ class _RotateEditorState extends State<RotateEditor> {
             if (!mounted) return;
             provider.selectVideoClip(null);
           });
-          return const Center(
+          return Center(
             child: Text(
               'Select a video clip to rotate',
               style: TextStyle(color: AppColors.textTertiary, fontSize: 13),
@@ -116,10 +116,10 @@ class _RotateEditorState extends State<RotateEditor> {
                 // Header
                 Row(
                   children: [
-                    const Icon(Icons.rotate_right,
+                    Icon(Icons.rotate_right,
                         color: AppColors.textSecondary, size: 16),
                     const SizedBox(width: 8),
-                    const Text(
+                    Text(
                       'Rotate & Mirror',
                       style: TextStyle(
                         color: AppColors.textPrimary,
@@ -129,7 +129,7 @@ class _RotateEditorState extends State<RotateEditor> {
                     ),
                     const Spacer(),
                     IconButton(
-                      icon: const Icon(Icons.refresh,
+                      icon: Icon(Icons.refresh,
                           color: AppColors.textTertiary, size: 18),
                       onPressed: _resetRotation,
                       tooltip: 'Reset Rotation',
@@ -142,7 +142,7 @@ class _RotateEditorState extends State<RotateEditor> {
                 const SizedBox(height: 12),
 
                 // Quick Actions
-                const Text(
+                Text(
                   'Quick Actions',
                   style: TextStyle(color: AppColors.textTertiary, fontSize: 11),
                 ),
@@ -171,14 +171,14 @@ class _RotateEditorState extends State<RotateEditor> {
                 const SizedBox(height: 14),
 
                 // Fine Rotation Control
-                const Text(
+                Text(
                   'Fine Rotation',
                   style: TextStyle(color: AppColors.textTertiary, fontSize: 11),
                 ),
                 const SizedBox(height: 8),
                 Row(
                   children: [
-                    const SizedBox(
+                    SizedBox(
                       width: 44,
                       child: Text(
                         'Angle',
@@ -222,7 +222,7 @@ class _RotateEditorState extends State<RotateEditor> {
                       width: 44,
                       child: Text(
                         '${_currentRotation.toInt()}°',
-                        style: const TextStyle(
+                        style: TextStyle(
                             color: AppColors.textSecondary, fontSize: 11),
                         textAlign: TextAlign.right,
                       ),
@@ -259,13 +259,13 @@ class _RotateEditorState extends State<RotateEditor> {
                             decoration: BoxDecoration(
                               color: AppColors.primary,
                               borderRadius: BorderRadius.circular(2),
-                              gradient: const LinearGradient(
+                              gradient: LinearGradient(
                                 colors: [AppColors.primary, AppColors.accent],
                                 begin: Alignment.centerLeft,
                                 end: Alignment.centerRight,
                               ),
                             ),
-                            child: const Center(
+                            child: Center(
                               child: Text(
                                 "F",
                                 style: TextStyle(
@@ -285,7 +285,7 @@ class _RotateEditorState extends State<RotateEditor> {
                           children: [
                             Text(
                               'Rotation: ${_currentRotation.toInt()}°',
-                              style: const TextStyle(
+                              style: TextStyle(
                                   color: AppColors.textPrimary, fontSize: 11),
                             ),
                             const SizedBox(height: 2),
@@ -293,7 +293,7 @@ class _RotateEditorState extends State<RotateEditor> {
                               _currentMirrored
                                   ? 'Mirrored (Horizontal Flip)'
                                   : 'Normal Orientation',
-                              style: const TextStyle(
+                              style: TextStyle(
                                   color: AppColors.textTertiary, fontSize: 10),
                             ),
                           ],

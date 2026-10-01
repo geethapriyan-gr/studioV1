@@ -3,13 +3,13 @@ import 'dart:math' as math;
 import 'dart:ui' as ui;
 import 'package:flutter/material.dart';
 import 'package:flutter/foundation.dart';
+import 'package:flutter/services.dart';
 import 'package:flutter/scheduler.dart' show Ticker;
 import 'package:provider/provider.dart';
 import 'package:video_player/video_player.dart';
 import 'package:file_picker/file_picker.dart';
 import 'package:path_provider/path_provider.dart';
 import 'package:video_thumbnail/video_thumbnail.dart';
-import 'package:google_fonts/google_fonts.dart';
 import 'dart:async';
 
 import '../providers/video_editor_provider.dart';
@@ -25,7 +25,6 @@ import '../widgets/sticker_panel.dart';
 import '../widgets/sticker_layer.dart';
 
 import '../widgets/draggable_media_overlay_widget.dart';
-import '../widgets/transformable_text_overlay.dart';
 import '../models/video_project.dart';
 import '../models/editor_panel_mode.dart';
 import '../models/chroma_key_settings.dart';
@@ -34,6 +33,11 @@ import '../transitions/transition_factory.dart';
 import '../main.dart' show AppColors;
 import '../splash_screen.dart';
 import 'home/home_shell.dart';
+import '../effects/effects_preview.dart';
+import '../widgets/clip_toolbar.dart';
+import 'export_screen.dart';
+import '../widgets/clip_tool_sheets.dart';
+import '../utils/text_overlay_painter.dart';
 
 class _RectClipper extends CustomClipper<Path> {
   final Rect rect;
@@ -52,6 +56,7 @@ class _RectClipper extends CustomClipper<Path> {
 
 class _DraggableTextWidget extends StatefulWidget {
   final TextOverlay overlay;
+  final VideoEditorProvider provider;
   final BoxConstraints constraints;
   final VoidCallback onDragStart;
   final Function(Offset) onDragEnd;
@@ -63,6 +68,7 @@ class _DraggableTextWidget extends StatefulWidget {
   const _DraggableTextWidget({
     Key? key,
     required this.overlay,
+    required this.provider,
     required this.constraints,
     required this.onDragStart,
     required this.onDragEnd,
@@ -76,16 +82,65 @@ class _DraggableTextWidget extends StatefulWidget {
   State<_DraggableTextWidget> createState() => _DraggableTextWidgetState();
 }
 
-class _DraggableTextWidgetState extends State<_DraggableTextWidget> {
+class _DraggableTextWidgetState extends State<_DraggableTextWidget>
+    with SingleTickerProviderStateMixin {
   Offset? _localPosition;
   // Pinch-to-zoom state
   double _pinchScale = 1.0;
   double _baseScale = 1.0;
 
+  // Animations re-evaluate every frame (not just on the 30 Hz timeline
+  // tick) while the text is animating during playback.
+  late final Ticker _ticker = createTicker((_) {
+    if (mounted) setState(() {});
+  });
+
+  @override
+  void initState() {
+    super.initState();
+    // Repaint once a (bundled or downloaded) font finishes loading.
+    PaintingBinding.instance.systemFonts.addListener(_onFontsChanged);
+  }
+
+  void _onFontsChanged() {
+    if (mounted) setState(() {});
+  }
+
+  @override
+  void dispose() {
+    PaintingBinding.instance.systemFonts.removeListener(_onFontsChanged);
+    _ticker.dispose();
+    super.dispose();
+  }
+
+  /// Current animation state. While editing (selected) or paused the text is
+  /// shown fully so it can be seen and dragged.
+  TextAnimState _animState() {
+    final o = widget.overlay;
+    final p = widget.provider;
+    final animated = o.animIn != TextAnimations.none ||
+        o.animOut != TextAnimations.none;
+    if (!animated || widget.isSelected || !p.isPlaying) {
+      if (_ticker.isActive) _ticker.stop();
+      return const TextAnimState();
+    }
+    final t = (p.smoothPosition - o.startTime).inMicroseconds / 1e6;
+    final state = TextAnimations.at(o, t);
+    if (state.isIdle) {
+      if (_ticker.isActive) _ticker.stop();
+    } else if (!_ticker.isActive) {
+      _ticker.start();
+    }
+    return state;
+  }
+
   @override
   Widget build(BuildContext context) {
     final position = _localPosition ?? widget.overlay.position;
     final effectiveFontSize = widget.overlay.fontSize * _pinchScale;
+    final anim = _animState();
+    final textPainter =
+        TextOverlayPainter(widget.overlay, fontSize: effectiveFontSize);
 
     return Positioned(
       left: position.dx * widget.constraints.maxWidth,
@@ -143,22 +198,19 @@ class _DraggableTextWidgetState extends State<_DraggableTextWidget> {
           child: Stack(
             clipBehavior: Clip.none,
             children: [
-              Text(
-                widget.overlay.text,
-                textAlign: widget.overlay.flutterTextAlign,
-                style: GoogleFonts.getFont(
-                  widget.overlay.fontFamily,
-                  fontSize: effectiveFontSize,
-                  color: widget.overlay.color,
-                  fontWeight: widget.overlay.fontWeight,
-                  fontStyle: widget.overlay.flutterFontStyle,
-                  shadows: const [
-                    Shadow(
-                      offset: Offset(1, 1),
-                      color: Colors.black54,
-                      blurRadius: 2,
+              // Drawn by the same painter the exporter uses (box, outline,
+              // shadow), with the in/out animation applied on top.
+              Transform.translate(
+                offset: Offset(0, anim.dy),
+                child: Transform.scale(
+                  scale: anim.scale,
+                  child: Opacity(
+                    opacity: anim.opacity.clamp(0.0, 1.0),
+                    child: CustomPaint(
+                      size: textPainter.size,
+                      painter: _OverlayTextPainter(textPainter, anim.reveal),
                     ),
-                  ],
+                  ),
                 ),
               ),
               if (widget.isSelected)
@@ -249,6 +301,7 @@ class _VideoEditorScreenState extends State<VideoEditorScreen>
   @override
   void dispose() {
     WidgetsBinding.instance.removeObserver(this);
+    _pulse.dispose();
     _transitionFrameQueue.clear();
     for (final image in _transitionFrames.values) {
       image?.dispose();
@@ -303,11 +356,11 @@ class _VideoEditorScreenState extends State<VideoEditorScreen>
         backgroundColor: AppColors.surface,
         shape: RoundedRectangleBorder(
           borderRadius: BorderRadius.circular(12),
-          side: const BorderSide(color: AppColors.border),
+          side: BorderSide(color: AppColors.border),
         ),
-        title: const Text('Permissions Denied',
+        title: Text('Permissions Denied',
             style: TextStyle(color: AppColors.textPrimary)),
-        content: const Text(
+        content: Text(
           'Storage permission is required to edit videos. Please enable it in Settings.',
           style: TextStyle(color: AppColors.textSecondary),
         ),
@@ -334,7 +387,7 @@ class _VideoEditorScreenState extends State<VideoEditorScreen>
       return Scaffold(
         backgroundColor: Colors.transparent,
         body: _buildScreenBackground(
-          const Center(
+          Center(
             child: CircularProgressIndicator(
                 color: AppColors.primary, strokeWidth: 2),
           ),
@@ -354,15 +407,15 @@ class _VideoEditorScreenState extends State<VideoEditorScreen>
                 children: [
                   Container(
                     padding: const EdgeInsets.all(20),
-                    decoration: const BoxDecoration(
+                    decoration: BoxDecoration(
                       color: AppColors.surfaceLight,
                       shape: BoxShape.circle,
                     ),
-                    child: const Icon(Icons.folder_off,
+                    child: Icon(Icons.folder_off,
                         size: 48, color: AppColors.textTertiary),
                   ),
                   const SizedBox(height: 24),
-                  const Text(
+                  Text(
                     'Storage Access Required',
                     style: TextStyle(
                       color: AppColors.textPrimary,
@@ -371,7 +424,7 @@ class _VideoEditorScreenState extends State<VideoEditorScreen>
                     ),
                   ),
                   const SizedBox(height: 12),
-                  const Text(
+                  Text(
                     'To import and edit videos, Studio V needs access to your device storage.',
                     textAlign: TextAlign.center,
                     style:
@@ -428,7 +481,7 @@ class _VideoEditorScreenState extends State<VideoEditorScreen>
               behavior: HitTestBehavior.opaque,
               child: Container(
                 color: Colors.black.withOpacity(0.65),
-                child: const Center(
+                child: Center(
                   child: Column(
                     mainAxisAlignment: MainAxisAlignment.center,
                     children: [
@@ -553,7 +606,7 @@ class _VideoEditorScreenState extends State<VideoEditorScreen>
         mainAxisSize: MainAxisSize.min,
         children: [
           if (provider.isAutoSaving)
-            const SizedBox(
+            SizedBox(
               width: 10,
               height: 10,
               child: CircularProgressIndicator(
@@ -568,7 +621,7 @@ class _VideoEditorScreenState extends State<VideoEditorScreen>
               color: AppColors.success,
             )
           else
-            const Icon(
+            Icon(
               Icons.cloud_off_outlined,
               size: 14,
               color: AppColors.textTertiary,
@@ -626,9 +679,9 @@ class _VideoEditorScreenState extends State<VideoEditorScreen>
           backgroundColor: AppColors.surface,
           shape: RoundedRectangleBorder(
             borderRadius: BorderRadius.circular(12),
-            side: const BorderSide(color: AppColors.border),
+            side: BorderSide(color: AppColors.border),
           ),
-          title: const Text('Select Aspect Ratio',
+          title: Text('Select Aspect Ratio',
               style: TextStyle(color: AppColors.textPrimary)),
           content: Column(
             mainAxisSize: MainAxisSize.min,
@@ -641,7 +694,7 @@ class _VideoEditorScreenState extends State<VideoEditorScreen>
                   Navigator.pop(context);
                 },
               ),
-              const Divider(color: AppColors.border, height: 1),
+              Divider(color: AppColors.border, height: 1),
               _buildAspectRatioOption(
                 icon: Icons.crop_portrait,
                 title: 'Portrait (9:16)',
@@ -681,98 +734,11 @@ class _VideoEditorScreenState extends State<VideoEditorScreen>
     return ListTile(
       leading: Icon(icon, color: AppColors.textSecondary, size: 20),
       title: Text(title,
-          style: const TextStyle(color: AppColors.textPrimary, fontSize: 14)),
+          style: TextStyle(color: AppColors.textPrimary, fontSize: 14)),
       onTap: onTap,
       contentPadding: const EdgeInsets.symmetric(horizontal: 8),
       minLeadingWidth: 24,
     );
-  }
-
-  void _openPreviewScreen(VideoEditorProvider provider) {
-    if (provider.isPlaying) {
-      provider.togglePlayback();
-    }
-
-    Navigator.of(context)
-        .push(
-      MaterialPageRoute(
-        builder: (context) => Scaffold(
-          backgroundColor: AppColors.background,
-          body: Stack(
-            children: [
-              Center(
-                child: Consumer<VideoEditorProvider>(
-                  builder: (ctx, p, _) => FittedBox(
-                    fit: BoxFit.contain,
-                    child: SizedBox(
-                      width: _getPreviewWidth(p),
-                      height: _getPreviewHeight(p),
-                      child: _buildFilteredMedia(p, isPreviewMode: true),
-                    ),
-                  ),
-                ),
-              ),
-              Positioned(
-                top: 40,
-                left: 20,
-                child: IconButton(
-                  icon: Container(
-                    padding: const EdgeInsets.all(8),
-                    decoration: BoxDecoration(
-                      color: AppColors.surface.withOpacity(0.8),
-                      shape: BoxShape.circle,
-                    ),
-                    child: const Icon(Icons.close,
-                        color: AppColors.textPrimary, size: 20),
-                  ),
-                  onPressed: () => Navigator.pop(context),
-                ),
-              ),
-              Positioned(
-                bottom: 50,
-                left: 0,
-                right: 0,
-                child: Center(
-                  child: Consumer<VideoEditorProvider>(
-                    builder: (ctx, p, _) {
-                      if (p.isPlaying) {
-                        return GestureDetector(
-                          onTap: p.togglePlayback,
-                          behavior: HitTestBehavior.opaque,
-                          child: Container(
-                            width: 100,
-                            height: 100,
-                            color: Colors.transparent,
-                          ),
-                        );
-                      } else {
-                        return Container(
-                          decoration: BoxDecoration(
-                            color: AppColors.surface.withOpacity(0.8),
-                            shape: BoxShape.circle,
-                          ),
-                          child: IconButton(
-                            iconSize: 48,
-                            icon: const Icon(
-                              Icons.play_arrow_rounded,
-                              color: AppColors.textPrimary,
-                            ),
-                            onPressed: p.togglePlayback,
-                          ),
-                        );
-                      }
-                    },
-                  ),
-                ),
-              ),
-            ],
-          ),
-        ),
-      ),
-    )
-        .then((_) {
-      if (provider.isPlaying) provider.togglePlayback();
-    });
   }
 
   Widget _buildWelcomeView() {
@@ -819,13 +785,13 @@ class _VideoEditorScreenState extends State<VideoEditorScreen>
                         child: Column(
                           mainAxisSize: MainAxisSize.min,
                           children: [
-                            const CircularProgressIndicator(
+                            CircularProgressIndicator(
                                 color: AppColors.primary, strokeWidth: 2.5),
                             if (provider.loadingMessage != null) ...[
                               const SizedBox(height: 14),
                               Text(
                                 provider.loadingMessage!,
-                                style: const TextStyle(
+                                style: TextStyle(
                                   color: AppColors.textSecondary,
                                   fontSize: 13,
                                   fontWeight: FontWeight.w500,
@@ -836,131 +802,11 @@ class _VideoEditorScreenState extends State<VideoEditorScreen>
                         ),
                       )
                     else if (provider.hasProject)
-                      Center(
-                        child: FittedBox(
-                          fit: BoxFit.contain,
-                          child: SizedBox(
-                            width: _getPreviewWidth(provider),
-                            height: _getPreviewHeight(provider),
-                            child: GestureDetector(
-                              behavior: HitTestBehavior.opaque,
-                              onTap: () => provider.clearSelection(),
-                              child: Stack(
-                                children: [
-                                  _buildFilteredMedia(provider),
-                                  if (provider.isInGap)
-                                    Container(color: AppColors.background),
-                                  // Media Overlays (Videos/Images)
-                                  LayoutBuilder(
-                                    builder: (context, overlayConstraints) {
-                                      return Stack(
-                                        children: [
-                                          ...provider
-                                                  .currentProject?.overlayClips
-                                                  .where((clip) =>
-                                                      provider.currentPosition >=
-                                                          clip.startTime &&
-                                                      provider.currentPosition <
-                                                          clip.endTime)
-                                                  .map((overlayClip) {
-                                                return DraggableMediaOverlay(
-                                                  key: ValueKey(overlayClip.id),
-                                                  overlayClip: overlayClip,
-                                                  parentSize: Size(
-                                                    overlayConstraints.maxWidth,
-                                                    overlayConstraints
-                                                        .maxHeight,
-                                                  ),
-                                                  previewController: provider
-                                                      .previewController,
-                                                  onPositionChanged: () {},
-                                                  onUpdatePosition: (newPos) {
-                                                    provider
-                                                        .updateOverlayClipPosition(
-                                                      overlayClip.id,
-                                                      newPos,
-                                                    );
-                                                  },
-                                                  onUpdateSize: (newSize) {
-                                                    provider
-                                                        .updateOverlayClipSize(
-                                                      overlayClip.id,
-                                                      newSize,
-                                                    );
-                                                  },
-                                                  onSelected: () {
-                                                    provider.selectOverlayClip(
-                                                      overlayClip.id,
-                                                    );
-                                                  },
-                                                  onDelete: () {
-                                                    provider.removeOverlayClip(
-                                                      overlayClip.id,
-                                                    );
-                                                  },
-                                                  isSelected: provider
-                                                          .selectedOverlayClipId ==
-                                                      overlayClip.id,
-                                                );
-                                              }).toList() ??
-                                              [],
-                                        ],
-                                      );
-                                    },
-                                  ),
-                                  // Text Overlays
-                                  LayoutBuilder(
-                                    builder: (context, textConstraints) {
-                                      return Stack(
-                                        children: [
-                                          ...provider.currentTextOverlays.map(
-                                              (overlay) => _DraggableTextWidget(
-                                                    key: ValueKey(overlay.id),
-                                                    overlay: overlay,
-                                                    constraints:
-                                                        textConstraints,
-                                                    onDragStart: () {
-                                                      provider.recordUndo();
-                                                    },
-                                                    onDragEnd: (newPosition) {
-                                                      provider
-                                                          .updateTextOverlayPosition(
-                                                              overlay.id,
-                                                              newPosition);
-                                                    },
-                                                    onFontSizeChanged:
-                                                        (newFontSize) {
-                                                      provider
-                                                          .updateTextOverlay(
-                                                        overlay.id,
-                                                        fontSize: newFontSize,
-                                                      );
-                                                    },
-                                                    onSelected: () {
-                                                      provider
-                                                          .selectTextOverlay(
-                                                              overlay.id);
-                                                    },
-                                                    onDelete: () {
-                                                      provider
-                                                          .removeTextOverlay(
-                                                              overlay.id);
-                                                    },
-                                                    isSelected: provider
-                                                            .selectedTextOverlayId ==
-                                                        overlay.id,
-                                                  )),
-                                        ],
-                                      );
-                                    },
-                                  ),
-                                  // Sticker Layer
-                                  const StickerLayer(),
-                                ],
-                              ),
-                            ),
-                          ),
-                        ),
+                      _buildPreviewCanvas(provider, interactive: true),
+                    // Tap / double-tap feedback bubble.
+                    if (provider.hasProject)
+                      Positioned.fill(
+                        child: _PreviewPulse(pulse: _pulse),
                       ),
                     if (provider.hasProject && provider.isRenderingTransitions)
                       Positioned(
@@ -1009,7 +855,7 @@ class _VideoEditorScreenState extends State<VideoEditorScreen>
               height: bottomHeight,
               width: double.infinity,
               child: Container(
-                decoration: const BoxDecoration(
+                decoration: BoxDecoration(
                   color: AppColors.surface,
                   border: Border(
                       top: BorderSide(color: AppColors.border, width: 1)),
@@ -1018,7 +864,7 @@ class _VideoEditorScreenState extends State<VideoEditorScreen>
                   children: [
                     // Playback Controls
                     Container(
-                      height: 32,
+                      height: 50,
                       padding: const EdgeInsets.symmetric(horizontal: 8),
                       child: Center(
                         child: _buildPlaybackControls(provider),
@@ -1048,6 +894,151 @@ class _VideoEditorScreenState extends State<VideoEditorScreen>
         );
       },
     );
+  }
+
+  /// The preview canvas: media (with effects) plus media overlays, text and
+  /// stickers, scaled to fit. [interactive] is false in fullscreen, where
+  /// overlays are shown but cannot be dragged or selected.
+  Widget _buildPreviewCanvas(VideoEditorProvider provider,
+      {required bool interactive}) {
+    final canvas = Center(
+      child: FittedBox(
+        fit: BoxFit.contain,
+        child: SizedBox(
+          width: _getPreviewWidth(provider),
+          height: _getPreviewHeight(provider),
+          child: GestureDetector(
+            behavior: HitTestBehavior.opaque,
+            onTapUp: (d) => _onPreviewTap(provider, interactive),
+            onDoubleTapDown: (d) => _lastDoubleTapDx = d.localPosition.dx,
+            onDoubleTap: () => _onPreviewDoubleTap(
+                provider, _lastDoubleTapDx < _getPreviewWidth(provider) / 2),
+            child: Stack(
+              children: [
+                _buildFilteredMedia(provider),
+                if (provider.isInGap)
+                  Container(color: AppColors.background),
+                // Media Overlays (Videos/Images)
+                IgnorePointer(
+                 ignoring: !interactive,
+                 child: LayoutBuilder(
+                  builder: (context, overlayConstraints) {
+                    return Stack(
+                      children: [
+                        ...provider
+                                .currentProject?.overlayClips
+                                .where((clip) =>
+                                    provider.currentPosition >=
+                                        clip.startTime &&
+                                    provider.currentPosition <
+                                        clip.endTime)
+                                .map((overlayClip) {
+                              return DraggableMediaOverlay(
+                                key: ValueKey(overlayClip.id),
+                                overlayClip: overlayClip,
+                                parentSize: Size(
+                                  overlayConstraints.maxWidth,
+                                  overlayConstraints
+                                      .maxHeight,
+                                ),
+                                previewController: provider
+                                    .previewController,
+                                onPositionChanged: () {},
+                                onUpdatePosition: (newPos) {
+                                  provider
+                                      .updateOverlayClipPosition(
+                                    overlayClip.id,
+                                    newPos,
+                                  );
+                                },
+                                onUpdateSize: (newSize) {
+                                  provider
+                                      .updateOverlayClipSize(
+                                    overlayClip.id,
+                                    newSize,
+                                  );
+                                },
+                                onSelected: () {
+                                  provider.selectOverlayClip(
+                                    overlayClip.id,
+                                  );
+                                },
+                                onDelete: () {
+                                  provider.removeOverlayClip(
+                                    overlayClip.id,
+                                  );
+                                },
+                                isSelected: provider
+                                        .selectedOverlayClipId ==
+                                    overlayClip.id,
+                              );
+                            }).toList() ??
+                            [],
+                      ],
+                    );
+                  },
+                )),
+                // Text Overlays
+                IgnorePointer(
+                 ignoring: !interactive,
+                 child: LayoutBuilder(
+                  builder: (context, textConstraints) {
+                    return Stack(
+                      children: [
+                        ...provider.currentTextOverlays.map(
+                            (overlay) => _DraggableTextWidget(
+                                  key: ValueKey(overlay.id),
+                                  overlay: overlay,
+                                  provider: provider,
+                                  constraints:
+                                      textConstraints,
+                                  onDragStart: () {
+                                    provider.recordUndo();
+                                  },
+                                  onDragEnd: (newPosition) {
+                                    provider
+                                        .updateTextOverlayPosition(
+                                            overlay.id,
+                                            newPosition);
+                                  },
+                                  onFontSizeChanged:
+                                      (newFontSize) {
+                                    provider
+                                        .updateTextOverlay(
+                                      overlay.id,
+                                      fontSize: newFontSize,
+                                    );
+                                  },
+                                  onSelected: () {
+                                    provider
+                                        .selectTextOverlay(
+                                            overlay.id);
+                                  },
+                                  onDelete: () {
+                                    provider
+                                        .removeTextOverlay(
+                                            overlay.id);
+                                  },
+                                  isSelected: provider
+                                          .selectedTextOverlayId ==
+                                      overlay.id,
+                                )),
+                      ],
+                    );
+                  },
+                )),
+                // Sticker Layer
+                IgnorePointer(
+                  ignoring: !interactive,
+                  child: const StickerLayer(),
+                ),
+              ],
+            ),
+          ),
+        ),
+      ),
+    );
+    return canvas;
   }
 
   double _getPreviewWidth(VideoEditorProvider provider) {
@@ -1085,7 +1076,57 @@ class _VideoEditorScreenState extends State<VideoEditorScreen>
     return 1920.0;
   }
 
+  /// Bottom toolbar: the selected clip's own tools while a timeline clip is
+  /// selected, otherwise the main toolbar. Switching slides between them.
   Widget _buildToolBar(VideoEditorProvider provider) {
+    VideoClip? selected;
+    final selectedId = provider.selectedVideoClipId;
+    if (selectedId != null) {
+      for (final c in provider.currentProject?.videoClips ?? const <VideoClip>[]) {
+        if (c.id == selectedId) selected = c;
+      }
+    }
+    return AnimatedSwitcher(
+      duration: const Duration(milliseconds: 220),
+      switchInCurve: Curves.easeOutCubic,
+      switchOutCurve: Curves.easeInCubic,
+      transitionBuilder: (child, animation) => FadeTransition(
+        opacity: animation,
+        child: SlideTransition(
+          position: Tween(begin: const Offset(0, 0.35), end: Offset.zero)
+              .animate(animation),
+          child: child,
+        ),
+      ),
+      child: selected != null
+          ? ClipToolbar(
+              key: const ValueKey('clip-toolbar'),
+              provider: provider,
+              clip: selected,
+            )
+          : KeyedSubtree(
+              key: const ValueKey('main-toolbar'),
+              child: _buildMainToolBar(provider),
+            ),
+    );
+  }
+
+  /// Runs a clip tool from the main toolbar on the clip under the playhead
+  /// (selecting it, which also brings up the clip toolbar).
+  void _withClipAtPlayhead(
+      VideoEditorProvider provider, void Function(String clipId) action) {
+    final clip = provider.currentVideoClip;
+    if (clip == null) {
+      ScaffoldMessenger.of(context).showSnackBar(
+        const SnackBar(content: Text('Move the playhead over a clip first')),
+      );
+      return;
+    }
+    provider.selectVideoClip(clip.id);
+    action(clip.id);
+  }
+
+  Widget _buildMainToolBar(VideoEditorProvider provider) {
     return SafeArea(
       top: false,
       left: false,
@@ -1093,7 +1134,7 @@ class _VideoEditorScreenState extends State<VideoEditorScreen>
       bottom: true,
       child: Container(
         height: 84,
-        decoration: const BoxDecoration(
+        decoration: BoxDecoration(
           color: AppColors.surface,
           border: Border(top: BorderSide(color: AppColors.border, width: 1)),
         ),
@@ -1111,6 +1152,27 @@ class _VideoEditorScreenState extends State<VideoEditorScreen>
                 label: 'Timeline',
                 isActive: provider.showTimeline,
                 onPressed: provider.toggleTimeline,
+              ),
+              const SizedBox(width: 6),
+              _buildToolButton(
+                icon: Icons.auto_awesome_outlined,
+                label: 'Effects',
+                onPressed: () => _withClipAtPlayhead(provider,
+                    (id) => ClipToolSheets.effects(context, id)),
+              ),
+              const SizedBox(width: 6),
+              _buildToolButton(
+                icon: Icons.speed_rounded,
+                label: 'Speed',
+                onPressed: () => _withClipAtPlayhead(
+                    provider, (id) => ClipToolSheets.speed(context, id)),
+              ),
+              const SizedBox(width: 6),
+              _buildToolButton(
+                icon: Icons.rotate_90_degrees_ccw_rounded,
+                label: 'Rotate',
+                onPressed: () => _withClipAtPlayhead(
+                    provider, (id) => ClipToolSheets.rotate(context, id)),
               ),
               const SizedBox(width: 6),
               _buildToolButton(
@@ -1303,7 +1365,7 @@ class _VideoEditorScreenState extends State<VideoEditorScreen>
         }
       },
       itemBuilder: (context) => [
-        const PopupMenuItem(
+        PopupMenuItem(
           value: 'left',
           child: Row(
             children: [
@@ -1313,7 +1375,7 @@ class _VideoEditorScreenState extends State<VideoEditorScreen>
             ],
           ),
         ),
-        const PopupMenuItem(
+        PopupMenuItem(
           value: 'right',
           child: Row(
             children: [
@@ -1328,7 +1390,7 @@ class _VideoEditorScreenState extends State<VideoEditorScreen>
       color: AppColors.surface,
       shape: RoundedRectangleBorder(
         borderRadius: BorderRadius.circular(8),
-        side: const BorderSide(color: AppColors.border),
+        side: BorderSide(color: AppColors.border),
       ),
       child: _buildPremiumToolBox(
         icon: provider.showTrimEditor
@@ -1410,35 +1472,202 @@ class _VideoEditorScreenState extends State<VideoEditorScreen>
     );
   }
 
-  Widget _buildPlaybackControls(VideoEditorProvider provider) {
-    return Container(
-      padding: const EdgeInsets.symmetric(horizontal: 8, vertical: 4),
-      child: Row(
-        mainAxisSize: MainAxisSize.min,
-        children: [
-          IconButton(
-            icon: Icon(
-              provider.isPlaying
-                  ? Icons.pause_rounded
-                  : Icons.play_arrow_rounded,
-              color: AppColors.textPrimary,
-              size: 22,
-            ),
-            onPressed: provider.togglePlayback,
-            padding: const EdgeInsets.all(4),
-            constraints: const BoxConstraints(minWidth: 36, minHeight: 36),
-          ),
-          Text(
-            '${_formatDuration(provider.currentPosition)} / ${_formatDuration(provider.totalDuration)}',
-            style: const TextStyle(
-              color: AppColors.textSecondary,
-              fontSize: 11,
-              fontWeight: FontWeight.w500,
-            ),
-          ),
-        ],
-      ),
+  // ── Preview gestures & playback controls ─────────────────────────────
+
+  double _lastDoubleTapDx = 0;
+
+  /// Feedback bubble (play/pause/skip) shown over the preview.
+  final ValueNotifier<_PreviewPulseData?> _pulse = ValueNotifier(null);
+  int _pulseSerial = 0;
+
+  void _showPulse(IconData icon, {String? label, Alignment? alignment}) {
+    _pulse.value = _PreviewPulseData(
+      ++_pulseSerial,
+      icon,
+      label,
+      alignment ?? Alignment.center,
     );
+  }
+
+  /// Tap on the preview: deselect if something is selected, otherwise
+  /// play/pause.
+  void _onPreviewTap(VideoEditorProvider provider, bool interactive) {
+    if (interactive && provider.hasTimelineSelection) {
+      provider.clearSelection();
+      return;
+    }
+    HapticFeedback.selectionClick();
+    final willPlay = !provider.isPlaying;
+    provider.togglePlayback();
+    _showPulse(willPlay ? Icons.play_arrow_rounded : Icons.pause_rounded);
+  }
+
+  /// Double-tap left/right half of the preview: skip back/forward 2 s.
+  void _onPreviewDoubleTap(VideoEditorProvider provider, bool left) {
+    HapticFeedback.lightImpact();
+    const step = Duration(seconds: 2);
+    var target = left
+        ? provider.currentPosition - step
+        : provider.currentPosition + step;
+    if (target < Duration.zero) target = Duration.zero;
+    final total = provider.totalDuration;
+    if (target > total) target = total;
+    provider.seekTo(target);
+    _showPulse(
+      left ? Icons.fast_rewind_rounded : Icons.fast_forward_rounded,
+      label: left ? '−2s' : '+2s',
+      alignment: left ? const Alignment(-0.6, 0) : const Alignment(0.6, 0),
+    );
+  }
+
+  /// Steps one frame (at the project frame rate), pausing first.
+  Future<void> _stepFrame(VideoEditorProvider provider, int direction) async {
+    HapticFeedback.selectionClick();
+    if (provider.isPlaying) await provider.togglePlayback();
+    final fps = (provider.currentProject?.outputFrameRate ?? 30)
+        .clamp(1, 120)
+        .toDouble();
+    final frame = Duration(microseconds: (1e6 / fps).round());
+    var target = provider.currentPosition + frame * direction;
+    if (target < Duration.zero) target = Duration.zero;
+    final total = provider.totalDuration;
+    if (target > total) target = total;
+    await provider.seekTo(target);
+  }
+
+  String _formatPrecise(Duration d) {
+    final m = d.inMinutes.remainder(60).toString().padLeft(2, '0');
+    final s = d.inSeconds.remainder(60).toString().padLeft(2, '0');
+    final tenth = (d.inMilliseconds.remainder(1000) ~/ 100);
+    return '$m:$s.$tenth';
+  }
+
+  Widget _buildPlaybackControls(VideoEditorProvider provider) {
+    Widget stepButton(IconData icon, String tip, VoidCallback onTap) =>
+        IconButton(
+          tooltip: tip,
+          onPressed: onTap,
+          icon: Icon(icon, color: AppColors.textSecondary, size: 22),
+          padding: EdgeInsets.zero,
+          constraints: const BoxConstraints(minWidth: 36, minHeight: 36),
+        );
+
+    return Stack(
+      alignment: Alignment.center,
+      children: [
+        Align(
+          alignment: Alignment.centerLeft,
+          child: Padding(
+            padding: const EdgeInsets.only(left: 6),
+            child: Text.rich(
+              TextSpan(
+                children: [
+                  TextSpan(
+                    text: _formatPrecise(provider.currentPosition),
+                    style: TextStyle(
+                      color: AppColors.textPrimary,
+                      fontWeight: FontWeight.w700,
+                    ),
+                  ),
+                  TextSpan(
+                    text: ' / ${_formatDuration(provider.totalDuration)}',
+                    style: TextStyle(color: AppColors.textTertiary),
+                  ),
+                ],
+              ),
+              style: const TextStyle(
+                fontSize: 11.5,
+                fontFeatures: [FontFeature.tabularFigures()],
+              ),
+            ),
+          ),
+        ),
+        Row(
+          mainAxisSize: MainAxisSize.min,
+          children: [
+            stepButton(Icons.keyboard_arrow_left_rounded, 'Previous frame',
+                () => _stepFrame(provider, -1)),
+            const SizedBox(width: 6),
+            GestureDetector(
+              onTap: () {
+                HapticFeedback.selectionClick();
+                provider.togglePlayback();
+              },
+              child: AnimatedContainer(
+                duration: const Duration(milliseconds: 200),
+                width: 42,
+                height: 42,
+                decoration: BoxDecoration(
+                  shape: BoxShape.circle,
+                  gradient: LinearGradient(
+                    begin: Alignment.topLeft,
+                    end: Alignment.bottomRight,
+                    colors: [AppColors.primaryLight, AppColors.primaryDark],
+                  ),
+                  boxShadow: [
+                    BoxShadow(
+                      color: AppColors.primary
+                          .withValues(alpha: provider.isPlaying ? 0.55 : 0.3),
+                      blurRadius: provider.isPlaying ? 16 : 8,
+                    ),
+                  ],
+                ),
+                child: AnimatedSwitcher(
+                  duration: const Duration(milliseconds: 160),
+                  transitionBuilder: (c, a) =>
+                      ScaleTransition(scale: a, child: c),
+                  child: Icon(
+                    provider.isPlaying
+                        ? Icons.pause_rounded
+                        : Icons.play_arrow_rounded,
+                    key: ValueKey(provider.isPlaying),
+                    color: Colors.white,
+                    size: 26,
+                  ),
+                ),
+              ),
+            ),
+            const SizedBox(width: 6),
+            stepButton(Icons.keyboard_arrow_right_rounded, 'Next frame',
+                () => _stepFrame(provider, 1)),
+          ],
+        ),
+        Align(
+          alignment: Alignment.centerRight,
+          child: IconButton(
+            tooltip: 'Fullscreen preview',
+            onPressed: () => _openFullscreen(provider),
+            icon: Icon(Icons.fullscreen_rounded,
+                color: AppColors.textSecondary, size: 24),
+          ),
+        ),
+      ],
+    );
+  }
+
+  void _openFullscreen(VideoEditorProvider provider) {
+    HapticFeedback.selectionClick();
+    provider.clearSelection();
+    Navigator.of(context).push(PageRouteBuilder(
+      opaque: true,
+      transitionDuration: const Duration(milliseconds: 260),
+      reverseTransitionDuration: const Duration(milliseconds: 200),
+      pageBuilder: (_, __, ___) => _FullscreenPreview(
+        canvasBuilder: (p) => _buildPreviewCanvas(p, interactive: false),
+        pulse: _pulse,
+        onTogglePlay: (p) => _onPreviewTap(p, false),
+        onStepFrame: _stepFrame,
+        formatTime: _formatPrecise,
+      ),
+      transitionsBuilder: (_, animation, __, child) => FadeTransition(
+        opacity: animation,
+        child: ScaleTransition(
+          scale: Tween(begin: 0.96, end: 1.0).animate(
+              CurvedAnimation(parent: animation, curve: Curves.easeOutCubic)),
+          child: child,
+        ),
+      ),
+    ));
   }
 
   Widget _buildBottomPanel(VideoEditorProvider provider) {
@@ -1493,260 +1722,14 @@ class _VideoEditorScreenState extends State<VideoEditorScreen>
           outputPath = _normalizeMp4Path(outputPath);
         }
       }
-      if (outputPath != null) {
-        _showExportDialog(provider, outputPath);
+      if (outputPath != null && mounted) {
+        await Navigator.of(context).push(MaterialPageRoute(
+          builder: (_) => ExportScreen(outputPath: outputPath!),
+        ));
       }
     } catch (e) {
       _showErrorDialog('Failed to export video: $e');
     }
-  }
-
-  void _showExportDialog(VideoEditorProvider provider, String outputPath) {
-    showDialog(
-      context: context,
-      barrierDismissible: false,
-      builder: (dialogContext) {
-        int crf = 23;
-        final proj = provider.currentProject;
-        Size selectedResolution =
-            proj?.outputResolution ?? const Size(1920, 1080);
-
-        final allowed = {
-          const Size(1920, 1080),
-          const Size(1080, 1920),
-          const Size(1280, 720),
-          const Size(720, 1280),
-          const Size(854, 480),
-          const Size(480, 854),
-        };
-
-        int selectedFps = proj?.outputFrameRate ?? 30;
-
-        Future<void> startExport() async {
-          await Provider.of<VideoEditorProvider>(context, listen: false)
-              .setOutputSettings(
-                  resolution: selectedResolution, frameRate: selectedFps);
-          final result = await Provider.of<VideoEditorProvider>(context,
-                  listen: false)
-              .exportVideo(outputPath: outputPath, crf: crf, preset: 'ultrafast');
-          if (result != null && mounted) {
-            Navigator.of(dialogContext).pop();
-            String finalPath = result;
-            if (Platform.isAndroid || Platform.isIOS) {
-              try {
-                final bytes = await File(result).readAsBytes();
-                final pickedPath = await FilePicker.platform.saveFile(
-                  dialogTitle: 'Save Video',
-                  fileName: 'edited_video.mp4',
-                  type: FileType.video,
-                  bytes: bytes,
-                );
-                if (pickedPath != null) {
-                  final fixed = _normalizeMp4Path(pickedPath);
-                  if (fixed == pickedPath) {
-                    finalPath = pickedPath;
-                  } else {
-                    await File(fixed).writeAsBytes(bytes, flush: true);
-                    finalPath = fixed;
-                  }
-                }
-              } catch (_) {}
-            }
-            _showSuccessDialog('Video exported successfully to: $finalPath');
-          }
-        }
-
-        return StatefulBuilder(
-          builder: (context, setState) {
-            return Consumer<VideoEditorProvider>(
-              builder: (context, p, child) {
-                final exporting = p.isExporting;
-                return AlertDialog(
-                  backgroundColor: AppColors.surface,
-                  shape: RoundedRectangleBorder(
-                    borderRadius: BorderRadius.circular(12),
-                    side: const BorderSide(color: AppColors.border),
-                  ),
-                  title: const Text('Export Video',
-                      style: TextStyle(color: AppColors.textPrimary)),
-                  content: Column(
-                    mainAxisSize: MainAxisSize.min,
-                    crossAxisAlignment: CrossAxisAlignment.start,
-                    children: [
-                      const Text('Output',
-                          style: TextStyle(
-                              fontWeight: FontWeight.w600,
-                              color: AppColors.textPrimary)),
-                      const SizedBox(height: 12),
-                      Row(
-                        children: [
-                          const Text('Resolution',
-                              style: TextStyle(
-                                  color: AppColors.textSecondary,
-                                  fontSize: 13)),
-                          const SizedBox(width: 12),
-                          Expanded(
-                            child: DropdownButtonFormField<String>(
-                              value:
-                                  '${selectedResolution.width.toInt()}x${selectedResolution.height.toInt()}',
-                              isExpanded: true,
-                              dropdownColor: AppColors.surface,
-                              style: const TextStyle(
-                                  color: AppColors.textPrimary, fontSize: 13),
-                              decoration: InputDecoration(
-                                border: OutlineInputBorder(
-                                  borderRadius: BorderRadius.circular(8),
-                                  borderSide:
-                                      const BorderSide(color: AppColors.border),
-                                ),
-                                enabledBorder: OutlineInputBorder(
-                                  borderRadius: BorderRadius.circular(8),
-                                  borderSide:
-                                      const BorderSide(color: AppColors.border),
-                                ),
-                                contentPadding: const EdgeInsets.symmetric(
-                                    horizontal: 12, vertical: 8),
-                              ),
-                              items: [
-                                if (!allowed.contains(selectedResolution))
-                                  DropdownMenuItem(
-                                    value:
-                                        '${selectedResolution.width.toInt()}x${selectedResolution.height.toInt()}',
-                                    child: Text(
-                                        '${selectedResolution.width.toInt()}x${selectedResolution.height.toInt()} (Custom)'),
-                                  ),
-                                ...allowed.map((s) => DropdownMenuItem(
-                                      value:
-                                          '${s.width.toInt()}x${s.height.toInt()}',
-                                      child: Text(
-                                          '${s.width.toInt()}x${s.height.toInt()}'),
-                                    )),
-                              ],
-                              onChanged: exporting
-                                  ? null
-                                  : (v) {
-                                      if (v == null) return;
-                                      final parts = v.split('x');
-                                      if (parts.length >= 2) {
-                                        final wStr = parts[0].trim();
-                                        final hStr =
-                                            parts[1].split(' ')[0].trim();
-                                        final w = int.tryParse(wStr) ??
-                                            selectedResolution.width.toInt();
-                                        final h = int.tryParse(hStr) ??
-                                            selectedResolution.height.toInt();
-                                        setState(() => selectedResolution =
-                                            Size(w.toDouble(), h.toDouble()));
-                                      }
-                                    },
-                            ),
-                          ),
-                        ],
-                      ),
-                      const SizedBox(height: 12),
-                      Row(
-                        children: [
-                          const Text('Framerate',
-                              style: TextStyle(
-                                  color: AppColors.textSecondary,
-                                  fontSize: 13)),
-                          const SizedBox(width: 12),
-                          Expanded(
-                            child: DropdownButtonFormField<int>(
-                              value: selectedFps,
-                              isExpanded: true,
-                              dropdownColor: AppColors.surface,
-                              style: const TextStyle(
-                                  color: AppColors.textPrimary, fontSize: 13),
-                              decoration: InputDecoration(
-                                border: OutlineInputBorder(
-                                  borderRadius: BorderRadius.circular(8),
-                                  borderSide:
-                                      const BorderSide(color: AppColors.border),
-                                ),
-                                enabledBorder: OutlineInputBorder(
-                                  borderRadius: BorderRadius.circular(8),
-                                  borderSide:
-                                      const BorderSide(color: AppColors.border),
-                                ),
-                                contentPadding: const EdgeInsets.symmetric(
-                                    horizontal: 12, vertical: 8),
-                              ),
-                              items: const [24, 25, 30, 50, 60]
-                                  .map((e) => DropdownMenuItem(
-                                      value: e, child: Text('$e fps')))
-                                  .toList(),
-                              onChanged: exporting
-                                  ? null
-                                  : (v) => setState(
-                                      () => selectedFps = v ?? selectedFps),
-                            ),
-                          ),
-                        ],
-                      ),
-                      const SizedBox(height: 16),
-                      if (exporting) ...[
-                        ClipRRect(
-                          borderRadius: BorderRadius.circular(4),
-                          child: LinearProgressIndicator(
-                            value: p.exportProgress,
-                            backgroundColor: AppColors.border,
-                            color: AppColors.primary,
-                            minHeight: 4,
-                          ),
-                        ),
-                        const SizedBox(height: 8),
-                        Text(
-                          '${(p.exportProgress * 100).toInt()}%',
-                          style: const TextStyle(
-                              color: AppColors.textSecondary, fontSize: 12),
-                        ),
-                      ],
-                      if (p.exportError != null)
-                        Padding(
-                          padding: const EdgeInsets.only(top: 8),
-                          child: Text(
-                            p.exportError!,
-                            style: const TextStyle(
-                                color: AppColors.error, fontSize: 12),
-                          ),
-                        ),
-                    ],
-                  ),
-                  actions: [
-                    if (!exporting)
-                      TextButton(
-                        onPressed: () => Navigator.of(dialogContext).pop(),
-                        child: const Text('Close'),
-                      ),
-                    if (!exporting)
-                      ElevatedButton.icon(
-                        onPressed: startExport,
-                        icon: const Icon(Icons.save_outlined, size: 18),
-                        label: const Text('Start Export'),
-                      ),
-                    if (exporting)
-                      TextButton.icon(
-                        onPressed: () async {
-                          final cancelled = await p.cancelExport();
-                          if (cancelled && mounted) {
-                            Navigator.of(dialogContext).pop();
-                            ScaffoldMessenger.of(context).showSnackBar(
-                              const SnackBar(content: Text('Export cancelled')),
-                            );
-                          }
-                        },
-                        icon: const Icon(Icons.cancel_outlined, size: 18),
-                        label: const Text('Cancel Export'),
-                      ),
-                  ],
-                );
-              },
-            );
-          },
-        );
-      },
-    );
   }
 
   void _showErrorDialog(String message) {
@@ -1756,14 +1739,14 @@ class _VideoEditorScreenState extends State<VideoEditorScreen>
         backgroundColor: AppColors.surface,
         shape: RoundedRectangleBorder(
           borderRadius: BorderRadius.circular(12),
-          side: const BorderSide(color: AppColors.border),
+          side: BorderSide(color: AppColors.border),
         ),
         title:
-            const Text('Error', style: TextStyle(color: AppColors.textPrimary)),
+            Text('Error', style: TextStyle(color: AppColors.textPrimary)),
         content: SingleChildScrollView(
           child: Text(
             message,
-            style: const TextStyle(color: AppColors.textSecondary),
+            style: TextStyle(color: AppColors.textSecondary),
           ),
         ),
         actions: [
@@ -1802,22 +1785,22 @@ class _VideoEditorScreenState extends State<VideoEditorScreen>
         backgroundColor: AppColors.surface,
         shape: RoundedRectangleBorder(
           borderRadius: BorderRadius.circular(12),
-          side: const BorderSide(color: AppColors.border),
+          side: BorderSide(color: AppColors.border),
         ),
-        title: const Text('Merge Clips',
+        title: Text('Merge Clips',
             style: TextStyle(color: AppColors.textPrimary)),
         content: Column(
           mainAxisSize: MainAxisSize.min,
           children: [
-            const Text('Select a clip to merge with:',
+            Text('Select a clip to merge with:',
                 style: TextStyle(color: AppColors.textSecondary)),
             const SizedBox(height: 16),
             ...adjacentClips.map((clip) => ListTile(
                   title: Text('Clip ${clips.indexOf(clip) + 1}',
-                      style: const TextStyle(color: AppColors.textPrimary)),
+                      style: TextStyle(color: AppColors.textPrimary)),
                   subtitle: Text(
                       '${_formatDuration(clip.startTime)} - ${_formatDuration(clip.endTime)}',
-                      style: const TextStyle(color: AppColors.textTertiary)),
+                      style: TextStyle(color: AppColors.textTertiary)),
                   onTap: () {
                     Navigator.of(context).pop();
                     provider.mergeVideoClips(selectedClipId, clip.id);
@@ -1847,11 +1830,11 @@ class _VideoEditorScreenState extends State<VideoEditorScreen>
         backgroundColor: AppColors.surface,
         shape: RoundedRectangleBorder(
           borderRadius: BorderRadius.circular(12),
-          side: const BorderSide(color: AppColors.border),
+          side: BorderSide(color: AppColors.border),
         ),
-        title: const Text('Delete Clip',
+        title: Text('Delete Clip',
             style: TextStyle(color: AppColors.textPrimary)),
-        content: const Text(
+        content: Text(
           'Are you sure you want to delete this video clip? This action cannot be undone.',
           style: TextStyle(color: AppColors.textSecondary),
         ),
@@ -1867,29 +1850,6 @@ class _VideoEditorScreenState extends State<VideoEditorScreen>
             },
             style: TextButton.styleFrom(foregroundColor: AppColors.error),
             child: const Text('Delete'),
-          ),
-        ],
-      ),
-    );
-  }
-
-  void _showSuccessDialog(String message) {
-    showDialog(
-      context: context,
-      builder: (context) => AlertDialog(
-        backgroundColor: AppColors.surface,
-        shape: RoundedRectangleBorder(
-          borderRadius: BorderRadius.circular(12),
-          side: const BorderSide(color: AppColors.border),
-        ),
-        title: const Text('Success',
-            style: TextStyle(color: AppColors.textPrimary)),
-        content: Text(message,
-            style: const TextStyle(color: AppColors.textSecondary)),
-        actions: [
-          TextButton(
-            onPressed: () => Navigator.of(context).pop(),
-            child: const Text('OK'),
           ),
         ],
       ),
@@ -2119,7 +2079,18 @@ class _VideoEditorScreenState extends State<VideoEditorScreen>
     }
   }
 
+  /// Preview media with clip effects on top (effects follow the timeline,
+  /// exactly like the exporter applies them). Effects are skipped while the
+  /// crop editor is open so the crop handles stay still.
   Widget _buildFilteredMedia(VideoEditorProvider provider,
+      {bool isPreviewMode = false}) {
+    final media =
+        _buildFilteredMediaInner(provider, isPreviewMode: isPreviewMode);
+    if (!isPreviewMode && provider.showCropEditor) return media;
+    return EffectsPreview(provider: provider, child: media);
+  }
+
+  Widget _buildFilteredMediaInner(VideoEditorProvider provider,
       {bool isPreviewMode = false}) {
     final currentClip = provider.currentVideoClip;
     if (currentClip == null) {
@@ -2414,7 +2385,7 @@ class _VideoEditorScreenState extends State<VideoEditorScreen>
               height: double.infinity,
               errorBuilder: (_, __, ___) => Container(
                 color: AppColors.background,
-                child: const Center(
+                child: Center(
                   child: Icon(
                     Icons.image_not_supported_outlined,
                     size: 48,
@@ -2759,7 +2730,7 @@ class _VideoEditorScreenState extends State<VideoEditorScreen>
                   shape: isCorner ? BoxShape.circle : BoxShape.rectangle,
                   borderRadius: isCorner ? null : BorderRadius.circular(3),
                   border: Border.all(color: AppColors.background, width: 1),
-                  boxShadow: const [
+                  boxShadow: [
                     BoxShadow(
                         color: AppColors.background,
                         blurRadius: 4,
@@ -3156,21 +3127,328 @@ class _TransitionPreviewState extends State<_TransitionPreview>
   }
 }
 
-class _CircleRevealClipper extends CustomClipper<Path> {
-  final double progress;
 
-  const _CircleRevealClipper({required this.progress});
+class _PreviewPulseData {
+  final int serial;
+  final IconData icon;
+  final String? label;
+  final Alignment alignment;
+  const _PreviewPulseData(this.serial, this.icon, this.label, this.alignment);
+}
+
+/// Short "pop" feedback for preview gestures (play, pause, ±2 s).
+class _PreviewPulse extends StatelessWidget {
+  final ValueNotifier<_PreviewPulseData?> pulse;
+  const _PreviewPulse({required this.pulse});
 
   @override
-  Path getClip(Size size) {
-    final center = Offset(size.width / 2, size.height / 2);
-    final maxR = math.sqrt(size.width * size.width + size.height * size.height);
-    final r = maxR * progress.clamp(0.0, 1.0);
-    return Path()..addOval(Rect.fromCircle(center: center, radius: r));
+  Widget build(BuildContext context) {
+    return IgnorePointer(
+      child: ValueListenableBuilder<_PreviewPulseData?>(
+        valueListenable: pulse,
+        builder: (context, data, _) {
+          if (data == null) return const SizedBox.shrink();
+          return Align(
+            alignment: data.alignment,
+            child: TweenAnimationBuilder<double>(
+              key: ValueKey(data.serial),
+              tween: Tween(begin: 0, end: 1),
+              duration: const Duration(milliseconds: 650),
+              builder: (context, t, child) {
+                // Pop in quickly, hold, then fade out.
+                final scale = t < 0.25 ? 0.7 + 1.2 * t : 1.0;
+                final opacity = t < 0.6 ? 1.0 : (1 - (t - 0.6) / 0.4);
+                return Opacity(
+                  opacity: opacity.clamp(0.0, 1.0),
+                  child: Transform.scale(scale: scale, child: child),
+                );
+              },
+              child: Container(
+                padding: EdgeInsets.symmetric(
+                    horizontal: data.label == null ? 16 : 18, vertical: 14),
+                decoration: BoxDecoration(
+                  color: Colors.black.withValues(alpha: 0.55),
+                  borderRadius: BorderRadius.circular(40),
+                ),
+                child: Row(
+                  mainAxisSize: MainAxisSize.min,
+                  children: [
+                    Icon(data.icon, color: Colors.white, size: 34),
+                    if (data.label != null) ...[
+                      const SizedBox(width: 6),
+                      Text(
+                        data.label!,
+                        style: const TextStyle(
+                          color: Colors.white,
+                          fontSize: 16,
+                          fontWeight: FontWeight.w700,
+                        ),
+                      ),
+                    ],
+                  ],
+                ),
+              ),
+            ),
+          );
+        },
+      ),
+    );
+  }
+}
+
+/// Fullscreen preview: the same canvas as the editor (media, effects,
+/// overlays) on black, with auto-hiding controls, a scrubber, frame
+/// stepping and a landscape toggle.
+class _FullscreenPreview extends StatefulWidget {
+  final Widget Function(VideoEditorProvider) canvasBuilder;
+  final ValueNotifier<_PreviewPulseData?> pulse;
+  final void Function(VideoEditorProvider) onTogglePlay;
+  final Future<void> Function(VideoEditorProvider, int) onStepFrame;
+  final String Function(Duration) formatTime;
+
+  const _FullscreenPreview({
+    required this.canvasBuilder,
+    required this.pulse,
+    required this.onTogglePlay,
+    required this.onStepFrame,
+    required this.formatTime,
+  });
+
+  @override
+  State<_FullscreenPreview> createState() => _FullscreenPreviewState();
+}
+
+class _FullscreenPreviewState extends State<_FullscreenPreview> {
+  bool _controlsVisible = true;
+  bool _landscape = false;
+  bool _scrubbing = false;
+  double? _scrubValue;
+  Timer? _hideTimer;
+
+  @override
+  void initState() {
+    super.initState();
+    SystemChrome.setEnabledSystemUIMode(SystemUiMode.immersiveSticky);
+    _scheduleHide();
   }
 
   @override
-  bool shouldReclip(covariant _CircleRevealClipper oldClipper) {
-    return oldClipper.progress != progress;
+  void dispose() {
+    _hideTimer?.cancel();
+    SystemChrome.setEnabledSystemUIMode(SystemUiMode.edgeToEdge);
+    SystemChrome.setPreferredOrientations(const []);
+    super.dispose();
   }
+
+  void _scheduleHide() {
+    _hideTimer?.cancel();
+    _hideTimer = Timer(const Duration(seconds: 3), () {
+      if (!mounted || _scrubbing) return;
+      final playing =
+          Provider.of<VideoEditorProvider>(context, listen: false).isPlaying;
+      if (playing) setState(() => _controlsVisible = false);
+    });
+  }
+
+  void _poke() {
+    if (!_controlsVisible) setState(() => _controlsVisible = true);
+    _scheduleHide();
+  }
+
+  void _toggleOrientation() {
+    HapticFeedback.selectionClick();
+    setState(() => _landscape = !_landscape);
+    SystemChrome.setPreferredOrientations(_landscape
+        ? const [
+            DeviceOrientation.landscapeLeft,
+            DeviceOrientation.landscapeRight,
+          ]
+        : const [DeviceOrientation.portraitUp]);
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    return Consumer<VideoEditorProvider>(
+      builder: (context, p, _) {
+        final total = p.totalDuration;
+        final totalMs = math.max(1, total.inMilliseconds).toDouble();
+        final pos = _scrubValue ??
+            p.currentPosition.inMilliseconds.clamp(0, totalMs).toDouble();
+        final padding = MediaQuery.of(context).padding;
+        return Scaffold(
+          backgroundColor: Colors.black,
+          body: Listener(
+            onPointerDown: (_) => _poke(),
+            child: Stack(
+              children: [
+                Positioned.fill(child: widget.canvasBuilder(p)),
+                Positioned.fill(child: _PreviewPulse(pulse: widget.pulse)),
+                // Top bar
+                AnimatedPositioned(
+                  duration: const Duration(milliseconds: 220),
+                  left: 0,
+                  right: 0,
+                  top: _controlsVisible ? 0 : -(padding.top + 90),
+                  child: Container(
+                    padding: EdgeInsets.fromLTRB(8, padding.top + 6, 8, 18),
+                    decoration: const BoxDecoration(
+                      gradient: LinearGradient(
+                        begin: Alignment.topCenter,
+                        end: Alignment.bottomCenter,
+                        colors: [Colors.black87, Colors.transparent],
+                      ),
+                    ),
+                    child: Row(
+                      children: [
+                        IconButton(
+                          tooltip: 'Close',
+                          onPressed: () => Navigator.of(context).pop(),
+                          icon: const Icon(Icons.close_rounded,
+                              color: Colors.white),
+                        ),
+                        Expanded(
+                          child: Text(
+                            p.currentProject?.name ?? 'Preview',
+                            maxLines: 1,
+                            overflow: TextOverflow.ellipsis,
+                            style: const TextStyle(
+                                color: Colors.white,
+                                fontWeight: FontWeight.w700),
+                          ),
+                        ),
+                        IconButton(
+                          tooltip: _landscape ? 'Portrait' : 'Landscape',
+                          onPressed: _toggleOrientation,
+                          icon: Icon(
+                            _landscape
+                                ? Icons.stay_current_portrait_rounded
+                                : Icons.screen_rotation_rounded,
+                            color: Colors.white,
+                          ),
+                        ),
+                      ],
+                    ),
+                  ),
+                ),
+                // Bottom controls
+                AnimatedPositioned(
+                  duration: const Duration(milliseconds: 220),
+                  left: 0,
+                  right: 0,
+                  bottom: _controlsVisible ? 0 : -(padding.bottom + 160),
+                  child: Container(
+                    padding:
+                        EdgeInsets.fromLTRB(16, 24, 16, padding.bottom + 10),
+                    decoration: const BoxDecoration(
+                      gradient: LinearGradient(
+                        begin: Alignment.bottomCenter,
+                        end: Alignment.topCenter,
+                        colors: [Colors.black87, Colors.transparent],
+                      ),
+                    ),
+                    child: Column(
+                      mainAxisSize: MainAxisSize.min,
+                      children: [
+                        Row(
+                          children: [
+                            Text(
+                              widget.formatTime(
+                                  Duration(milliseconds: pos.round())),
+                              style: const TextStyle(
+                                  color: Colors.white, fontSize: 12),
+                            ),
+                            Expanded(
+                              child: Slider(
+                                value: pos,
+                                max: totalMs,
+                                activeColor: AppColors.primary,
+                                inactiveColor: Colors.white24,
+                                onChangeStart: (v) {
+                                  _scrubbing = true;
+                                  p.beginScrub();
+                                },
+                                onChanged: (v) {
+                                  setState(() => _scrubValue = v);
+                                  p.seekTo(Duration(milliseconds: v.round()));
+                                },
+                                onChangeEnd: (v) {
+                                  _scrubbing = false;
+                                  setState(() => _scrubValue = null);
+                                  p.endScrub();
+                                  _scheduleHide();
+                                },
+                              ),
+                            ),
+                            Text(
+                              widget.formatTime(total),
+                              style: const TextStyle(
+                                  color: Colors.white70, fontSize: 12),
+                            ),
+                          ],
+                        ),
+                        Row(
+                          mainAxisAlignment: MainAxisAlignment.center,
+                          children: [
+                            IconButton(
+                              tooltip: 'Previous frame',
+                              onPressed: () => widget.onStepFrame(p, -1),
+                              icon: const Icon(
+                                  Icons.keyboard_arrow_left_rounded,
+                                  color: Colors.white,
+                                  size: 30),
+                            ),
+                            const SizedBox(width: 12),
+                            GestureDetector(
+                              onTap: () => widget.onTogglePlay(p),
+                              child: Container(
+                                width: 58,
+                                height: 58,
+                                decoration: BoxDecoration(
+                                  shape: BoxShape.circle,
+                                  color: AppColors.primary,
+                                ),
+                                child: Icon(
+                                  p.isPlaying
+                                      ? Icons.pause_rounded
+                                      : Icons.play_arrow_rounded,
+                                  color: Colors.white,
+                                  size: 34,
+                                ),
+                              ),
+                            ),
+                            const SizedBox(width: 12),
+                            IconButton(
+                              tooltip: 'Next frame',
+                              onPressed: () => widget.onStepFrame(p, 1),
+                              icon: const Icon(
+                                  Icons.keyboard_arrow_right_rounded,
+                                  color: Colors.white,
+                                  size: 30),
+                            ),
+                          ],
+                        ),
+                      ],
+                    ),
+                  ),
+                ),
+              ],
+            ),
+          ),
+        );
+      },
+    );
+  }
+}
+
+class _OverlayTextPainter extends CustomPainter {
+  final TextOverlayPainter text;
+  final double reveal;
+  _OverlayTextPainter(this.text, this.reveal);
+
+  @override
+  void paint(Canvas canvas, Size size) =>
+      text.paint(canvas, Offset.zero, reveal: reveal);
+
+  @override
+  bool shouldRepaint(covariant _OverlayTextPainter old) => true;
 }

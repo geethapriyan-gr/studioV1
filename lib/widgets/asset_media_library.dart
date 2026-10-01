@@ -128,7 +128,7 @@ class _AssetMediaLibraryState extends State<AssetMediaLibrary>
           onPressed: () => Navigator.pop(context),
           color: AppColors.textSecondary,
         ),
-        title: const Text(
+        title: Text(
           'Media Library',
           style: TextStyle(
             fontSize: 16,
@@ -142,7 +142,7 @@ class _AssetMediaLibraryState extends State<AssetMediaLibrary>
           preferredSize: const Size.fromHeight(48),
           child: Container(
             height: 48,
-            decoration: const BoxDecoration(
+            decoration: BoxDecoration(
               border: Border(
                 bottom: BorderSide(color: AppColors.border, width: 1),
               ),
@@ -209,7 +209,7 @@ class _AssetMediaLibraryState extends State<AssetMediaLibrary>
                     color: AppColors.textTertiary.withOpacity(0.5),
                   ),
                   const SizedBox(height: 12),
-                  const Text(
+                  Text(
                     'No media available',
                     style: TextStyle(
                       color: AppColors.textTertiary,
@@ -322,7 +322,7 @@ class _AssetGridTileState extends State<_AssetGridTile> {
                       fit: BoxFit.cover,
                       errorBuilder: (_, __, ___) => Container(
                         color: AppColors.surfaceLight,
-                        child: const Icon(
+                        child: Icon(
                           Icons.broken_image_rounded,
                           color: AppColors.textTertiary,
                           size: 28,
@@ -362,7 +362,7 @@ class _AssetGridTileState extends State<_AssetGridTile> {
                       color: Colors.black.withOpacity(0.7),
                       borderRadius: BorderRadius.circular(4),
                     ),
-                    child: const Row(
+                    child: Row(
                       mainAxisSize: MainAxisSize.min,
                       children: [
                         Icon(
@@ -431,7 +431,7 @@ class _VideoAssetThumbnail extends StatelessWidget {
     final name = fileName.replaceAll(RegExp(r'\.[^.]+$'), '').trim();
 
     return Container(
-      decoration: const BoxDecoration(
+      decoration: BoxDecoration(
         gradient: LinearGradient(
           begin: Alignment.topLeft,
           end: Alignment.bottomRight,
@@ -455,7 +455,7 @@ class _VideoAssetThumbnail extends StatelessWidget {
               padding: const EdgeInsets.symmetric(horizontal: 8),
               child: Text(
                 name,
-                style: const TextStyle(
+                style: TextStyle(
                   color: AppColors.textSecondary,
                   fontSize: 10,
                   fontWeight: FontWeight.w500,

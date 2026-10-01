@@ -132,7 +132,7 @@ class _FilterEditorState extends State<FilterEditor> {
           return Container(
             color: AppColors.surface,
             padding: const EdgeInsets.symmetric(vertical: 36, horizontal: 16),
-            child: const Center(
+            child: Center(
               child: Column(
                 mainAxisSize: MainAxisSize.min,
                 children: [
@@ -177,7 +177,7 @@ class _FilterEditorState extends State<FilterEditor> {
                 child: Row(
                   mainAxisAlignment: MainAxisAlignment.spaceBetween,
                   children: [
-                    const Text(
+                    Text(
                       'Adjust',
                       style: TextStyle(
                         color: AppColors.textPrimary,
@@ -189,7 +189,7 @@ class _FilterEditorState extends State<FilterEditor> {
                       mainAxisSize: MainAxisSize.min,
                       children: [
                         IconButton(
-                          icon: const Icon(Icons.refresh,
+                          icon: Icon(Icons.refresh,
                               color: AppColors.textTertiary, size: 18),
                           onPressed: () => _resetFilters(provider),
                           tooltip: "Reset All",
@@ -379,7 +379,7 @@ class _FilterEditorState extends State<FilterEditor> {
           Row(
             mainAxisAlignment: MainAxisAlignment.spaceBetween,
             children: [
-              const Text(
+              Text(
                 'Intensity',
                 style: TextStyle(
                   color: AppColors.textPrimary,
@@ -395,7 +395,7 @@ class _FilterEditorState extends State<FilterEditor> {
                 ),
                 child: Text(
                   '${(_filterIntensity * 100).round()}%',
-                  style: const TextStyle(
+                  style: TextStyle(
                     color: AppColors.textSecondary,
                     fontSize: 11,
                     fontWeight: FontWeight.w600,

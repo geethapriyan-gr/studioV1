@@ -80,6 +80,14 @@ class _AudioOverlayEditorState extends State<AudioOverlayEditor> {
                 if (selectedId != null) ...[
                   const SizedBox(height: 16),
                   _buildVolumeSliderContainer(provider),
+                  const SizedBox(height: 12),
+                  _buildFadeControls(provider),
+                  const SizedBox(height: 6),
+                  Text(
+                    'Fades last up to 1.5 s and play in the preview and export.',
+                    style: TextStyle(
+                        color: AppColors.textTertiary, fontSize: 11),
+                  ),
                 ],
               ],
             ),
@@ -125,7 +133,7 @@ class _AudioOverlayEditorState extends State<AudioOverlayEditor> {
     return Row(
       mainAxisAlignment: MainAxisAlignment.spaceBetween,
       children: [
-        const Text(
+        Text(
           'Audio Editor',
           style: TextStyle(
             color: AppColors.textPrimary,
@@ -166,7 +174,7 @@ class _AudioOverlayEditorState extends State<AudioOverlayEditor> {
   Widget _buildSectionLabel(String label) {
     return Text(
       label,
-      style: const TextStyle(
+      style: TextStyle(
         color: AppColors.textTertiary,
         fontSize: 11,
         fontWeight: FontWeight.w500,
@@ -211,12 +219,12 @@ class _AudioOverlayEditorState extends State<AudioOverlayEditor> {
             ),
             child: Row(
               children: [
-                const Icon(Icons.music_note_rounded, color: AppColors.primary, size: 20),
+                Icon(Icons.music_note_rounded, color: AppColors.primary, size: 20),
                 const SizedBox(width: 12),
                 Expanded(
                   child: Text(
                     _selectedAudioFile!.path.split('/').last,
-                    style: const TextStyle(
+                    style: TextStyle(
                       color: AppColors.textPrimary,
                       fontSize: 13,
                       fontWeight: FontWeight.w500,
@@ -261,7 +269,7 @@ class _AudioOverlayEditorState extends State<AudioOverlayEditor> {
             const SizedBox(height: 16),
             Text(
               label,
-              style: const TextStyle(
+              style: TextStyle(
                 color: AppColors.textPrimary,
                 fontSize: 14,
                 fontWeight: FontWeight.w600,
@@ -315,13 +323,13 @@ class _AudioOverlayEditorState extends State<AudioOverlayEditor> {
       children: [
         Text(
           label,
-          style: const TextStyle(color: AppColors.textTertiary, fontSize: 10),
+          style: TextStyle(color: AppColors.textTertiary, fontSize: 10),
         ),
         const SizedBox(height: 4),
         TextField(
           controller: controller,
           onChanged: (_) => _autoUpdate(provider),
-          style: const TextStyle(color: AppColors.textPrimary, fontSize: 12),
+          style: TextStyle(color: AppColors.textPrimary, fontSize: 12),
           keyboardType: TextInputType.datetime,
           decoration: InputDecoration(
             isDense: true,
@@ -335,7 +343,7 @@ class _AudioOverlayEditorState extends State<AudioOverlayEditor> {
             ),
             hintText: '00:00',
             hintStyle:
-                const TextStyle(color: AppColors.textTertiary, fontSize: 12),
+                TextStyle(color: AppColors.textTertiary, fontSize: 12),
           ),
         ),
       ],
@@ -377,9 +385,9 @@ class _AudioOverlayEditorState extends State<AudioOverlayEditor> {
         children: [
           Row(
             children: [
-              const Icon(Icons.volume_up_rounded, color: AppColors.primary, size: 20),
+              Icon(Icons.volume_up_rounded, color: AppColors.primary, size: 20),
               const SizedBox(width: 8),
-              const Text(
+              Text(
                 'Master Volume',
                 style: TextStyle(
                   color: AppColors.textPrimary,
@@ -390,7 +398,7 @@ class _AudioOverlayEditorState extends State<AudioOverlayEditor> {
               const Spacer(),
               Text(
                 '${(_volume * 100).toInt()}%',
-                style: const TextStyle(
+                style: TextStyle(
                   color: AppColors.primary,
                   fontSize: 14,
                   fontWeight: FontWeight.w600,
@@ -468,7 +476,7 @@ class _AudioOverlayEditorState extends State<AudioOverlayEditor> {
               ),
               if (value) ...[
                 const SizedBox(width: 4),
-                const Icon(Icons.check, size: 12, color: AppColors.audioTrack),
+                Icon(Icons.check, size: 12, color: AppColors.audioTrack),
               ]
             ],
           ),
@@ -606,12 +614,12 @@ class _AudioOverlayEditorState extends State<AudioOverlayEditor> {
         backgroundColor: AppColors.surface,
         shape: RoundedRectangleBorder(
           borderRadius: BorderRadius.circular(12),
-          side: const BorderSide(color: AppColors.border),
+          side: BorderSide(color: AppColors.border),
         ),
         title:
-            const Text('Error', style: TextStyle(color: AppColors.textPrimary)),
+            Text('Error', style: TextStyle(color: AppColors.textPrimary)),
         content: Text(message,
-            style: const TextStyle(color: AppColors.textSecondary)),
+            style: TextStyle(color: AppColors.textSecondary)),
         actions: [
           TextButton(
             onPressed: () => Navigator.of(context).pop(),

@@ -14,6 +14,9 @@ import '../models/video_project.dart';
 import '../models/chroma_key_settings.dart';
 import '../models/transition.dart';
 import '../models/video_effect.dart';
+import '../effects/effect_engine.dart';
+import '../utils/audio_fades.dart';
+import '../utils/text_overlay_painter.dart';
 
 /// Holds the rendered PNG file and metadata for a single overlay.
 class _RenderedOverlay {
@@ -75,6 +78,14 @@ class _ComposeLayer {
   final bool withAudio;
   final double volume;
 
+  /// Text in/out animation (png layers only), see [TextAnimations].
+  final String animIn;
+  final String animOut;
+  final double animSeconds;
+
+  /// Output pixels per canvas pixel (1920-px-tall design space).
+  final double animScale;
+
   _ComposeLayer._(
     this.kind, {
     this.png,
@@ -87,11 +98,28 @@ class _ComposeLayer {
     this.trimDuration = 0,
     this.withAudio = false,
     this.volume = 1.0,
+    this.animIn = 'none',
+    this.animOut = 'none',
+    this.animSeconds = 0,
+    this.animScale = 1,
   });
 
-  factory _ComposeLayer.png(_LayerPng png, double start, double end) =>
+  factory _ComposeLayer.png(_LayerPng png, double start, double end,
+          {String animIn = 'none',
+          String animOut = 'none',
+          double animSeconds = 0,
+          double animScale = 1}) =>
       _ComposeLayer._(_ComposeLayerKind.png,
-          png: png, start: start, end: end);
+          png: png,
+          start: start,
+          end: end,
+          animIn: animIn,
+          animOut: animOut,
+          animSeconds: animSeconds,
+          animScale: animScale);
+
+  bool get isAnimated =>
+      animSeconds > 0 && (animIn != 'none' || animOut != 'none');
 
   factory _ComposeLayer.rawImage(
           String path, Rect box, double opacity, double start, double end) =>
@@ -135,6 +163,12 @@ class ExportService {
   static final Map<String, double> _aspectCache = {};
   static final Map<String, bool> _audioStreamCache = {};
   static bool _cancelled = false;
+
+  /// x264 quality of the running export (lower = better, bigger). Preview
+  /// renders always use the default.
+  static int _activeCrf = 23;
+  static int get _crf =>
+      Zone.current[_previewRenderZoneKey] == true ? 23 : _activeCrf;
 
   /// True when the last export was stopped by [cancelExport].
   static bool get wasCancelled => _cancelled;
@@ -260,6 +294,7 @@ class ExportService {
     Map<String, ColorFilter>? clipColorFilters,
   }) async {
     _cancelled = false;
+    _activeCrf = crf.clamp(14, 35);
     _aspectCache.clear();
     _audioStreamCache.clear();
     try {
@@ -746,7 +781,7 @@ class ExportService {
     final cmd = '-y $fgInput $bgInput $nullAudio '
         '-filter_complex "$filterComplex" '
         '-map "[ck_out]" $audioMap $audioFilter '
-        '-c:v $_softwareEncoder -preset ultrafast -tune fastdecode -threads 0 -crf 23 -pix_fmt yuv420p '
+        '-c:v $_softwareEncoder -preset ultrafast -tune fastdecode -threads 0 -crf $_crf -pix_fmt yuv420p '
         '-c:a aac -ar 44100 -ac 2 -shortest '
         '${forceKeyFrameAt != null ? '-force_key_frames ${_secs(forceKeyFrameAt)} ' : ''}'
         '"$outputPath"';
@@ -945,13 +980,13 @@ class ExportService {
       String audioFilter = aFilters.isNotEmpty ? '-af "${aFilters.join(',')}"' : '';
 
       command =
-          '-y -ss $sourceStartSeconds -t $totalDurationSeconds -i "$inputPath" $nullAudio -filter_complex "${filters.join(',')}" -map "[final_out]" $audioMap $audioFilter -c:v $encoder -preset $preset -tune fastdecode -threads 0 -crf 23 -c:a aac -ar 44100 -ac 2 -shortest $keyFrameArg"$outputPath"';
+          '-y -ss $sourceStartSeconds -t $totalDurationSeconds -i "$inputPath" $nullAudio -filter_complex "${filters.join(',')}" -map "[final_out]" $audioMap $audioFilter -c:v $encoder -preset $preset -tune fastdecode -threads 0 -crf $_crf -c:a aac -ar 44100 -ac 2 -shortest $keyFrameArg"$outputPath"';
     } else if (imageFrameReady) {
       command =
-          '-y -i "$inputPath" $nullAudio -filter_complex "${filters.join(',')}" -map "[final_out]" -map 1:a -c:v $encoder -preset $preset -tune fastdecode -threads 0 -crf 23 -c:a aac -ar 44100 -ac 2 -t ${_secs(outputDurationSeconds)} $keyFrameArg"$outputPath"';
+          '-y -i "$inputPath" $nullAudio -filter_complex "${filters.join(',')}" -map "[final_out]" -map 1:a -c:v $encoder -preset $preset -tune fastdecode -threads 0 -crf $_crf -c:a aac -ar 44100 -ac 2 -t ${_secs(outputDurationSeconds)} $keyFrameArg"$outputPath"';
     } else {
       command =
-          '-y -loop 1 -t $outputDurationSeconds -i "$inputPath" $nullAudio -filter_complex "${filters.join(',')}" -map "[final_out]" -map 1:a -c:v $encoder -preset $preset -tune fastdecode -threads 0 -crf 23 -c:a aac -ar 44100 -ac 2 -shortest $keyFrameArg"$outputPath"';
+          '-y -loop 1 -t $outputDurationSeconds -i "$inputPath" $nullAudio -filter_complex "${filters.join(',')}" -map "[final_out]" -map 1:a -c:v $encoder -preset $preset -tune fastdecode -threads 0 -crf $_crf -c:a aac -ar 44100 -ac 2 -shortest $keyFrameArg"$outputPath"';
     }
 
     return await _executeFFmpeg(command, onClipProgress,
@@ -1086,7 +1121,7 @@ class ExportService {
               '-y -i "$current" -i "$next" '
               '-filter_complex "${fc.toString()}" '
               '-map "[vout]" -map "[aout]" '
-              '-c:v $encoder -preset $preset -tune fastdecode -threads 0 -crf 23 -c:a aac -ar 44100 -ac 2 "$mergedPath"';
+              '-c:v $encoder -preset $preset -tune fastdecode -threads 0 -crf $_crf -c:a aac -ar 44100 -ac 2 "$mergedPath"';
         }
 
         String? result;
@@ -1106,7 +1141,7 @@ class ExportService {
           final concatFile = File(path.join(workDir.path, 'fallback_$i.txt'));
           await concatFile.writeAsString("file '$current'\nfile '$next'");
           final fallbackPath = path.join(workDir.path, 'fallback_merged_$i.mp4');
-          final fbCmd = '-y -f concat -safe 0 -i "${concatFile.path}" -c:v $encoder -preset $preset -tune fastdecode -threads 0 -crf 23 -c:a aac -ar 44100 -ac 2 "$fallbackPath"';
+          final fbCmd = '-y -f concat -safe 0 -i "${concatFile.path}" -c:v $encoder -preset $preset -tune fastdecode -threads 0 -crf $_crf -c:a aac -ar 44100 -ac 2 "$fallbackPath"';
           
           String? fbResult;
           try {
@@ -1422,7 +1457,7 @@ class ExportService {
       final effectsOutputPath = path.join(workDir.path, 'effects_only.mp4');
       final command = '-y -i "$inputPath" -vf "$filterString" '
           '-c:v $encoder -preset $preset -tune fastdecode -threads 0 '
-          '-crf 23 -c:a copy "$effectsOutputPath"';
+          '-crf $_crf -c:a copy "$effectsOutputPath"';
       return await _executeFFmpeg(command, onProgress,
               outputPath: effectsOutputPath, duration: duration) ??
           inputPath;
@@ -1523,7 +1558,7 @@ class ExportService {
         path.join(workDir.path, 'combined_effects_overlays.mp4');
     final command = '$inputArgs -filter_complex "$fcStr" '
         '-map "[out]" -map 0:a? '
-        '-c:v $encoder -preset $preset -tune fastdecode -threads 0 -crf 23 '
+        '-c:v $encoder -preset $preset -tune fastdecode -threads 0 -crf $_crf '
         '-r $targetFps -pix_fmt yuv420p -c:a copy -shortest "$tempOutput"';
 
     final result = await _executeFFmpeg(command, onProgress,
@@ -2372,43 +2407,17 @@ class ExportService {
     double designWidth,
     String filePath,
   ) async {
-    TextStyle style;
-    try {
-      style = GoogleFonts.getFont(
-        overlay.fontFamily,
-        fontSize: overlay.fontSize.clamp(1.0, 512.0).toDouble(),
-        color: overlay.color,
-        fontWeight: overlay.fontWeight,
-        fontStyle: overlay.flutterFontStyle,
-        shadows: const [
-          Shadow(offset: Offset(1, 1), color: Colors.black54, blurRadius: 2),
-        ],
-      );
-    } catch (_) {
-      style = GoogleFonts.roboto(
-        fontSize: overlay.fontSize.clamp(1.0, 512.0).toDouble(),
-        color: overlay.color,
-        fontWeight: overlay.fontWeight,
-        fontStyle: overlay.flutterFontStyle,
-        shadows: const [
-          Shadow(offset: Offset(1, 1), color: Colors.black54, blurRadius: 2),
-        ],
-      );
-    }
     try {
       // Make sure the font is actually loaded before rasterizing.
-      await GoogleFonts.pendingFonts([style]);
+      await GoogleFonts.pendingFonts(TextOverlayPainter(overlay).styles);
     } catch (_) {}
 
     const designHeight = 1920.0;
     // The preview draws the text inside a container with a 3px border and
     // 4px padding, positioned at (dx, dy) of the preview box, without wrapping.
     const previewInset = 7.0;
-    final painter = TextPainter(
-      text: TextSpan(text: overlay.text, style: style),
-      textAlign: overlay.flutterTextAlign,
-      textDirection: TextDirection.ltr,
-    )..layout();
+    // Same painter as the preview: box, outline, shadow and fill.
+    final painter = TextOverlayPainter(overlay);
     final origin = Offset(
       overlay.position.dx * designWidth + previewInset,
       overlay.position.dy * designHeight + previewInset,
@@ -2423,6 +2432,97 @@ class ExportService {
       offsetY: clipArea.top,
       filePath: filePath,
       opacity: overlay.opacity,
+    );
+  }
+
+  /// FFmpeg filters and overlay position expressions for an animated text
+  /// layer, mirroring [TextAnimations] (fade, slide, pop, typewriter).
+  /// Times in the layer filters are local (0..[layerDur]); the overlay
+  /// expressions use the timeline time t.
+  static Future<({String filters, String x, String y})> _textAnimation(
+      _ComposeLayer l, double layerDur) async {
+    final d = l.animSeconds;
+    final ds = _secs(d);
+    final filters = <String>[];
+    final x0 = l.png!.x;
+    final y0 = l.png!.y;
+    var pw = 0;
+    var ph = 0;
+    try {
+      final codec = await ui.instantiateImageCodec(await l.png!.file.readAsBytes());
+      final frame = await codec.getNextFrame();
+      pw = frame.image.width;
+      ph = frame.image.height;
+      frame.image.dispose();
+      codec.dispose();
+    } catch (_) {}
+
+    // Local progress (0..1) into the in- and out-animations.
+    final pin = 'clip(t/$ds,0,1)';
+    final pout = 'clip((${_secs(layerDur)}-t)/$ds,0,1)';
+    final pinT = 'clip(T/$ds,0,1)';
+    final poutT = 'clip((${_secs(layerDur)}-T)/$ds,0,1)';
+    // Timeline-time versions for overlay x/y.
+    final s = _secs(l.start);
+    final pinG = 'clip((t-$s)/$ds,0,1)';
+    final poutG = 'clip(($s+${_secs(layerDur)}-t)/$ds,0,1)';
+
+    String popScale(String p) =>
+        'if(lt($p,0.7),0.6+0.48*$p/0.7,1.08-0.08*($p-0.7)/0.3)';
+
+    var scaleExpr = '';
+    var dyExpr = '';
+    var reveal = '';
+    void apply(String kind, bool isIn) {
+      switch (kind) {
+        case 'fade':
+          filters.add(isIn
+              ? 'fade=t=in:st=0:d=$ds:alpha=1'
+              : 'fade=t=out:st=${_secs(math.max(0, layerDur - d))}:d=$ds:alpha=1');
+          break;
+        case 'slide':
+          filters.add(isIn
+              ? 'fade=t=in:st=0:d=$ds:alpha=1'
+              : 'fade=t=out:st=${_secs(math.max(0, layerDur - d))}:d=$ds:alpha=1');
+          final p = isIn ? pinG : poutG;
+          final k = _secs(TextAnimations.slideDistance * l.animScale);
+          dyExpr += '+$k*pow(1-$p,3)';
+          break;
+        case 'pop':
+          filters.add(isIn
+              ? 'fade=t=in:st=0:d=${_secs(d / 2)}:alpha=1'
+              : 'fade=t=out:st=${_secs(math.max(0, layerDur - d / 2))}:d=${_secs(d / 2)}:alpha=1');
+          final p = isIn ? pin : pout;
+          scaleExpr += '*${popScale(p)}';
+          break;
+        case 'typewriter':
+          reveal += '*${isIn ? pinT : poutT}';
+          break;
+      }
+    }
+
+    if (l.animIn != 'none') apply(l.animIn, true);
+    if (l.animOut != 'none') apply(l.animOut, false);
+
+    if (reveal.isNotEmpty) {
+      filters.add("geq=r='r(X,Y)':g='g(X,Y)':b='b(X,Y)'"
+          ":a='if(lt(X,W*(1$reveal)),alpha(X,Y),0)'");
+    }
+    var x = '$x0';
+    var y = '$y0';
+    if (scaleExpr.isNotEmpty && pw > 0 && ph > 0) {
+      filters.add("scale=w='max(2,$pw$scaleExpr)':h='max(2,$ph$scaleExpr)'"
+          ':eval=frame');
+      // Keep the text centred while it scales.
+      x = "'$x0+($pw-overlay_w)/2'";
+      y = "'$y0+($ph-overlay_h)/2$dyExpr'";
+    } else if (dyExpr.isNotEmpty) {
+      y = "'$y0$dyExpr'";
+    }
+    return (
+      filters: filters.isEmpty ? '' : ',${filters.join(',')}',
+      x: x,
+      y: y,
     );
   }
 
@@ -2514,45 +2614,6 @@ class ExportService {
     }
   }
 
-  static List<String> _effectFilterStrings(
-      VideoProject project, double duration) {
-    final out = <String>[];
-    for (final effect in project.videoEffects) {
-      final start = effect.startTime.inMilliseconds / 1000.0;
-      final end = (effect.startTime + effect.duration).inMilliseconds / 1000.0;
-      if (start >= duration) continue;
-      final intensity = effect.intensity.clamp(0.01, 1.0);
-      switch (effect.type) {
-        case VideoEffectType.blur:
-          final radius = (intensity * 15).toStringAsFixed(1);
-          out.add("boxblur=luma_radius=$radius:enable='between(t,$start,$end)'");
-          break;
-        case VideoEffectType.shake:
-          out.add(
-              "colorchannelmixer=rr=1.0:rg=0.1:rb=0.0:gr=0.0:gg=1.0:gb=0.1:br=0.1:bg=0.0:bb=1.0:enable='between(t,$start,$end)*lt(mod(t*15,1.0),0.5)'");
-          break;
-        case VideoEffectType.flash:
-          out.add(
-              "colorchannelmixer=rr=1.5:gg=1.5:bb=1.5:enable='between(t,$start,$end)*lt(mod(t-floor(t-$start),0.3),0.15)'");
-          break;
-        case VideoEffectType.glitch:
-          out.add("noise=alls=15:allf=t+u:enable='between(t,$start,$end)'");
-          break;
-        case VideoEffectType.grayscale:
-          out.add(
-              "colorchannelmixer=rr=0.2126:rg=0.7152:rb=0.0722:gr=0.2126:gg=0.7152:gb=0.0722:br=0.2126:bg=0.7152:bb=0.0722:enable='between(t,$start,$end)'");
-          break;
-        case VideoEffectType.sepia:
-          out.add(
-              "colorchannelmixer=rr=0.393:rg=0.769:rb=0.189:gr=0.349:gg=0.686:gb=0.168:br=0.272:bg=0.534:bb=0.131:enable='between(t,$start,$end)'");
-          break;
-        default:
-          break;
-      }
-    }
-    return out;
-  }
-
   /// Composites media overlays, text and stickers onto [basePath] in the same
   /// stacking order as the preview (media overlays, then text, then
   /// stickers), in as few encoding passes as possible.
@@ -2571,7 +2632,9 @@ class ExportService {
     required String preset,
     required void Function(double) onProgress,
   }) async {
-    final effects = _effectFilterStrings(project, duration);
+    // Clip effects: the same formulas the editor preview uses.
+    final effectsGraph = EffectEngine.ffmpegGraph(project,
+        width: targetWidth, height: targetHeight, duration: duration);
     final layers = <_ComposeLayer>[];
 
     // 1. Media overlays (bottom of the overlay stack in the preview)
@@ -2630,7 +2693,13 @@ class ExportService {
           (1920.0 * clipAspect).round().clamp(1, 4096).toDouble();
       final png = await _renderTextLayer(
           t, area, designWidth, path.join(workDir.path, 'layer_text_$i.png'));
-      if (png != null) layers.add(_ComposeLayer.png(png, start, end));
+      if (png != null) {
+        layers.add(_ComposeLayer.png(png, start, end,
+            animIn: t.animIn,
+            animOut: t.animOut,
+            animSeconds: TextAnimations.seconds(t),
+            animScale: area.height / 1920.0));
+      }
     }
 
     // 3. Stickers (top of the stack in the preview)
@@ -2649,7 +2718,7 @@ class ExportService {
       if (png != null) layers.add(_ComposeLayer.png(png, start, end));
     }
 
-    if (effects.isEmpty && layers.isEmpty) return basePath;
+    if (effectsGraph == null && layers.isEmpty) return basePath;
 
     // Split into passes: at most 3 simultaneously decoded videos per pass
     // (keeps memory low on phones) and a bounded number of inputs.
@@ -2677,8 +2746,11 @@ class ExportService {
       final pass = passes[p];
       final inputs = StringBuffer('-y -i "$current"');
       final fc = StringBuffer();
-      final baseFx = (p == 0 && effects.isNotEmpty) ? ',${effects.join(',')}' : '';
-      fc.write('[0:v]setpts=PTS-STARTPTS$baseFx[b0];');
+      if (p == 0 && effectsGraph != null) {
+        fc.write('[0:v]setpts=PTS-STARTPTS[e0];$effectsGraph');
+      } else {
+        fc.write('[0:v]setpts=PTS-STARTPTS[b0];');
+      }
       var prev = 'b0';
       final audioLabels = <String>[];
       for (int j = 0; j < pass.length; j++) {
@@ -2692,12 +2764,20 @@ class ExportService {
             : '';
         int x;
         int y;
+        String? overlayPos;
         switch (l.kind) {
           case _ComposeLayerKind.png:
             inputs.write(
                 ' -loop 1 -framerate $targetFps -t ${_secs(layerDur)} -i "${l.png!.file.path}"');
-            fc.write(
-                '[$idx:v]format=rgba,setpts=PTS-STARTPTS+${_secs(l.start)}/TB[l$idx];');
+            if (l.isAnimated) {
+              final anim = await _textAnimation(l, layerDur);
+              fc.write('[$idx:v]format=rgba${anim.filters},'
+                  'setpts=PTS-STARTPTS+${_secs(l.start)}/TB[l$idx];');
+              overlayPos = '${anim.x}:${anim.y}';
+            } else {
+              fc.write(
+                  '[$idx:v]format=rgba,setpts=PTS-STARTPTS+${_secs(l.start)}/TB[l$idx];');
+            }
             x = l.png!.x;
             y = l.png!.y;
             break;
@@ -2727,7 +2807,7 @@ class ExportService {
             break;
         }
         final outLabel = 'v$idx';
-        fc.write('[$prev][l$idx]overlay=$x:$y:'
+        fc.write('[$prev][l$idx]overlay=${overlayPos ?? '$x:$y'}:'
             "enable='between(t,${_secs(l.start)},${_secs(l.end)})':"
             'eof_action=pass[$outLabel];');
         prev = outLabel;
@@ -2745,7 +2825,7 @@ class ExportService {
 
       final out = path.join(workDir.path, 'composed_$p.mp4');
       final command = '$inputs -filter_complex "$fcStr" -map "[$prev]" $audioArgs '
-          '-c:v $encoder -preset $preset -tune fastdecode -threads 0 -crf 23 '
+          '-c:v $encoder -preset $preset -tune fastdecode -threads 0 -crf $_crf '
           '-r $targetFps -pix_fmt yuv420p -t ${_secs(duration)} "$out"';
       final result = await _executeFFmpeg(command, (v) {
         onProgress((p + v) / passes.length);
@@ -2768,7 +2848,7 @@ class ExportService {
     final cmd = '-y -f lavfi -i color=c=black:s=${w}x$h:r=$fps '
         '-f lavfi -i anullsrc=channel_layout=stereo:sample_rate=44100 '
         '-t ${_secs(seconds)} -vf "setsar=1,format=yuv420p" '
-        '-c:v $_softwareEncoder -preset $preset -tune fastdecode -threads 0 -crf 23 '
+        '-c:v $_softwareEncoder -preset $preset -tune fastdecode -threads 0 -crf $_crf '
         '-c:a aac -ar 44100 -ac 2 "$outPath"';
     return _executeFFmpeg(cmd, null, outputPath: outPath);
   }
@@ -2835,7 +2915,7 @@ class ExportService {
             '[ta][tb]xfade=transition=$xfadeName:duration=$sd:offset=0,format=yuv420p[tv];'
             '[1:a]asetpts=PTS-STARTPTS[tau]" '
             '-map "[tv]" -map "[tau]" -c:v $encoder -preset $preset -tune fastdecode '
-            '-threads 0 -crf 23 -c:a aac -ar 44100 -ac 2 -t $sd "$tPath"';
+            '-threads 0 -crf $_crf -c:a aac -ar 44100 -ac 2 -t $sd "$tPath"';
         final t = await _executeFFmpeg(cmd, null, outputPath: tPath);
         if (t == null) return null;
         entries.add("file '$t'");
@@ -2918,6 +2998,19 @@ class ExportService {
       final overlayVolume =
           (overlay.volume * audioMasterVolume).clamp(0.0, 1.0);
       String filter = '[$audioInputIdx:a]volume=$overlayVolume';
+      // Fades, with the same length/shape the preview mixer uses.
+      final fadeSecs = AudioFades.length(overlay.endTime - overlay.startTime)
+              .inMilliseconds /
+          1000.0;
+      if (fadeSecs > 0.01) {
+        if (overlay.fadeIn) {
+          filter += ',afade=t=in:st=0:d=${_secs(fadeSecs)}';
+        }
+        if (overlay.fadeOut) {
+          final st = math.max(0.0, overlayDuration - fadeSecs);
+          filter += ',afade=t=out:st=${_secs(st)}:d=${_secs(fadeSecs)}';
+        }
+      }
       if (delayMs > 0) {
         filter += ',adelay=$delayMs|$delayMs';
       }
@@ -3114,7 +3207,7 @@ class ExportService {
           '[ta][tb]xfade=transition=$xfadeName:duration=$sds:offset=0,format=yuv420p[tv];'
           '[1:a]asetpts=PTS-STARTPTS[tau]" '
           '-map "[tv]" -map "[tau]" -c:v $_softwareEncoder -preset ultrafast '
-          '-tune fastdecode -g 5 -threads 0 -crf 23 -c:a aac -ar 44100 -ac 2 '
+          '-tune fastdecode -g 5 -threads 0 -crf $_crf -c:a aac -ar 44100 -ac 2 '
           '-movflags +faststart -t $sds "$outputPath"';
       final out = await _executeFFmpeg(cmd,
           (p) => onProgress?.call(0.8 + 0.2 * p.clamp(0.0, 1.0)),
