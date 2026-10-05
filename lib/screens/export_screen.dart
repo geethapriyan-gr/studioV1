@@ -319,6 +319,12 @@ class _ExportScreenState extends State<ExportScreen> {
         body: SafeArea(
           child: AnimatedSwitcher(
             duration: const Duration(milliseconds: 300),
+            // Every stage fills the screen (the default layout shrinks to the
+            // child, which pushed the progress view to the left edge).
+            layoutBuilder: (current, previous) => Stack(
+              fit: StackFit.expand,
+              children: [...previous, if (current != null) current],
+            ),
             child: switch (_stage) {
               _Stage.setup => _buildSetup(),
               _Stage.exporting => _buildProgress(),

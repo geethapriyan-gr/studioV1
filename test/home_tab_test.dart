@@ -8,6 +8,7 @@ import 'package:studio_v_v2/providers/video_editor_provider.dart';
 import 'package:studio_v_v2/screens/home/home_prefs.dart';
 import 'package:studio_v_v2/screens/home/home_tab.dart';
 import 'package:studio_v_v2/screens/home/library_tab.dart';
+import 'package:studio_v_v2/screens/home/settings_tab.dart';
 import 'package:studio_v_v2/screens/home/templates_tab.dart';
 
 void main() {
@@ -144,6 +145,43 @@ void main() {
     expect(find.textContaining('Create project'), findsNothing);
     expect(tester.takeException(), isNull);
   });
+
+  for (final which in ['home', 'editor']) {
+    testWidgets('$which theme picker shows swatches and closes',
+        (tester) async {
+      tester.view.devicePixelRatio = 1.0;
+      tester.view.physicalSize = const Size(400, 850);
+      addTearDown(tester.view.resetDevicePixelRatio);
+      addTearDown(tester.view.resetPhysicalSize);
+
+      await tester.pumpWidget(MaterialApp(
+        home: Builder(
+          builder: (context) => Scaffold(
+            body: Center(
+              child: ElevatedButton(
+                onPressed: () => which == 'home'
+                    ? showHomeThemePicker(context, prefs)
+                    : showEditorThemePicker(context, prefs),
+                child: const Text('open'),
+              ),
+            ),
+          ),
+        ),
+      ));
+      await tester.tap(find.text('open'));
+      await tester.pumpAndSettle();
+
+      expect(tester.takeException(), isNull);
+      expect(find.text(which == 'home' ? 'Home theme' : 'Editor theme'),
+          findsOneWidget);
+      expect(find.text(which == 'home' ? 'Sunset' : 'Midnight Blue'),
+          findsOneWidget);
+
+      await tester.tap(find.byTooltip('Close'));
+      await tester.pumpAndSettle();
+      expect(find.byTooltip('Close'), findsNothing);
+    });
+  }
 
   testWidgets('shows the empty state without projects', (tester) async {
     await pumpHome(tester, const []);

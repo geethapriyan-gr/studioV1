@@ -310,3 +310,76 @@ String formatBytes(int bytes) {
   }
   return '${value.toStringAsFixed(value >= 100 ? 0 : 1)} ${units[i]}';
 }
+
+/// Home screen background themes. 'mountain' is the photo backdrop and
+/// 'amoled' plain black; the rest are gradients with a soft accent glow.
+class HomeThemeOption {
+  final String id;
+  final String name;
+  final String description;
+  final List<Color> colors;
+  final Color glow;
+
+  const HomeThemeOption(
+      this.id, this.name, this.description, this.colors, this.glow);
+
+  bool get isPhoto => id == 'mountain';
+
+  static const List<HomeThemeOption> all = [
+    HomeThemeOption('mountain', 'Mountain', 'Photo background (default)',
+        [Color(0xFF3B2A4A), Color(0xFF8A5A6B)], Color(0xFFE0A07A)),
+    HomeThemeOption(
+        'aurora',
+        'Aurora',
+        'Purple and teal',
+        [Color(0xFF1E0B3A), Color(0xFF0B1E3A), Color(0xFF062A2A)],
+        Color(0xFF2DD4BF)),
+    HomeThemeOption('amoled', 'AMOLED Black', 'Pure black, saves battery',
+        [Color(0xFF000000), Color(0xFF000000)], Color(0xFF8B5CF6)),
+    HomeThemeOption(
+        'sunset',
+        'Sunset',
+        'Warm plum to amber',
+        [Color(0xFF2A0F2E), Color(0xFF6B1F3A), Color(0xFFB8452F)],
+        Color(0xFFFBBF24)),
+    HomeThemeOption(
+        'ocean',
+        'Ocean',
+        'Deep sea blues',
+        [Color(0xFF021B2E), Color(0xFF043B5C), Color(0xFF0B6E7A)],
+        Color(0xFF38BDF8)),
+    HomeThemeOption(
+        'forest',
+        'Forest',
+        'Pine and moss greens',
+        [Color(0xFF06140C), Color(0xFF0F2E1B), Color(0xFF1F4A2C)],
+        Color(0xFF4ADE80)),
+    HomeThemeOption(
+        'midnight',
+        'Midnight',
+        'Indigo night sky',
+        [Color(0xFF0B1026), Color(0xFF1A1F4D), Color(0xFF2A1E5C)],
+        Color(0xFF818CF8)),
+    HomeThemeOption(
+        'rose',
+        'Rose',
+        'Berry and blush',
+        [Color(0xFF1C0A14), Color(0xFF4A1530), Color(0xFF7A2848)],
+        Color(0xFFF472B6)),
+    HomeThemeOption(
+        'ember',
+        'Ember',
+        'Charcoal with a fire glow',
+        [Color(0xFF120C08), Color(0xFF2C1A10), Color(0xFF5A2A10)],
+        Color(0xFFF97316)),
+    HomeThemeOption(
+        'graphite',
+        'Graphite',
+        'Neutral greys',
+        [Color(0xFF151517), Color(0xFF26262B), Color(0xFF3A3A40)],
+        Color(0xFFA1A1AA)),
+  ];
+
+  static HomeThemeOption byId(String id) =>
+      all.firstWhere((t) => t.id == id, orElse: () => all.first);
+}

@@ -5,6 +5,7 @@ import 'package:flutter/material.dart';
 import '../../providers/video_editor_provider.dart';
 import 'exports_tab.dart';
 import 'home_actions.dart';
+import 'home_models.dart' show HomeThemeOption;
 import 'home_prefs.dart';
 import 'home_storage.dart';
 import 'home_tab.dart';
@@ -411,34 +412,51 @@ class _ThemeBackdrop extends StatelessWidget {
 
   @override
   Widget build(BuildContext context) {
+    final option = HomeThemeOption.byId(theme);
     switch (theme) {
       case 'amoled':
         return const ColoredBox(color: Colors.black);
-      case 'aurora':
-        return const DecoratedBox(
+      case 'mountain':
+        break;
+      default:
+        // Gradient theme with a soft accent glow near the top.
+        return DecoratedBox(
           decoration: BoxDecoration(
             gradient: LinearGradient(
               begin: Alignment.topLeft,
               end: Alignment.bottomRight,
-              colors: [Color(0xFF1E0B3A), Color(0xFF0B1E3A), Color(0xFF062A2A)],
+              colors: option.colors,
+            ),
+          ),
+          child: DecoratedBox(
+            decoration: BoxDecoration(
+              gradient: RadialGradient(
+                center: const Alignment(0.7, -0.8),
+                radius: 1.1,
+                colors: [
+                  option.glow.withValues(alpha: 0.22),
+                  Colors.transparent,
+                ],
+              ),
             ),
           ),
         );
-      default:
-        // The mountain photo is already drawn behind the screen; add a soft
-        // gradient so text stays readable.
-        return DecoratedBox(
-          decoration: BoxDecoration(
-            gradient: LinearGradient(
-              begin: Alignment.topCenter,
-              end: Alignment.bottomCenter,
-              colors: [
-                Colors.black.withValues(alpha: 0.05),
-                Colors.black.withValues(alpha: 0.30),
-              ],
-            ),
+    }
+    {
+      // The mountain photo is already drawn behind the screen; add a soft
+      // gradient so text stays readable.
+      return DecoratedBox(
+        decoration: BoxDecoration(
+          gradient: LinearGradient(
+            begin: Alignment.topCenter,
+            end: Alignment.bottomCenter,
+            colors: [
+              Colors.black.withValues(alpha: 0.05),
+              Colors.black.withValues(alpha: 0.30),
+            ],
           ),
-        );
+        ),
+      );
     }
   }
 }

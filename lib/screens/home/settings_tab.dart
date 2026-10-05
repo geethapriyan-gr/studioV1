@@ -67,35 +67,7 @@ class _SettingsTabState extends State<SettingsTab> {
     if (choice != null) await prefs.setDefaultAspect(choice);
   }
 
-  Future<void> _pickTheme() async {
-    const themes = [
-      ('mountain', 'Mountain', 'Photo background (default)'),
-      ('aurora', 'Aurora', 'Purple and teal gradient'),
-      ('amoled', 'AMOLED Black', 'Pure black, saves battery'),
-    ];
-    final choice = await showHomeSheet<String>(
-      context,
-      builder: (ctx) => ListView(
-        shrinkWrap: true,
-        padding: const EdgeInsets.fromLTRB(12, 14, 12, 12),
-        children: [
-          const _SheetTitle('Home theme'),
-          for (final t in themes)
-            ListTile(
-              leading: const Icon(Icons.palette_outlined, color: kHomeAccent),
-              title: Text(t.$2, style: const TextStyle(color: Colors.white)),
-              subtitle:
-                  Text(t.$3, style: const TextStyle(color: Colors.white54)),
-              trailing: t.$1 == prefs.homeTheme
-                  ? const Icon(Icons.check_rounded, color: kHomeAccent)
-                  : null,
-              onTap: () => Navigator.pop(ctx, t.$1),
-            ),
-        ],
-      ),
-    );
-    if (choice != null) await prefs.setHomeTheme(choice);
-  }
+  Future<void> _pickTheme() => showHomeThemePicker(context, prefs);
 
   Future<void> _pickLanguage() async {
     const languages = ['English', 'हिन्दी', 'தமிழ்', 'తెలుగు', 'മലയാളം'];
@@ -217,11 +189,7 @@ class _SettingsTabState extends State<SettingsTab> {
   Widget build(BuildContext context) {
     final top = MediaQuery.of(context).padding.top;
     final aspect = AspectOption.byId(prefs.defaultAspect);
-    final themeName = switch (prefs.homeTheme) {
-      'amoled' => 'AMOLED Black',
-      'aurora' => 'Aurora',
-      _ => 'Mountain',
-    };
+    final themeName = HomeThemeOption.byId(prefs.homeTheme).name;
     final u = _usage;
 
     return ListView(
@@ -718,36 +686,267 @@ Future<void> showEditorThemePicker(BuildContext context, HomePrefs prefs) {
   return showHomeSheet<void>(
     context,
     builder: (ctx) => StatefulBuilder(
-      builder: (ctx, setSheet) => ListView(
-        shrinkWrap: true,
-        padding: const EdgeInsets.fromLTRB(16, 14, 16, 20),
-        children: [
-          const _SheetTitle('Editor theme'),
-          GridView.count(
-            crossAxisCount: 2,
-            shrinkWrap: true,
-            physics: const NeverScrollableScrollPhysics(),
-            mainAxisSpacing: 12,
-            crossAxisSpacing: 12,
-            childAspectRatio: 0.92,
-            children: [
-              for (final t in EditorThemeData.all)
-                _ThemeSwatch(
-                  theme: t,
-                  selected: t.id == prefs.editorTheme,
-                  onTap: () async {
-                    homeHaptic(prefs);
-                    AppColors.apply(t);
-                    await prefs.setEditorTheme(t.id);
-                    setSheet(() {});
-                  },
-                ),
-            ],
-          ),
-        ],
+      builder: (ctx, setSheet) => _ThemePickerLayout(
+        title: 'Editor theme',
+        subtitle: 'Colours of the editing screen. Applies instantly.',
+        grid: GridView.count(
+          crossAxisCount: 2,
+          shrinkWrap: true,
+          physics: const NeverScrollableScrollPhysics(),
+          mainAxisSpacing: 12,
+          crossAxisSpacing: 12,
+          childAspectRatio: 0.92,
+          children: [
+            for (final t in EditorThemeData.all)
+              _ThemeSwatch(
+                theme: t,
+                selected: t.id == prefs.editorTheme,
+                onTap: () async {
+                  homeHaptic(prefs);
+                  AppColors.apply(t);
+                  await prefs.setEditorTheme(t.id);
+                  setSheet(() {});
+                },
+              ),
+          ],
+        ),
       ),
     ),
   );
+}
+
+/// Home theme picker: each option is a miniature home screen (header,
+/// project cards, bottom bar) on that theme's background.
+Future<void> showHomeThemePicker(BuildContext context, HomePrefs prefs) {
+  return showHomeSheet<void>(
+    context,
+    builder: (ctx) => StatefulBuilder(
+      builder: (ctx, setSheet) => _ThemePickerLayout(
+        title: 'Home theme',
+        subtitle: 'Background of the home screen. Applies instantly.',
+        grid: GridView.count(
+          crossAxisCount: 2,
+          shrinkWrap: true,
+          physics: const NeverScrollableScrollPhysics(),
+          mainAxisSpacing: 12,
+          crossAxisSpacing: 12,
+          childAspectRatio: 0.92,
+          children: [
+            for (final t in HomeThemeOption.all)
+              _HomeThemeSwatch(
+                theme: t,
+                selected: t.id == prefs.homeTheme,
+                onTap: () async {
+                  homeHaptic(prefs);
+                  await prefs.setHomeTheme(t.id);
+                  setSheet(() {});
+                },
+              ),
+          ],
+        ),
+      ),
+    ),
+  );
+}
+
+/// Shared layout for the theme pickers: a fixed header (title, subtitle,
+/// close button) above a scrolling grid of swatches.
+class _ThemePickerLayout extends StatelessWidget {
+  final String title;
+  final String subtitle;
+  final Widget grid;
+
+  const _ThemePickerLayout({
+    required this.title,
+    required this.subtitle,
+    required this.grid,
+  });
+
+  @override
+  Widget build(BuildContext context) {
+    return Column(
+      mainAxisSize: MainAxisSize.min,
+      children: [
+        Padding(
+          padding: const EdgeInsets.fromLTRB(20, 12, 10, 4),
+          child: Row(
+            children: [
+              Expanded(
+                child: Column(
+                  crossAxisAlignment: CrossAxisAlignment.start,
+                  children: [
+                    Text(title,
+                        style: const TextStyle(
+                            color: Colors.white,
+                            fontSize: 21,
+                            fontWeight: FontWeight.w800)),
+                    const SizedBox(height: 2),
+                    Text(subtitle,
+                        style: TextStyle(
+                            color: Colors.white.withValues(alpha: 0.55),
+                            fontSize: 12.5)),
+                  ],
+                ),
+              ),
+              IconButton.filledTonal(
+                tooltip: 'Close',
+                onPressed: () => Navigator.of(context).pop(),
+                icon: const Icon(Icons.close_rounded),
+              ),
+            ],
+          ),
+        ),
+        Flexible(
+          child: SingleChildScrollView(
+            padding: const EdgeInsets.fromLTRB(16, 10, 16, 20),
+            child: grid,
+          ),
+        ),
+      ],
+    );
+  }
+}
+
+class _HomeThemeSwatch extends StatelessWidget {
+  final HomeThemeOption theme;
+  final bool selected;
+  final VoidCallback onTap;
+
+  const _HomeThemeSwatch({
+    required this.theme,
+    required this.selected,
+    required this.onTap,
+  });
+
+  @override
+  Widget build(BuildContext context) {
+    final t = theme;
+    final Widget background;
+    if (t.isPhoto) {
+      background = Image.asset('assets/background_image.jpeg',
+          fit: BoxFit.cover, cacheWidth: 360);
+    } else if (t.id == 'amoled') {
+      background = const ColoredBox(color: Colors.black);
+    } else {
+      background = DecoratedBox(
+        decoration: BoxDecoration(
+          gradient: LinearGradient(
+            begin: Alignment.topLeft,
+            end: Alignment.bottomRight,
+            colors: t.colors,
+          ),
+        ),
+        child: DecoratedBox(
+          decoration: BoxDecoration(
+            gradient: RadialGradient(
+              center: const Alignment(0.7, -0.8),
+              radius: 1.1,
+              colors: [t.glow.withValues(alpha: 0.3), Colors.transparent],
+            ),
+          ),
+        ),
+      );
+    }
+    Widget card() => Expanded(
+          child: Container(
+            margin: const EdgeInsets.symmetric(horizontal: 3),
+            decoration: BoxDecoration(
+              color: Colors.white.withValues(alpha: 0.14),
+              borderRadius: BorderRadius.circular(6),
+              border: Border.all(color: Colors.white.withValues(alpha: 0.18)),
+            ),
+          ),
+        );
+
+    return GestureDetector(
+      onTap: onTap,
+      child: AnimatedContainer(
+        duration: const Duration(milliseconds: 200),
+        padding: const EdgeInsets.all(3),
+        decoration: BoxDecoration(
+          borderRadius: BorderRadius.circular(18),
+          border: Border.all(
+            color: selected ? kHomeAccent : Colors.white.withValues(alpha: 0.1),
+            width: selected ? 2.5 : 1,
+          ),
+        ),
+        child: ClipRRect(
+          borderRadius: BorderRadius.circular(14),
+          child: Stack(
+            fit: StackFit.expand,
+            children: [
+              background,
+              Padding(
+                padding: const EdgeInsets.fromLTRB(10, 10, 10, 0),
+                child: Column(
+                  crossAxisAlignment: CrossAxisAlignment.start,
+                  children: [
+                    // Mini header: logo + title
+                    Row(
+                      children: [
+                        Container(
+                          width: 14,
+                          height: 14,
+                          decoration: BoxDecoration(
+                            color: kHomeAccent,
+                            borderRadius: BorderRadius.circular(4),
+                          ),
+                        ),
+                        const SizedBox(width: 5),
+                        Container(
+                          width: 44,
+                          height: 7,
+                          decoration: BoxDecoration(
+                            color: Colors.white.withValues(alpha: 0.85),
+                            borderRadius: BorderRadius.circular(4),
+                          ),
+                        ),
+                      ],
+                    ),
+                    const SizedBox(height: 10),
+                    // Mini project cards
+                    Expanded(child: Row(children: [card(), card()])),
+                    const SizedBox(height: 6),
+                    Expanded(child: Row(children: [card(), card()])),
+                    const SizedBox(height: 8),
+                  ],
+                ),
+              ),
+              Positioned(
+                left: 0,
+                right: 0,
+                bottom: 0,
+                child: Container(
+                  padding:
+                      const EdgeInsets.symmetric(horizontal: 10, vertical: 7),
+                  color: Colors.black.withValues(alpha: 0.55),
+                  child: Row(
+                    children: [
+                      Expanded(
+                        child: Text(
+                          t.name,
+                          maxLines: 1,
+                          overflow: TextOverflow.ellipsis,
+                          style: const TextStyle(
+                            color: Colors.white,
+                            fontWeight: FontWeight.w700,
+                            fontSize: 12.5,
+                          ),
+                        ),
+                      ),
+                      if (selected)
+                        const Icon(Icons.check_circle_rounded,
+                            color: kHomeAccent, size: 16),
+                    ],
+                  ),
+                ),
+              ),
+            ],
+          ),
+        ),
+      ),
+    );
+  }
 }
 
 class _ThemeSwatch extends StatelessWidget {
