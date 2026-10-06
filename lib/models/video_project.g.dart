@@ -18,18 +18,18 @@ class TextOverlayAdapter extends TypeAdapter<TextOverlay> {
     };
     return TextOverlay(
       id: fields[0] as String,
-      text: fields[1] as String,
-      position: fields[2] as Offset,
-      fontSize: fields[3] as double,
-      color: fields[4] as Color,
-      fontFamily: fields[5] as String,
-      fontWeight: fields[6] as FontWeight,
-      startTime: fields[7] as Duration,
-      endTime: fields[8] as Duration,
-      rotation: fields[9] as double,
-      opacity: fields[10] as double,
-      fontStyle: fields[11] as FontStyleEnum,
-      textAlign: fields[12] as TextAlignEnum,
+      text: fields[1] as String? ?? '',
+      position: fields[2] as Offset? ?? const Offset(0.5, 0.5),
+      fontSize: (fields[3] as num?)?.toDouble() ?? 24.0,
+      color: fields[4] as Color? ?? const Color(0xFFFFFFFF),
+      fontFamily: fields[5] as String? ?? 'Roboto',
+      fontWeight: fields[6] as FontWeight? ?? FontWeight.normal,
+      startTime: fields[7] as Duration? ?? Duration.zero,
+      endTime: fields[8] as Duration? ?? const Duration(seconds: 3),
+      rotation: (fields[9] as num?)?.toDouble() ?? 0.0,
+      opacity: (fields[10] as num?)?.toDouble() ?? 1.0,
+      fontStyle: fields[11] as FontStyleEnum? ?? FontStyleEnum.normal,
+      textAlign: fields[12] as TextAlignEnum? ?? TextAlignEnum.center,
       // Fields 13+ were added later; older projects read the defaults.
       animIn: fields[13] as String? ?? 'none',
       animOut: fields[14] as String? ?? 'none',
@@ -110,11 +110,12 @@ class AudioOverlayAdapter extends TypeAdapter<AudioOverlay> {
       audioFile: fields[1] as File,
       startTime: fields[2] as Duration,
       endTime: fields[3] as Duration,
-      audioStartOffset: fields[4] as Duration,
-      volume: fields[5] as double,
-      fadeIn: fields[6] as bool,
-      fadeOut: fields[7] as bool,
-      trackIndex: fields[8] as int,
+      // Every field below may be missing in projects saved by older builds.
+      audioStartOffset: fields[4] as Duration? ?? Duration.zero,
+      volume: (fields[5] as num?)?.toDouble() ?? 1.0,
+      fadeIn: fields[6] as bool? ?? false,
+      fadeOut: fields[7] as bool? ?? false,
+      trackIndex: (fields[8] as num?)?.toInt() ?? 0,
     );
   }
 
@@ -174,26 +175,37 @@ class VideoClipAdapter extends TypeAdapter<VideoClip> {
       sourceEnd: fields[7] as Duration?,
       trimStart: fields[8] as Duration?,
       trimEnd: fields[9] as Duration?,
-      volume: fields[10] as double,
-      isMuted: fields[11] as bool,
-      rotation: fields[12] as double,
+      // Fields 10+ may be missing in projects saved by older builds.
+      volume: (fields[10] as num?)?.toDouble() ?? 1.0,
+      isMuted: fields[11] as bool? ?? false,
+      rotation: (fields[12] as num?)?.toDouble() ?? 0.0,
       cropRect: fields[13] as Rect?,
-      isMirrored: fields[14] as bool,
-      playbackSpeed: fields[15] as double,
-      isReversed: fields[17] as bool,
+      isMirrored: fields[14] as bool? ?? false,
+      playbackSpeed: (fields[15] as num?)?.toDouble() ?? 1.0,
+      isReversed: fields[17] as bool? ?? false,
       reversedFilePath: fields[18] as String?,
       chromaKeySettings: fields[19] as ChromaKeySettings?,
-      overlayPosition: fields[20] as Offset,
-      overlaySize: fields[21] as Size,
-      overlayOpacity: fields[22] as double,
-      trackIndex: fields[23] as int,
+      overlayPosition: fields[20] as Offset? ?? const Offset(0.1, 0.1),
+      overlaySize: fields[21] as Size? ?? const Size(0.3, 0.3),
+      overlayOpacity: (fields[22] as num?)?.toDouble() ?? 1.0,
+      trackIndex: (fields[23] as num?)?.toInt() ?? 0,
+      maskShape: fields[24] as String? ?? 'none',
+      borderWidth: (fields[25] as num?)?.toDouble() ?? 0.0,
+      borderColor: fields[26] as Color?,
+      shadow: fields[27] as bool? ?? false,
+      animIn: fields[28] as String? ?? 'none',
+      animOut: fields[29] as String? ?? 'none',
+      keyframeData: (fields[30] as List?)
+              ?.map((e) => (e as num).toDouble())
+              .toList() ??
+          const <double>[],
     );
   }
 
   @override
   void write(BinaryWriter writer, VideoClip obj) {
     writer
-      ..writeByte(23)
+      ..writeByte(30)
       ..writeByte(0)
       ..write(obj.id)
       ..writeByte(1)
@@ -239,7 +251,21 @@ class VideoClipAdapter extends TypeAdapter<VideoClip> {
       ..writeByte(22)
       ..write(obj.overlayOpacity)
       ..writeByte(23)
-      ..write(obj.trackIndex);
+      ..write(obj.trackIndex)
+      ..writeByte(24)
+      ..write(obj.maskShape)
+      ..writeByte(25)
+      ..write(obj.borderWidth)
+      ..writeByte(26)
+      ..write(obj.borderColor)
+      ..writeByte(27)
+      ..write(obj.shadow)
+      ..writeByte(28)
+      ..write(obj.animIn)
+      ..writeByte(29)
+      ..write(obj.animOut)
+      ..writeByte(30)
+      ..write(obj.keyframeData);
   }
 
   @override
@@ -266,19 +292,23 @@ class StickerModelAdapter extends TypeAdapter<StickerModel> {
     return StickerModel(
       id: fields[0] as String,
       assetPath: fields[1] as String,
-      position: fields[2] as Offset,
-      scale: fields[3] as double,
-      rotation: fields[4] as double,
-      startTime: fields[5] as Duration,
-      endTime: fields[6] as Duration,
-      opacity: fields[7] as double,
+      position: fields[2] as Offset? ?? const Offset(0.5, 0.5),
+      scale: (fields[3] as num?)?.toDouble() ?? 1.0,
+      rotation: (fields[4] as num?)?.toDouble() ?? 0.0,
+      startTime: fields[5] as Duration? ?? Duration.zero,
+      endTime: fields[6] as Duration? ?? const Duration(seconds: 5),
+      opacity: (fields[7] as num?)?.toDouble() ?? 1.0,
+      // Fields 8+ were added later; older projects read the defaults.
+      flipX: fields[8] as bool? ?? false,
+      animIn: fields[9] as String? ?? 'none',
+      animOut: fields[10] as String? ?? 'none',
     );
   }
 
   @override
   void write(BinaryWriter writer, StickerModel obj) {
     writer
-      ..writeByte(8)
+      ..writeByte(11)
       ..writeByte(0)
       ..write(obj.id)
       ..writeByte(1)
@@ -294,7 +324,13 @@ class StickerModelAdapter extends TypeAdapter<StickerModel> {
       ..writeByte(6)
       ..write(obj.endTime)
       ..writeByte(7)
-      ..write(obj.opacity);
+      ..write(obj.opacity)
+      ..writeByte(8)
+      ..write(obj.flipX)
+      ..writeByte(9)
+      ..write(obj.animIn)
+      ..writeByte(10)
+      ..write(obj.animOut);
   }
 
   @override
@@ -318,24 +354,28 @@ class ColorFilterAdapter extends TypeAdapter<ColorFilter> {
     final fields = <int, dynamic>{
       for (int i = 0; i < numOfFields; i++) reader.readByte(): reader.read(),
     };
+    double d(int i, double fallback) =>
+        (fields[i] as num?)?.toDouble() ?? fallback;
     return ColorFilter(
-      brightness: fields[0] as double,
-      contrast: fields[1] as double,
-      saturation: fields[2] as double,
-      hue: fields[3] as double,
-      exposure: fields[4] as double,
-      highlights: fields[5] as double,
-      shadows: fields[6] as double,
-      warmth: fields[7] as double,
-      tint: fields[8] as double,
-      sharpness: fields[9] as double,
-      fade: fields[10] as double,
-      luminance: fields[11] as double,
-      temperature: fields[12] as double,
-      opacity: fields[13] as double,
-      filterPresetMatrices: (fields[14] as List)
-          .map((dynamic e) => (e as List).cast<double>())
-          .toList(),
+      brightness: d(0, 0.0),
+      contrast: d(1, 1.0),
+      saturation: d(2, 1.0),
+      hue: d(3, 0.0),
+      exposure: d(4, 0.0),
+      highlights: d(5, 0.0),
+      shadows: d(6, 0.0),
+      warmth: d(7, 0.0),
+      tint: d(8, 0.0),
+      sharpness: d(9, 0.0),
+      fade: d(10, 0.0),
+      luminance: d(11, 0.0),
+      temperature: d(12, 0.0),
+      opacity: d(13, 1.0),
+      filterPresetMatrices: (fields[14] as List?)
+              ?.map((dynamic e) =>
+                  (e as List).map((v) => (v as num).toDouble()).toList())
+              .toList() ??
+          const [],
     );
   }
 
@@ -398,21 +438,23 @@ class VideoProjectAdapter extends TypeAdapter<VideoProject> {
     };
     return VideoProject(
       id: fields[0] as String,
-      name: fields[1] as String,
-      videoClips: (fields[2] as List).cast<VideoClip>(),
-      textOverlays: (fields[3] as List).cast<TextOverlay>(),
-      audioOverlays: (fields[4] as List).cast<AudioOverlay>(),
-      stickers: (fields[5] as List).cast<StickerModel>(),
-      colorFilter: fields[6] as ColorFilter,
-      overlayClips: (fields[15] as List).cast<VideoClip>(),
-      totalDuration: fields[7] as Duration,
-      outputResolution: fields[8] as Size,
-      outputFrameRate: fields[9] as int,
+      // Lists and settings may be missing in projects saved by older builds.
+      name: fields[1] as String? ?? 'Untitled',
+      videoClips: (fields[2] as List?)?.cast<VideoClip>() ?? const [],
+      textOverlays: (fields[3] as List?)?.cast<TextOverlay>() ?? const [],
+      audioOverlays: (fields[4] as List?)?.cast<AudioOverlay>() ?? const [],
+      stickers: (fields[5] as List?)?.cast<StickerModel>() ?? const [],
+      colorFilter: fields[6] as ColorFilter? ?? const ColorFilter(),
+      overlayClips: (fields[15] as List?)?.cast<VideoClip>() ?? const [],
+      totalDuration: fields[7] as Duration? ?? Duration.zero,
+      outputResolution: fields[8] as Size? ?? const Size(1920, 1080),
+      outputFrameRate: (fields[9] as num?)?.toInt() ?? 30,
       createdAt: fields[10] as DateTime?,
       lastModified: fields[11] as DateTime?,
-      chromaKeyBackgrounds: (fields[12] as List).cast<String>(),
-      transitions: (fields[13] as List).cast<Transition>(),
-      videoEffects: (fields[14] as List).cast<VideoEffect>(),
+      chromaKeyBackgrounds:
+          (fields[12] as List?)?.cast<String>() ?? const [],
+      transitions: (fields[13] as List?)?.cast<Transition>() ?? const [],
+      videoEffects: (fields[14] as List?)?.cast<VideoEffect>() ?? const [],
     );
   }
 

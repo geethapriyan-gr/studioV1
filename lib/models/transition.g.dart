@@ -21,8 +21,8 @@ class TransitionAdapter extends TypeAdapter<Transition> {
       clipId1: fields[1] as String,
       clipId2: fields[2] as String,
       type: fields[3] as TransitionType,
-      duration: fields[4] as Duration,
-      startTime: fields[5] as Duration,
+      duration: fields[4] as Duration? ?? const Duration(milliseconds: 500),
+      startTime: fields[5] as Duration? ?? Duration.zero,
     );
   }
 

@@ -270,6 +270,7 @@ class AudioOverlay {
       'volume': volume,
       'fadeIn': fadeIn,
       'fadeOut': fadeOut,
+      'trackIndex': trackIndex,
     };
   }
 }
@@ -323,6 +324,26 @@ class VideoClip {
   @HiveField(23)
   final int trackIndex;
 
+  // ── Media-overlay (picture-in-picture) look; unused for main clips ──
+  /// Mask shape, see [OverlayShapes]: 'none' | 'rounded' | 'circle' | ...
+  @HiveField(24, defaultValue: 'none')
+  final String maskShape;
+  /// Border thickness in canvas pixels (1920-px-tall design space).
+  @HiveField(25, defaultValue: 0.0)
+  final double borderWidth;
+  @HiveField(26)
+  final Color? borderColor;
+  @HiveField(27, defaultValue: false)
+  final bool shadow;
+  /// In/out animation: 'none' | 'fade' | 'slide' | 'pop'.
+  @HiveField(28, defaultValue: 'none')
+  final String animIn;
+  @HiveField(29, defaultValue: 'none')
+  final String animOut;
+  /// Motion keyframes, flattened as [OverlayKeyframe.encode] produces.
+  @HiveField(30, defaultValue: <double>[])
+  final List<double> keyframeData;
+
   VideoClip({
     required this.id,
     required this.mediaType,
@@ -347,6 +368,13 @@ class VideoClip {
     this.overlaySize = const Size(0.3, 0.3),
     this.overlayOpacity = 1.0,
     this.trackIndex = 0,
+    this.maskShape = 'none',
+    this.borderWidth = 0.0,
+    this.borderColor,
+    this.shadow = false,
+    this.animIn = 'none',
+    this.animOut = 'none',
+    this.keyframeData = const [],
   })  : sourceStart = sourceStart ?? startTime,
         sourceEnd = sourceEnd ?? endTime,
         trimStart = trimStart ?? (sourceStart ?? startTime),
@@ -378,6 +406,15 @@ class VideoClip {
     Size? overlaySize,
     double? overlayOpacity,
     int? trackIndex,
+    bool clearCropRect = false,
+    String? maskShape,
+    double? borderWidth,
+    Color? borderColor,
+    bool clearBorderColor = false,
+    bool? shadow,
+    String? animIn,
+    String? animOut,
+    List<double>? keyframeData,
   }) {
     return VideoClip(
       id: id ?? this.id,
@@ -393,7 +430,7 @@ class VideoClip {
       volume: volume ?? this.volume,
       isMuted: isMuted ?? this.isMuted,
       rotation: rotation ?? this.rotation,
-      cropRect: cropRect ?? this.cropRect,
+      cropRect: clearCropRect ? null : (cropRect ?? this.cropRect),
       isMirrored: isMirrored ?? this.isMirrored,
       playbackSpeed: playbackSpeed ?? this.playbackSpeed,
       isReversed: isReversed ?? this.isReversed,
@@ -407,11 +444,24 @@ class VideoClip {
       overlaySize: overlaySize ?? this.overlaySize,
       overlayOpacity: overlayOpacity ?? this.overlayOpacity,
       trackIndex: trackIndex ?? this.trackIndex,
+      maskShape: maskShape ?? this.maskShape,
+      borderWidth: borderWidth ?? this.borderWidth,
+      borderColor:
+          clearBorderColor ? null : (borderColor ?? this.borderColor),
+      shadow: shadow ?? this.shadow,
+      animIn: animIn ?? this.animIn,
+      animOut: animOut ?? this.animOut,
+      keyframeData: keyframeData ?? this.keyframeData,
     );
   }
 
   Duration get duration => endTime - startTime;
   Duration get trimmedDuration => trimEnd - trimStart;
+
+  List<OverlayKeyframe> get keyframes => OverlayKeyframe.decode(keyframeData);
+
+  /// True when a border is drawn around the overlay.
+  bool get hasBorder => borderColor != null && borderWidth > 0;
 
   Map<String, dynamic> toJson() {
     return {
@@ -446,7 +496,82 @@ class VideoClip {
       'overlayWidth': overlaySize.width,
       'overlayHeight': overlaySize.height,
       'overlayOpacity': overlayOpacity,
+      'trackIndex': trackIndex,
+      'maskShape': maskShape,
+      'borderWidth': borderWidth,
+      'borderColor': borderColor?.toARGB32(),
+      'shadow': shadow,
+      'animIn': animIn,
+      'animOut': animOut,
+      'keyframes': keyframeData,
     };
+  }
+}
+
+/// A media-overlay motion keyframe: where the overlay box is (top-left and
+/// size, normalized to the preview box) [time] after the overlay starts.
+/// Between keyframes the box moves linearly; preview and export share
+/// [OverlayKeyframe.boxAt].
+class OverlayKeyframe {
+  final Duration time;
+  final Offset position;
+  final Size size;
+
+  const OverlayKeyframe(this.time, this.position, this.size);
+
+  static const int _stride = 5;
+
+  static List<OverlayKeyframe> decode(List<double> data) {
+    final out = <OverlayKeyframe>[];
+    for (int i = 0; i + _stride <= data.length; i += _stride) {
+      out.add(OverlayKeyframe(
+        Duration(microseconds: (data[i] * 1000).round()),
+        Offset(data[i + 1], data[i + 2]),
+        Size(data[i + 3], data[i + 4]),
+      ));
+    }
+    out.sort((a, b) => a.time.compareTo(b.time));
+    return out;
+  }
+
+  static List<double> encode(List<OverlayKeyframe> frames) {
+    final sorted = List<OverlayKeyframe>.from(frames)
+      ..sort((a, b) => a.time.compareTo(b.time));
+    return [
+      for (final k in sorted) ...[
+        k.time.inMicroseconds / 1000.0,
+        k.position.dx,
+        k.position.dy,
+        k.size.width,
+        k.size.height,
+      ]
+    ];
+  }
+
+  /// Box (position, size) of an overlay [local] time after it starts.
+  /// Without keyframes this is the overlay's static box.
+  static (Offset, Size) boxAt(VideoClip clip, Duration local) {
+    final frames = clip.keyframes;
+    if (frames.isEmpty) return (clip.overlayPosition, clip.overlaySize);
+    if (local <= frames.first.time) {
+      return (frames.first.position, frames.first.size);
+    }
+    if (local >= frames.last.time) {
+      return (frames.last.position, frames.last.size);
+    }
+    for (int i = 0; i < frames.length - 1; i++) {
+      final a = frames[i];
+      final b = frames[i + 1];
+      if (local >= a.time && local <= b.time) {
+        final span = (b.time - a.time).inMicroseconds;
+        final t = span <= 0 ? 1.0 : (local - a.time).inMicroseconds / span;
+        return (
+          Offset.lerp(a.position, b.position, t)!,
+          Size.lerp(a.size, b.size, t)!,
+        );
+      }
+    }
+    return (frames.last.position, frames.last.size);
   }
 }
 
@@ -468,6 +593,14 @@ class StickerModel {
   final Duration endTime;
   @HiveField(7)
   final double opacity;
+  // Mirrored horizontally.
+  @HiveField(8, defaultValue: false)
+  final bool flipX;
+  // In/out animation: 'none' | 'fade' | 'slide' | 'pop'.
+  @HiveField(9, defaultValue: 'none')
+  final String animIn;
+  @HiveField(10, defaultValue: 'none')
+  final String animOut;
 
   StickerModel({
     required this.id,
@@ -478,9 +611,20 @@ class StickerModel {
     required this.startTime,
     required this.endTime,
     this.opacity = 1.0,
+    this.flipX = false,
+    this.animIn = 'none',
+    this.animOut = 'none',
   });
 
+  /// Bundled stickers are asset paths; stickers made from the user's own
+  /// images are absolute file paths.
+  bool get isAsset => assetPath.startsWith('assets/');
+
+  /// Animated GIF stickers play in the preview and in the export.
+  bool get isAnimated => assetPath.toLowerCase().endsWith('.gif');
+
   StickerModel copyWith({
+    String? id,
     String? assetPath,
     Offset? position,
     double? scale,
@@ -488,9 +632,12 @@ class StickerModel {
     Duration? startTime,
     Duration? endTime,
     double? opacity,
+    bool? flipX,
+    String? animIn,
+    String? animOut,
   }) {
     return StickerModel(
-      id: id,
+      id: id ?? this.id,
       assetPath: assetPath ?? this.assetPath,
       position: position ?? this.position,
       scale: scale ?? this.scale,
@@ -498,6 +645,9 @@ class StickerModel {
       startTime: startTime ?? this.startTime,
       endTime: endTime ?? this.endTime,
       opacity: opacity ?? this.opacity,
+      flipX: flipX ?? this.flipX,
+      animIn: animIn ?? this.animIn,
+      animOut: animOut ?? this.animOut,
     );
   }
 
@@ -511,6 +661,9 @@ class StickerModel {
       'startTimeMs': startTime.inMilliseconds,
       'endTimeMs': endTime.inMilliseconds,
       'opacity': opacity,
+      'flipX': flipX,
+      'animIn': animIn,
+      'animOut': animOut,
     };
   }
 }
@@ -743,20 +896,45 @@ class VideoProject {
       stickers: stickers.where((s) => s.id != id).toList(),
       lastModified: DateTime.now());
 
-  Duration calculateTotalDuration() {
-    if (videoClips.isEmpty) return Duration.zero;
+  Duration calculateTotalDuration() => _maxEnd(videoClips);
+
+  static Duration _maxEnd(List<VideoClip> clips) {
     Duration maxEndTime = Duration.zero;
-    for (final clip in videoClips) {
+    for (final clip in clips) {
       if (clip.endTime > maxEndTime) maxEndTime = clip.endTime;
     }
     return maxEndTime;
+  }
+
+  /// End of the last item of any kind: clips, media overlays, text,
+  /// stickers and audio. This is the length of the video the preview plays
+  /// and the exporter renders.
+  Duration get contentEnd {
+    var end = _maxEnd(videoClips);
+    void take(Duration d) {
+      if (d > end) end = d;
+    }
+
+    for (final c in overlayClips) {
+      take(c.endTime);
+    }
+    for (final t in textOverlays) {
+      take(t.endTime);
+    }
+    for (final s in stickers) {
+      take(s.endTime);
+    }
+    for (final a in audioOverlays) {
+      take(a.endTime);
+    }
+    return end;
   }
 
   VideoProject addVideoClip(VideoClip clip) {
     final updatedClips = List<VideoClip>.from(videoClips)..add(clip);
     return copyWith(
       videoClips: updatedClips,
-      totalDuration: calculateTotalDuration(),
+      totalDuration: _maxEnd(updatedClips),
       lastModified: DateTime.now(),
     );
   }
@@ -766,7 +944,7 @@ class VideoProject {
         videoClips.map((c) => c.id == clipId ? updatedClip : c).toList();
     return copyWith(
       videoClips: updatedClips,
-      totalDuration: calculateTotalDuration(),
+      totalDuration: _maxEnd(updatedClips),
       lastModified: DateTime.now(),
     );
   }
@@ -775,7 +953,7 @@ class VideoProject {
     final updatedClips = videoClips.where((c) => c.id != clipId).toList();
     return copyWith(
       videoClips: updatedClips,
-      totalDuration: calculateTotalDuration(),
+      totalDuration: _maxEnd(updatedClips),
       lastModified: DateTime.now(),
     );
   }
@@ -883,6 +1061,7 @@ class VideoProject {
       'chromaKeyBackgrounds': chromaKeyBackgrounds,
       'transitions': transitions.map((t) => t.toJson()).toList(),
       'videoEffects': videoEffects.map((e) => e.toJson()).toList(),
+      'overlayClips': overlayClips.map((c) => c.toJson()).toList(),
     };
   }
 }

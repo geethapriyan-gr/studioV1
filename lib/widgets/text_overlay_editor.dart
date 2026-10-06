@@ -6,6 +6,7 @@ import '../models/video_project.dart';
 import '../main.dart' show AppColors;
 import 'modern_slider.dart';
 import '../utils/text_overlay_painter.dart';
+import 'length_prompt.dart';
 
 class TextOverlayEditor extends StatefulWidget {
   const TextOverlayEditor({super.key});
@@ -150,10 +151,10 @@ class _TextOverlayEditorState extends State<TextOverlayEditor> {
             _isItalic = currentOverlay.flutterFontStyle == FontStyle.italic;
             _textAlign = currentOverlay.flutterTextAlign;
             _durationSeconds =
-                (currentOverlay.endTime - currentOverlay.startTime)
-                    .inSeconds
-                    .toDouble()
-                    .clamp(1.0, 60.0);
+                ((currentOverlay.endTime - currentOverlay.startTime)
+                            .inMilliseconds /
+                        1000.0)
+                    .clamp(1.0, 20.0);
             _boxColor = currentOverlay.boxColor;
             _outlineColor = currentOverlay.outlineColor;
             if (currentOverlay.outlineWidth > 0) {
@@ -458,9 +459,10 @@ class _TextOverlayEditorState extends State<TextOverlayEditor> {
                 // Font Size Slider
                 ModernSlider(
                   label: 'Font size',
-                  value: _fontSize,
+                  value: _fontSize.clamp(10.0, TextOverlayPainter.maxFontSize),
                   min: 10,
-                  max: 1000,
+                  // Larger sizes are not drawn, so the slider stops here.
+                  max: TextOverlayPainter.maxFontSize,
                   divisions: 100,
                   onChanged: (v) {
                     setState(() => _fontSize = v);
@@ -484,7 +486,9 @@ class _TextOverlayEditorState extends State<TextOverlayEditor> {
                   unit: 's',
                   onChanged: (v) {
                     setState(() => _durationSeconds = v);
-                    if (selId != null) _updateSelectedOverlay(provider);
+                    if (selId != null) {
+                      _updateSelectedOverlay(provider, durationChanged: true);
+                    }
                   },
                 ),
               ],
@@ -548,8 +552,10 @@ class _TextOverlayEditorState extends State<TextOverlayEditor> {
     if (_textController.text.trim().isEmpty) return;
     _focusNode.unfocus();
     final start = provider.currentPosition;
-    final end = start + Duration(seconds: _durationSeconds.toInt());
-    await provider.addTextOverlay(
+    final end =
+        start + Duration(milliseconds: (_durationSeconds * 1000).round());
+    final before = provider.totalDuration;
+    final id = await provider.addTextOverlay(
       text: _textController.text,
       position: _position,
       startTime: start,
@@ -569,10 +575,19 @@ class _TextOverlayEditorState extends State<TextOverlayEditor> {
     );
     _textController.clear();
     provider.clearTextPreview();
+    if (mounted) {
+      await LengthPrompt.afterAdd(
+          context, provider, before, TimelineItemKind.text, id);
+    }
     provider.toggleTimeline();
   }
 
-  Future<void> _updateSelectedOverlay(VideoEditorProvider provider) async {
+  /// Applies the editor's settings to the selected text. Only the duration
+  /// slider changes the text's length ([durationChanged]); other edits keep
+  /// the length set on the timeline. Rapid edits (typing, slider drags) are
+  /// one undo step.
+  Future<void> _updateSelectedOverlay(VideoEditorProvider provider,
+      {bool durationChanged = false}) async {
     final selId = provider.selectedTextOverlayId;
     if (selId == null) return;
     final exists =
@@ -581,8 +596,10 @@ class _TextOverlayEditorState extends State<TextOverlayEditor> {
     if (!exists) return;
     final overlay =
         provider.currentProject!.textOverlays.firstWhere((o) => o.id == selId);
-    final newEnd =
-        overlay.startTime + Duration(seconds: _durationSeconds.toInt());
+    final newEnd = durationChanged
+        ? overlay.startTime +
+            Duration(milliseconds: (_durationSeconds * 1000).round())
+        : overlay.endTime;
     await provider.updateTextOverlay(
       selId,
       text: _textController.text,
@@ -601,6 +618,7 @@ class _TextOverlayEditorState extends State<TextOverlayEditor> {
       clearOutline: _outlineColor == null,
       outlineWidth: _outlineColor == null ? 0 : _outlineWidth,
       shadow: _shadow,
+      undoKey: 'text-edit:$selId',
     );
   }
 

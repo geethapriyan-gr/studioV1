@@ -20,9 +20,9 @@ class VideoEffectAdapter extends TypeAdapter<VideoEffect> {
       id: fields[0] as String,
       clipId: fields[1] as String,
       type: fields[2] as VideoEffectType,
-      intensity: fields[3] as double,
-      startTime: fields[4] as Duration,
-      duration: fields[5] as Duration,
+      intensity: (fields[3] as num?)?.toDouble() ?? 0.5,
+      startTime: fields[4] as Duration? ?? Duration.zero,
+      duration: fields[5] as Duration? ?? Duration.zero,
       parameters: (fields[6] as Map?)?.cast<String, dynamic>(),
     );
   }

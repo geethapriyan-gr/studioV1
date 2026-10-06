@@ -1,6 +1,7 @@
 import 'dart:async';
 import 'dart:io';
 import 'dart:math' as math;
+import 'dart:typed_data';
 import 'dart:ui' as ui;
 import 'package:flutter/material.dart' hide ColorFilter;
 import 'package:google_fonts/google_fonts.dart';
@@ -16,6 +17,8 @@ import '../models/transition.dart';
 import '../models/video_effect.dart';
 import '../effects/effect_engine.dart';
 import '../utils/audio_fades.dart';
+import '../utils/overlay_shapes.dart';
+import '../utils/sticker_catalog.dart';
 import '../utils/text_overlay_painter.dart';
 
 /// Holds the rendered PNG file and metadata for a single overlay.
@@ -62,21 +65,71 @@ class _LayerPng {
   const _LayerPng(this.file, this.x, this.y);
 }
 
-enum _ComposeLayerKind { png, rawImage, video }
+enum _ComposeLayerKind { png, motion }
+
+/// A layer drawn from a "tile" stream that can rotate, animate and move:
+/// media overlays (video or photo) and animated GIF stickers.
+///
+/// The tile is the unrotated item at its largest size ([tileW] x [tileH]
+/// pixels, decoration margin included, local timestamps from 0). The
+/// exporter then rotates it, applies the in/out animation and the keyframe
+/// scale, and places its centre on [path].
+class _MotionLayer {
+  /// FFmpeg input arguments, one entry per input (the first is the media).
+  final List<String> inputs;
+
+  /// Builds the tile from the inputs (their stream indices given) into the
+  /// pad named [out]. The result must be RGBA, [tileW] x [tileH].
+  final String Function(List<int> inputIndex, String out) tileGraph;
+  final int tileW;
+  final int tileH;
+  final double start;
+  final double end;
+  final double rotationDeg;
+  final double opacity;
+  final String animIn;
+  final String animOut;
+  final double animSeconds;
+
+  /// Output pixels per canvas pixel (1920-px-tall design space).
+  final double animScale;
+
+  /// (local seconds, centre x, centre y, scale relative to the tile) — one
+  /// entry for a static item, keyframes for moving ones.
+  final List<(double, double, double, double)> path;
+  final bool isVideo;
+  final bool withAudio;
+  final double volume;
+  final double speed;
+
+  const _MotionLayer({
+    required this.inputs,
+    required this.tileGraph,
+    required this.tileW,
+    required this.tileH,
+    required this.start,
+    required this.end,
+    required this.path,
+    this.rotationDeg = 0,
+    this.opacity = 1,
+    this.animIn = 'none',
+    this.animOut = 'none',
+    this.animSeconds = 0,
+    this.animScale = 1,
+    this.isVideo = false,
+    this.withAudio = false,
+    this.volume = 1,
+    this.speed = 1,
+  });
+}
 
 /// One visual layer drawn on top of the base timeline during export.
 class _ComposeLayer {
   final _ComposeLayerKind kind;
   final _LayerPng? png;
-  final String? path;
-  final Rect? box;
   final double opacity;
   final double start;
   final double end;
-  final double trimStart;
-  final double trimDuration;
-  final bool withAudio;
-  final double volume;
 
   /// Text in/out animation (png layers only), see [TextAnimations].
   final String animIn;
@@ -86,18 +139,23 @@ class _ComposeLayer {
   /// Output pixels per canvas pixel (1920-px-tall design space).
   final double animScale;
 
+  /// Set for [_ComposeLayerKind.motion] layers.
+  final _MotionLayer? motion;
+
+  factory _ComposeLayer.motion(_MotionLayer m) => _ComposeLayer._(
+      _ComposeLayerKind.motion,
+      motion: m,
+      start: m.start,
+      end: m.end,
+      opacity: m.opacity);
+
   _ComposeLayer._(
     this.kind, {
+    this.motion,
     this.png,
-    this.path,
-    this.box,
     this.opacity = 1.0,
     required this.start,
     required this.end,
-    this.trimStart = 0,
-    this.trimDuration = 0,
-    this.withAudio = false,
-    this.volume = 1.0,
     this.animIn = 'none',
     this.animOut = 'none',
     this.animSeconds = 0,
@@ -120,33 +178,6 @@ class _ComposeLayer {
 
   bool get isAnimated =>
       animSeconds > 0 && (animIn != 'none' || animOut != 'none');
-
-  factory _ComposeLayer.rawImage(
-          String path, Rect box, double opacity, double start, double end) =>
-      _ComposeLayer._(_ComposeLayerKind.rawImage,
-          path: path, box: box, opacity: opacity, start: start, end: end);
-
-  factory _ComposeLayer.video(
-    String path,
-    Rect box,
-    double opacity,
-    double start,
-    double end, {
-    required double trimStart,
-    required double trimDuration,
-    required bool withAudio,
-    required double volume,
-  }) =>
-      _ComposeLayer._(_ComposeLayerKind.video,
-          path: path,
-          box: box,
-          opacity: opacity,
-          start: start,
-          end: end,
-          trimStart: trimStart,
-          trimDuration: trimDuration,
-          withAudio: withAudio,
-          volume: volume);
 }
 
 /// Transition into a clip: blend [seconds] from the previous clip's last frame.
@@ -2150,28 +2181,22 @@ class ExportService {
     required double canvasHeight,
   }) async {
     try {
-      final byteData = await rootBundle.load(sticker.assetPath);
-      final codec = await ui.instantiateImageCodec(
-        byteData.buffer.asUint8List(
-          byteData.offsetInBytes,
-          byteData.lengthInBytes,
-        ),
-      );
-      final frame = await codec.getNextFrame();
-      final image = frame.image;
+      final image = await _loadStickerImage(sticker.assetPath);
+      if (image == null) return null;
 
       final recorder = ui.PictureRecorder();
       final canvas = Canvas(recorder);
-      const previewBaseStickerSize = 400.0;
-      final stickerSize =
-          (previewBaseStickerSize * sticker.scale).clamp(1.0, canvasHeight);
+      // Same geometry as the preview: a 600 * scale box centred on the
+      // position, picture contain-fitted, rotated and optionally mirrored.
+      final stickerSize = _stickerBaseSize * sticker.scale;
       final centerX = sticker.position.dx * canvasWidth;
       final centerY = sticker.position.dy * canvasHeight;
 
       canvas.save();
       canvas.translate(centerX, centerY);
       canvas.rotate(sticker.rotation);
-      final dstRect = Rect.fromCenter(
+      if (sticker.flipX) canvas.scale(-1, 1);
+      final box = Rect.fromCenter(
         center: Offset.zero,
         width: stickerSize,
         height: stickerSize,
@@ -2184,10 +2209,11 @@ class ExportService {
           image.width.toDouble(),
           image.height.toDouble(),
         ),
-        dstRect,
-        Paint(),
+        _containRect(image.width.toDouble(), image.height.toDouble(), box),
+        Paint()..filterQuality = FilterQuality.high,
       );
       canvas.restore();
+      image.dispose();
 
       final overlayImage = await recorder
           .endRecording()
@@ -2211,19 +2237,38 @@ class ExportService {
   // ══════════════════════════════════════════════════════════════════════════
 
   /// Length of the whole timeline in seconds — identical to the preview's
-  /// `VideoEditorProvider.totalDuration` (video clips, audio and text).
-  static double _timelineTotalSeconds(VideoProject project) {
-    var maxMs = 0;
-    for (final c in project.videoClips) {
-      if (c.endTime.inMilliseconds > maxMs) maxMs = c.endTime.inMilliseconds;
+  /// `VideoEditorProvider.totalDuration`: the end of the last item of any
+  /// kind (clips, media overlays, text, stickers, audio).
+  @visibleForTesting
+  static double timelineTotalSeconds(VideoProject project) =>
+      project.contentEnd.inMilliseconds / 1000.0;
+
+  static double _timelineTotalSeconds(VideoProject project) =>
+      timelineTotalSeconds(project);
+
+  /// Sticker size at scale 1 in canvas pixels (matches the preview).
+  static const double _stickerBaseSize = 600.0;
+
+  /// Decodes a sticker picture: a bundled asset or one of the user's own
+  /// images (first frame for GIFs).
+  static Future<ui.Image?> _loadStickerImage(String stickerPath) async {
+    try {
+      final resolved = StickerCatalog.resolve(stickerPath);
+      final Uint8List bytes;
+      if (resolved.startsWith('assets/')) {
+        final data = await rootBundle.load(resolved);
+        bytes =
+            data.buffer.asUint8List(data.offsetInBytes, data.lengthInBytes);
+      } else {
+        bytes = await File(resolved).readAsBytes();
+      }
+      final codec = await ui.instantiateImageCodec(bytes);
+      final image = (await codec.getNextFrame()).image;
+      codec.dispose();
+      return image;
+    } catch (_) {
+      return null;
     }
-    for (final a in project.audioOverlays) {
-      if (a.endTime.inMilliseconds > maxMs) maxMs = a.endTime.inMilliseconds;
-    }
-    for (final t in project.textOverlays) {
-      if (t.endTime.inMilliseconds > maxMs) maxMs = t.endTime.inMilliseconds;
-    }
-    return maxMs / 1000.0;
   }
 
   static String _secs(double v) => v.toStringAsFixed(6);
@@ -2423,7 +2468,20 @@ class ExportService {
       overlay.position.dy * designHeight + previewInset,
     );
     return _rasterizeLayer(
-      paint: (canvas) => painter.paint(canvas, origin),
+      paint: (canvas) {
+        if (overlay.rotation == 0) {
+          painter.paint(canvas, origin);
+          return;
+        }
+        // The preview rotates the text's box around its centre.
+        final center = origin + painter.size.center(Offset.zero);
+        canvas.save();
+        canvas.translate(center.dx, center.dy);
+        canvas.rotate(overlay.rotation * math.pi / 180);
+        canvas.translate(-center.dx, -center.dy);
+        painter.paint(canvas, origin);
+        canvas.restore();
+      },
       designWidth: designWidth,
       designHeight: designHeight,
       outWidth: clipArea.width.round(),
@@ -2534,21 +2592,11 @@ class ExportService {
     double designWidth,
     String filePath,
   ) async {
-    ui.Image? image;
-    try {
-      final byteData = await rootBundle.load(sticker.assetPath);
-      final codec = await ui.instantiateImageCodec(byteData.buffer
-          .asUint8List(byteData.offsetInBytes, byteData.lengthInBytes));
-      image = (await codec.getNextFrame()).image;
-      codec.dispose();
-    } catch (_) {
-      return null;
-    }
-    final img = image;
+    final img = await _loadStickerImage(sticker.assetPath);
+    if (img == null) return null;
     try {
       const designHeight = 1920.0;
-      const previewBaseStickerSize = 600.0;
-      final size = previewBaseStickerSize * sticker.scale;
+      final size = _stickerBaseSize * sticker.scale;
       final center = Offset(sticker.position.dx * designWidth,
           sticker.position.dy * designHeight);
       return await _rasterizeLayer(
@@ -2556,6 +2604,7 @@ class ExportService {
           canvas.save();
           canvas.translate(center.dx, center.dy);
           canvas.rotate(sticker.rotation);
+          if (sticker.flipX) canvas.scale(-1, 1);
           final box = Rect.fromCenter(
               center: Offset.zero, width: size, height: size);
           canvas.drawImageRect(
@@ -2580,43 +2629,559 @@ class ExportService {
     }
   }
 
-  /// Image media overlay pre-rendered at its final on-screen size.
-  static Future<_LayerPng?> _renderImageOverlayLayer(
-      String imagePath, Rect box, double opacity, String filePath) async {
-    final w = box.width.round();
-    final h = box.height.round();
-    if (w < 1 || h < 1) return null;
-    final image = await _decodeImageFile(imagePath, math.max(w, h));
-    if (image == null) return null;
+
+  static String _n(double v) => v.toStringAsFixed(3);
+
+  /// Even pixel size, at least 2 (yuv420 / filter friendly).
+  static int _even(double v) => math.max(2, (v.round() ~/ 2) * 2);
+
+  /// Piecewise-linear FFmpeg expression of [tv] through [pts]
+  /// ((time, value) pairs sorted by time); constant outside the range.
+  @visibleForTesting
+  static String piecewiseExpr(List<(double, double)> pts, String tv) {
+    if (pts.isEmpty) return '0';
+    var expr = _n(pts.last.$2);
+    for (int i = pts.length - 2; i >= 0; i--) {
+      final a = pts[i];
+      final b = pts[i + 1];
+      final span = b.$1 - a.$1;
+      final seg = span <= 1e-6
+          ? _n(b.$2)
+          : '${_n(a.$2)}+(${_n(b.$2 - a.$2)})*(($tv)-${_secs(a.$1)})'
+              '/${_secs(span)}';
+      expr = 'if(lt($tv,${_secs(b.$1)}),$seg,$expr)';
+    }
+    if (pts.length > 1) {
+      expr = 'if(lt($tv,${_secs(pts.first.$1)}),${_n(pts.first.$2)},$expr)';
+    }
+    return expr;
+  }
+
+  /// FFmpeg `colorkey` filter with the same formula as the preview's
+  /// overlay key shader.
+  @visibleForTesting
+  static String colorKeyFilter(ChromaKeySettings s) {
+    final rgb = s.keyColor.toARGB32() & 0xFFFFFF;
+    return 'colorkey=0x${rgb.toRadixString(16).padLeft(6, '0')}'
+        ':${s.similarity.clamp(0.01, 1.0).toStringAsFixed(4)}'
+        ':${s.blend.clamp(0.0, 1.0).toStringAsFixed(4)}';
+  }
+
+  /// Draws [paint] on a [width] x [height] transparent canvas and writes a
+  /// PNG. Returns null on failure.
+  static Future<File?> _writeCanvasPng(int width, int height,
+      void Function(Canvas canvas) paint, String filePath) async {
+    if (width <= 0 || height <= 0) return null;
     try {
-      return await _rasterizeLayer(
-        paint: (canvas) {
-          canvas.drawImageRect(
-            image,
-            Rect.fromLTWH(
-                0, 0, image.width.toDouble(), image.height.toDouble()),
-            _containRect(image.width.toDouble(), image.height.toDouble(),
-                Rect.fromLTWH(0, 0, w.toDouble(), h.toDouble())),
-            Paint()..filterQuality = FilterQuality.high,
-          );
-        },
-        designWidth: w.toDouble(),
-        designHeight: h.toDouble(),
-        outWidth: w,
-        outHeight: h,
-        offsetX: box.left,
-        offsetY: box.top,
-        filePath: filePath,
-        opacity: opacity,
-      );
-    } finally {
+      final recorder = ui.PictureRecorder();
+      paint(Canvas(recorder));
+      final picture = recorder.endRecording();
+      final image = await picture.toImage(width, height);
+      picture.dispose();
+      final png = await image.toByteData(format: ui.ImageByteFormat.png);
       image.dispose();
+      if (png == null) return null;
+      final file = File(filePath);
+      await file.writeAsBytes(
+          png.buffer.asUint8List(png.offsetInBytes, png.lengthInBytes));
+      return file;
+    } catch (_) {
+      return null;
     }
   }
 
+  /// Removes the key colour from [image] with the `colorkey` formula
+  /// (used for photo overlays, which are composed in Flutter).
+  static Future<ui.Image> _keyImage(
+      ui.Image image, ChromaKeySettings s) async {
+    final data =
+        await image.toByteData(format: ui.ImageByteFormat.rawStraightRgba);
+    if (data == null) return image;
+    final src = data.buffer.asUint8List(data.offsetInBytes, data.lengthInBytes);
+    final out = Uint8List(src.length);
+    final kr = s.keyColor.r, kg = s.keyColor.g, kb = s.keyColor.b;
+    final sim = s.similarity.clamp(0.0, 1.0);
+    final blend = s.blend.clamp(0.0, 1.0);
+    for (int i = 0; i < src.length; i += 4) {
+      final r = src[i] / 255.0, g = src[i + 1] / 255.0, b = src[i + 2] / 255.0;
+      final dr = r - kr, dg = g - kg, db = b - kb;
+      final diff = math.sqrt((dr * dr + dg * dg + db * db) / 3.0);
+      final k = blend > 0.0001
+          ? ((diff - sim) / blend).clamp(0.0, 1.0)
+          : (diff > sim ? 1.0 : 0.0);
+      final a = src[i + 3] / 255.0 * k;
+      // rgba8888 is premultiplied.
+      out[i] = (src[i] * a).round();
+      out[i + 1] = (src[i + 1] * a).round();
+      out[i + 2] = (src[i + 2] * a).round();
+      out[i + 3] = (a * 255).round();
+    }
+    final completer = Completer<ui.Image>();
+    ui.decodeImageFromPixels(
+        out, image.width, image.height, ui.PixelFormat.rgba8888,
+        completer.complete);
+    return completer.future;
+  }
+
+  /// Destination rect for the (cropped) media inside [box]: cover when the
+  /// overlay has a mask shape, contain otherwise — as in the preview.
+  static Rect _fitRect(double srcW, double srcH, Rect box, bool cover) {
+    if (srcW <= 0 || srcH <= 0) return box;
+    final s = cover
+        ? math.max(box.width / srcW, box.height / srcH)
+        : math.min(box.width / srcW, box.height / srcH);
+    final w = srcW * s;
+    final h = srcH * s;
+    return Rect.fromLTWH(
+        box.left + (box.width - w) / 2, box.top + (box.height - h) / 2, w, h);
+  }
+
+  /// Photo overlay tile: cropped, mirrored, keyed, fitted into [box],
+  /// clipped to its shape, with its border and shadow — composed exactly as
+  /// the preview widget draws it.
+  static Future<File?> _renderPhotoOverlayTile(VideoClip clip, String imagePath,
+      int tileW, int tileH, Rect box, double scale, String filePath) async {
+    var image = await _decodeImageFile(imagePath, math.max(tileW, tileH) * 2);
+    if (image == null) return null;
+    try {
+      final crop = clip.cropRect ?? const Rect.fromLTWH(0, 0, 1, 1);
+      final src = Rect.fromLTWH(
+        crop.left * image.width,
+        crop.top * image.height,
+        math.max(1.0, crop.width * image.width),
+        math.max(1.0, crop.height * image.height),
+      );
+      final masked = OverlayShapes.isMasked(clip);
+      final key = clip.chromaKeySettings;
+      if (key != null && key.enabled) {
+        // Key the cropped picture first (the border must stay opaque).
+        final cropped = await _imageFromCanvas(
+            src.width.round(), src.height.round(), (c) {
+          c.drawImageRect(image!, src,
+              Rect.fromLTWH(0, 0, src.width, src.height), Paint());
+        });
+        image.dispose();
+        image = await _keyImage(cropped, key);
+        if (!identical(image, cropped)) cropped.dispose();
+      }
+      final media = image;
+      final mediaSrc = (key != null && key.enabled)
+          ? Rect.fromLTWH(0, 0, media.width.toDouble(), media.height.toDouble())
+          : src;
+      final dst = _fitRect(mediaSrc.width, mediaSrc.height, box, masked);
+      return await _writeCanvasPng(tileW, tileH, (canvas) {
+        canvas.save();
+        if (masked) {
+          canvas.clipPath(OverlayShapes.pathFor(clip.maskShape, box));
+        } else {
+          canvas.clipRect(box);
+        }
+        if (clip.isMirrored) {
+          canvas.translate(box.center.dx, 0);
+          canvas.scale(-1, 1);
+          canvas.translate(-box.center.dx, 0);
+        }
+        canvas.drawImageRect(
+            media, mediaSrc, dst, Paint()..filterQuality = FilterQuality.high);
+        canvas.restore();
+        OverlayShapes.paintDecoration(canvas, box, clip, scale);
+      }, filePath);
+    } finally {
+      image?.dispose();
+    }
+  }
+
+  static Future<ui.Image> _imageFromCanvas(
+      int w, int h, void Function(Canvas) paint) async {
+    final recorder = ui.PictureRecorder();
+    paint(Canvas(recorder));
+    final picture = recorder.endRecording();
+    final image = await picture.toImage(math.max(1, w), math.max(1, h));
+    picture.dispose();
+    return image;
+  }
+
+  /// Media overlay → motion layer(s): the media tile and, for videos with a
+  /// border or shadow, a decoration tile that moves with it.
+  static Future<List<_ComposeLayer>> _overlayLayers(
+    VideoProject project,
+    VideoClip o,
+    int index,
+    Directory workDir,
+    int targetWidth,
+    int targetHeight,
+    double fps,
+  ) async {
+    final filePath = o.videoFile?.path ?? o.imageFile?.path;
+    if (filePath == null) return const [];
+    final start = o.startTime.inMilliseconds / 1000.0;
+    final end = o.endTime.inMilliseconds / 1000.0;
+    if (end <= start) return const [];
+    final layerDur = end - start;
+    final area =
+        await _clipAreaAt(project, o.startTime, targetWidth, targetHeight);
+    final s = area.height / 1920.0; // output px per canvas px
+
+    // Box over time (normalized to the preview box) → output pixels.
+    final frames = o.keyframes;
+    final boxes = frames.isEmpty
+        ? [(0.0, o.overlayPosition, o.overlaySize)]
+        : [
+            for (final k in frames)
+              (k.time.inMicroseconds / 1e6, k.position, k.size)
+          ];
+    final maxW =
+        boxes.map((b) => b.$3.width).reduce(math.max) * area.width;
+    final maxH =
+        boxes.map((b) => b.$3.height).reduce(math.max) * area.height;
+    final bw = _even(maxW);
+    final bh = _even(maxH);
+    final margin = (OverlayShapes.margin(o) * s).ceil();
+    final tileW = bw + 2 * margin;
+    final tileH = bh + 2 * margin;
+    final box = Rect.fromLTWH(
+        margin.toDouble(), margin.toDouble(), bw.toDouble(), bh.toDouble());
+    final motionPath = [
+      for (final b in boxes)
+        (
+          b.$1,
+          area.left + (b.$2.dx + b.$3.width / 2) * area.width,
+          area.top + (b.$2.dy + b.$3.height / 2) * area.height,
+          b.$3.width * area.width / bw,
+        )
+    ];
+    final opacity = o.overlayOpacity.clamp(0.0, 1.0).toDouble();
+    final animSeconds = TextAnimations.secondsFor(layerDur);
+
+    _MotionLayer motion({
+      required List<String> inputs,
+      required String Function(List<int>, String) tileGraph,
+      bool isVideo = false,
+      bool withAudio = false,
+    }) =>
+        _MotionLayer(
+          inputs: inputs,
+          tileGraph: tileGraph,
+          tileW: tileW,
+          tileH: tileH,
+          start: start,
+          end: end,
+          path: motionPath,
+          rotationDeg: o.rotation,
+          opacity: opacity,
+          animIn: o.animIn,
+          animOut: o.animOut,
+          animSeconds: animSeconds,
+          animScale: s,
+          isVideo: isVideo,
+          withAudio: withAudio,
+          volume: o.volume.clamp(0.0, 1.0).toDouble(),
+          speed: o.playbackSpeed,
+        );
+
+    String loopPng(File f) =>
+        '-loop 1 -framerate ${_n(fps)} -t ${_secs(layerDur)} -i "${f.path}"';
+
+    if (o.mediaType == MediaType.image) {
+      final tile = await _renderPhotoOverlayTile(o, filePath, tileW, tileH,
+          box, s, path.join(workDir.path, 'overlay_tile_$index.png'));
+      if (tile == null) return const [];
+      return [
+        _ComposeLayer.motion(motion(
+          inputs: [loopPng(tile)],
+          tileGraph: (idx, out) => '[${idx[0]}:v]format=rgba[$out];',
+        )),
+      ];
+    }
+
+    // Video overlay: tile built by FFmpeg.
+    final masked = OverlayShapes.isMasked(o);
+    File? mask;
+    if (masked) {
+      mask = await _writeCanvasPng(bw, bh, (c) {
+        final r = Rect.fromLTWH(0, 0, bw.toDouble(), bh.toDouble());
+        c.drawRect(r, Paint()..color = const Color(0xFF000000));
+        c.drawPath(OverlayShapes.pathFor(o.maskShape, r),
+            Paint()..color = const Color(0xFFFFFFFF));
+      }, path.join(workDir.path, 'overlay_mask_$index.png'));
+    }
+    final key = o.chromaKeySettings;
+    final keyed = key != null && key.enabled;
+    final hasAudio =
+        !o.isMuted && o.volume > 0 && await _hasAudioStream(filePath);
+    final trimStart = o.trimStart.inMilliseconds / 1000.0;
+    final trimDur = o.trimmedDuration.inMilliseconds / 1000.0;
+    final speed = o.playbackSpeed <= 0 ? 1.0 : o.playbackSpeed;
+    final crop = o.cropRect;
+
+    final layers = <_ComposeLayer>[
+      _ComposeLayer.motion(motion(
+        inputs: [
+          '-ss ${_secs(trimStart)} -t ${_secs(trimDur)} -i "$filePath"',
+          if (mask != null) loopPng(mask),
+        ],
+        isVideo: true,
+        withAudio: hasAudio,
+        tileGraph: (idx, out) {
+          final v = idx[0];
+          final f = StringBuffer('[$v:v]');
+          f.write((speed - 1).abs() > 0.001
+              ? 'setpts=(PTS-STARTPTS)/${speed.toStringAsFixed(4)},'
+              : 'setpts=PTS-STARTPTS,');
+          f.write('fps=${_n(fps)},');
+          if (crop != null) {
+            f.write('crop=iw*${crop.width.toStringAsFixed(5)}'
+                ':ih*${crop.height.toStringAsFixed(5)}'
+                ':iw*${crop.left.toStringAsFixed(5)}'
+                ':ih*${crop.top.toStringAsFixed(5)},');
+          }
+          if (o.isMirrored) f.write('hflip,');
+          f.write('format=rgba,');
+          if (keyed) f.write('${colorKeyFilter(key)},');
+          f.write(masked
+              ? 'scale=$bw:$bh:force_original_aspect_ratio=increase,'
+                  'crop=$bw:$bh,'
+              : 'scale=$bw:$bh:force_original_aspect_ratio=decrease,'
+                  'pad=$bw:$bh:(ow-iw)/2:(oh-ih)/2:color=black@0,');
+          f.write('setsar=1');
+          var label = 'om$v';
+          f.write('[$label];');
+          if (mask != null) {
+            final m = idx[1];
+            f.write('[$m:v]format=gray,scale=$bw:$bh[mk$v];');
+            if (keyed) {
+              // Keep the key's transparency: multiply it with the mask.
+              f.write('[$label]split[ma$v][mb$v];'
+                  '[ma$v]alphaextract[ak$v];'
+                  '[ak$v][mk$v]blend=all_mode=multiply[am$v];'
+                  '[mb$v][am$v]alphamerge[mm$v];');
+            } else {
+              f.write('[$label][mk$v]alphamerge[mm$v];');
+            }
+            label = 'mm$v';
+          }
+          if (margin > 0) {
+            f.write('[$label]pad=$tileW:$tileH:$margin:$margin'
+                ':color=black@0[$out];');
+          } else {
+            f.write('[$label]copy[$out];');
+          }
+          return f.toString();
+        },
+      )),
+    ];
+
+    if (OverlayShapes.hasDecoration(o)) {
+      final deco = await _writeCanvasPng(tileW, tileH,
+          (c) => OverlayShapes.paintDecoration(c, box, o, s),
+          path.join(workDir.path, 'overlay_deco_$index.png'));
+      if (deco != null) {
+        layers.add(_ComposeLayer.motion(motion(
+          inputs: [loopPng(deco)],
+          tileGraph: (idx, out) => '[${idx[0]}:v]format=rgba[$out];',
+        )));
+      }
+    }
+    return layers;
+  }
+
+  /// Animated GIF sticker → motion layer (the GIF plays, looping, for the
+  /// sticker's whole duration).
+  static Future<_ComposeLayer?> _gifStickerLayer(VideoProject project,
+      StickerModel st, int targetWidth, int targetHeight, double fps) async {
+    final start = st.startTime.inMilliseconds / 1000.0;
+    final end = st.endTime.inMilliseconds / 1000.0;
+    if (end <= start) return null;
+    final img = await _loadStickerImage(st.assetPath);
+    if (img == null) return null;
+    final aspect = img.width / math.max(1, img.height);
+    img.dispose();
+    final area =
+        await _clipAreaAt(project, st.startTime, targetWidth, targetHeight);
+    final s = area.height / 1920.0;
+    final side = _stickerBaseSize * st.scale * s;
+    final bw = _even(aspect >= 1 ? side : side * aspect);
+    final bh = _even(aspect >= 1 ? side / aspect : side);
+    final file = StickerCatalog.resolve(st.assetPath);
+    final dur = end - start;
+    return _ComposeLayer.motion(_MotionLayer(
+      inputs: ['-ignore_loop 0 -t ${_secs(dur)} -i "$file"'],
+      tileGraph: (idx, out) => '[${idx[0]}:v]setpts=PTS-STARTPTS,'
+          'fps=${_n(fps)},format=rgba,scale=$bw:$bh,setsar=1'
+          '${st.flipX ? ',hflip' : ''}[$out];',
+      tileW: bw,
+      tileH: bh,
+      start: start,
+      end: end,
+      path: [
+        (
+          0.0,
+          area.left + st.position.dx * area.width,
+          area.top + st.position.dy * area.height,
+          1.0,
+        )
+      ],
+      rotationDeg: st.rotation * 180 / math.pi,
+      opacity: st.opacity.clamp(0.0, 1.0).toDouble(),
+      animIn: st.animIn,
+      animOut: st.animOut,
+      animSeconds: TextAnimations.secondsFor(dur),
+      animScale: s,
+      isVideo: true,
+    ));
+  }
+
+  /// Filters taking a motion layer's tile [tile] to [out], ready to overlay,
+  /// and the overlay position. Mirrors the preview: rotate, in/out
+  /// animation (fade, slide, pop), keyframe scale, opacity, centre path.
+  @visibleForTesting
+  static ({String filters, String x, String y}) motionGraphForTest(
+          {required int tileW,
+          required int tileH,
+          required double start,
+          required double end,
+          required List<(double, double, double, double)> path,
+          double rotationDeg = 0,
+          double opacity = 1,
+          String animIn = 'none',
+          String animOut = 'none',
+          double animScale = 1}) =>
+      _motionGraph(
+          _MotionLayer(
+            inputs: const [],
+            tileGraph: (_, __) => '',
+            tileW: tileW,
+            tileH: tileH,
+            start: start,
+            end: end,
+            path: path,
+            rotationDeg: rotationDeg,
+            opacity: opacity,
+            animIn: animIn,
+            animOut: animOut,
+            animSeconds: TextAnimations.secondsFor(end - start),
+            animScale: animScale,
+          ),
+          'tile',
+          'out');
+
+  static ({String filters, String x, String y}) _motionGraph(
+      _MotionLayer m, String tile, String out) {
+    final f = <String>['format=rgba'];
+    var w = m.tileW.toDouble();
+    var h = m.tileH.toDouble();
+
+    // Rotation (degrees, clockwise like Transform.rotate).
+    var rot = m.rotationDeg % 360;
+    if (rot > 180) rot -= 360;
+    if (rot.abs() > 0.01) {
+      final rad = rot * math.pi / 180;
+      final rw = _even((w * math.cos(rad)).abs() + (h * math.sin(rad)).abs());
+      final rh = _even((w * math.sin(rad)).abs() + (h * math.cos(rad)).abs());
+      f.add('rotate=a=${rad.toStringAsFixed(6)}:ow=$rw:oh=$rh:c=none');
+      w = rw.toDouble();
+      h = rh.toDouble();
+    }
+
+    // In/out animation, same curves as TextAnimations.
+    final layerDur = math.max(1e-3, m.end - m.start);
+    final d = m.animSeconds;
+    final ds = _secs(d);
+    var pop = '';
+    var dy = '';
+    String popScale(String p) =>
+        'if(lt($p,0.7),0.6+0.48*$p/0.7,1.08-0.08*($p-0.7)/0.3)';
+    final st = _secs(m.start);
+    void anim(String kind, bool isIn) {
+      if (d <= 0) return;
+      switch (kind) {
+        case 'fade':
+        case 'slide':
+          f.add(isIn
+              ? 'fade=t=in:st=0:d=$ds:alpha=1'
+              : 'fade=t=out:st=${_secs(math.max(0, layerDur - d))}:d=$ds:alpha=1');
+          if (kind == 'slide') {
+            final p = isIn
+                ? 'clip((t-$st)/$ds,0,1)'
+                : 'clip(($st+${_secs(layerDur)}-t)/$ds,0,1)';
+            final k = _n(TextAnimations.slideDistance * m.animScale);
+            dy += '+$k*pow(1-$p,3)';
+          }
+        case 'pop':
+          f.add(isIn
+              ? 'fade=t=in:st=0:d=${_secs(d / 2)}:alpha=1'
+              : 'fade=t=out:st=${_secs(math.max(0, layerDur - d / 2))}'
+                  ':d=${_secs(d / 2)}:alpha=1');
+          final p = isIn
+              ? 'clip(t/$ds,0,1)'
+              : 'clip((${_secs(layerDur)}-t)/$ds,0,1)';
+          pop += '*${popScale(p)}';
+      }
+    }
+
+    anim(m.animIn, true);
+    anim(m.animOut, false);
+
+    // Keyframed size (relative to the tile) and pop scale; padded back to a
+    // fixed size so the overlay position stays a simple centre offset.
+    final ks = m.path.map((p) => p.$4).toList();
+    final kMax = ks.reduce(math.max);
+    final kVaries = ks.any((k) => (k - ks.first).abs() > 1e-4);
+    var outW = w;
+    var outH = h;
+    if (kVaries || pop.isNotEmpty || (ks.first - 1).abs() > 1e-4) {
+      final kExpr = kVaries
+          ? piecewiseExpr([for (final p in m.path) (p.$1, p.$4)], 't')
+          : _n(ks.first);
+      final maxFactor = kMax * (pop.isNotEmpty ? 1.08 : 1.0);
+      final pw = _even(w * maxFactor) + 2;
+      final ph = _even(h * maxFactor) + 2;
+      f.add("scale=w='max(2,${_n(w)}*($kExpr)$pop)'"
+          ":h='max(2,${_n(h)}*($kExpr)$pop)':eval=frame");
+      f.add('pad=$pw:$ph:(ow-iw)/2:(oh-ih)/2:color=black@0:eval=frame');
+      outW = pw.toDouble();
+      outH = ph.toDouble();
+    }
+
+    if (m.opacity < 0.999) {
+      f.add('colorchannelmixer=aa=${m.opacity.toStringAsFixed(4)}');
+    }
+    f.add('setpts=PTS-STARTPTS+$st/TB');
+
+    final local = '(t-$st)';
+    final cx = m.path.length > 1
+        ? piecewiseExpr([for (final p in m.path) (p.$1, p.$2)], local)
+        : _n(m.path.first.$2);
+    final cy = m.path.length > 1
+        ? piecewiseExpr([for (final p in m.path) (p.$1, p.$3)], local)
+        : _n(m.path.first.$3);
+    return (
+      filters: '[$tile]${f.join(',')}[$out];',
+      x: "'$cx-${_n(outW / 2)}'",
+      y: "'$cy-${_n(outH / 2)}$dy'",
+    );
+  }
+
+  /// Audio tempo filters for [speed] (atempo takes 0.5..2 per stage).
+  static String _atempoChain(double speed) {
+    if ((speed - 1).abs() < 0.001) return '';
+    final parts = <String>[];
+    var s = speed;
+    while (s > 2.0) {
+      parts.add('atempo=2.0');
+      s /= 2.0;
+    }
+    while (s < 0.5) {
+      parts.add('atempo=0.5');
+      s *= 2.0;
+    }
+    parts.add('atempo=${s.toStringAsFixed(4)}');
+    return '${parts.join(',')},';
+  }
+
   /// Composites media overlays, text and stickers onto [basePath] in the same
-  /// stacking order as the preview (media overlays, then text, then
-  /// stickers), in as few encoding passes as possible.
+  /// stacking order as the preview (media overlays in layer order, then
+  /// text, then stickers), in as few encoding passes as possible.
   ///
   /// Returns [basePath] when there is nothing to draw, or null on failure so
   /// the caller can fall back to the previous multi-pass implementation.
@@ -2637,47 +3202,11 @@ class ExportService {
         width: targetWidth, height: targetHeight, duration: duration);
     final layers = <_ComposeLayer>[];
 
-    // 1. Media overlays (bottom of the overlay stack in the preview)
+    // 1. Media overlays (bottom of the overlay stack in the preview; the
+    //    list order is the layer order).
     for (int i = 0; i < project.overlayClips.length; i++) {
-      final o = project.overlayClips[i];
-      final filePath = o.videoFile?.path ?? o.imageFile?.path;
-      if (filePath == null) continue;
-      final start = o.startTime.inMilliseconds / 1000.0;
-      final end = o.endTime.inMilliseconds / 1000.0;
-      if (end <= start) continue;
-      final area =
-          await _clipAreaAt(project, o.startTime, targetWidth, targetHeight);
-      final box = Rect.fromLTWH(
-        area.left + o.overlayPosition.dx * area.width,
-        area.top + o.overlayPosition.dy * area.height,
-        math.max(2.0, o.overlaySize.width * area.width),
-        math.max(2.0, o.overlaySize.height * area.height),
-      );
-      final opacity = o.overlayOpacity.clamp(0.0, 1.0).toDouble();
-      if (o.mediaType == MediaType.image) {
-        final png = await _renderImageOverlayLayer(filePath, box, opacity,
-            path.join(workDir.path, 'layer_media_$i.png'));
-        if (png != null) {
-          layers.add(_ComposeLayer.png(png, start, end));
-        } else {
-          layers.add(_ComposeLayer.rawImage(filePath, box, opacity, start, end));
-        }
-      } else {
-        final hasAudio = !o.isMuted &&
-            o.volume > 0 &&
-            await _hasAudioStream(filePath);
-        layers.add(_ComposeLayer.video(
-          filePath,
-          box,
-          opacity,
-          start,
-          end,
-          trimStart: o.trimStart.inMilliseconds / 1000.0,
-          trimDuration: o.trimmedDuration.inMilliseconds / 1000.0,
-          withAudio: hasAudio,
-          volume: o.volume.clamp(0.0, 2.0).toDouble(),
-        ));
-      }
+      layers.addAll(await _overlayLayers(project, project.overlayClips[i], i,
+          workDir, targetWidth, targetHeight, targetFps));
     }
 
     // 2. Text overlays
@@ -2708,6 +3237,14 @@ class ExportService {
       final start = s.startTime.inMilliseconds / 1000.0;
       final end = s.endTime.inMilliseconds / 1000.0;
       if (end <= start) continue;
+      if (s.isAnimated) {
+        final gif = await _gifStickerLayer(
+            project, s, targetWidth, targetHeight, targetFps);
+        if (gif != null) {
+          layers.add(gif);
+          continue;
+        }
+      }
       final clipAspect = await _getClipAspectRatio(project, s.startTime);
       final area =
           await _clipAreaAt(project, s.startTime, targetWidth, targetHeight);
@@ -2715,10 +3252,21 @@ class ExportService {
           (1920.0 * clipAspect).round().clamp(1, 4096).toDouble();
       final png = await _renderStickerLayer(s, area, designWidth,
           path.join(workDir.path, 'layer_sticker_$i.png'));
-      if (png != null) layers.add(_ComposeLayer.png(png, start, end));
+      if (png != null) {
+        layers.add(_ComposeLayer.png(png, start, end,
+            animIn: s.animIn,
+            animOut: s.animOut,
+            animSeconds: TextAnimations.secondsFor(end - start),
+            animScale: area.height / 1920.0));
+      }
     }
 
     if (effectsGraph == null && layers.isEmpty) return basePath;
+
+    int inputsOf(_ComposeLayer l) =>
+        l.kind == _ComposeLayerKind.motion ? l.motion!.inputs.length : 1;
+    bool decodesVideo(_ComposeLayer l) =>
+        l.kind == _ComposeLayerKind.motion && l.motion!.isVideo;
 
     // Split into passes: at most 3 simultaneously decoded videos per pass
     // (keeps memory low on phones) and a bounded number of inputs.
@@ -2727,16 +3275,20 @@ class ExportService {
     final passes = <List<_ComposeLayer>>[];
     var currentPass = <_ComposeLayer>[];
     var videosInPass = 0;
+    var inputsInPass = 0;
     for (final l in layers) {
-      final isVideo = l.kind == _ComposeLayerKind.video;
+      final isVideo = decodesVideo(l);
+      final n = inputsOf(l);
       if (currentPass.isNotEmpty &&
           ((isVideo && videosInPass >= maxVideosPerPass) ||
-              currentPass.length >= maxInputsPerPass)) {
+              inputsInPass + n > maxInputsPerPass)) {
         passes.add(currentPass);
         currentPass = <_ComposeLayer>[];
         videosInPass = 0;
+        inputsInPass = 0;
       }
       currentPass.add(l);
+      inputsInPass += n;
       if (isVideo) videosInPass++;
     }
     if (currentPass.isNotEmpty || passes.isEmpty) passes.add(currentPass);
@@ -2753,61 +3305,49 @@ class ExportService {
       }
       var prev = 'b0';
       final audioLabels = <String>[];
+      var nextInput = 1;
       for (int j = 0; j < pass.length; j++) {
         final l = pass[j];
-        final idx = j + 1;
+        final idx = nextInput;
         final layerDur = math.max(1.0 / targetFps, l.end - l.start);
-        final bw = l.box == null ? 0 : math.max(2, (l.box!.width.round() ~/ 2) * 2);
-        final bh = l.box == null ? 0 : math.max(2, (l.box!.height.round() ~/ 2) * 2);
-        final alpha = l.opacity < 1.0
-            ? ',colorchannelmixer=aa=${l.opacity.toStringAsFixed(4)}'
-            : '';
-        int x;
-        int y;
-        String? overlayPos;
+        String overlayPos;
         switch (l.kind) {
           case _ComposeLayerKind.png:
+            nextInput++;
             inputs.write(
                 ' -loop 1 -framerate $targetFps -t ${_secs(layerDur)} -i "${l.png!.file.path}"');
             if (l.isAnimated) {
               final anim = await _textAnimation(l, layerDur);
               fc.write('[$idx:v]format=rgba${anim.filters},'
-                  'setpts=PTS-STARTPTS+${_secs(l.start)}/TB[l$idx];');
+                  'setpts=PTS-STARTPTS+${_secs(l.start)}/TB[l$j];');
               overlayPos = '${anim.x}:${anim.y}';
             } else {
               fc.write(
-                  '[$idx:v]format=rgba,setpts=PTS-STARTPTS+${_secs(l.start)}/TB[l$idx];');
+                  '[$idx:v]format=rgba,setpts=PTS-STARTPTS+${_secs(l.start)}/TB[l$j];');
+              overlayPos = '${l.png!.x}:${l.png!.y}';
             }
-            x = l.png!.x;
-            y = l.png!.y;
-            break;
-          case _ComposeLayerKind.rawImage:
-            inputs.write(
-                ' -loop 1 -framerate $targetFps -t ${_secs(layerDur)} -i "${l.path}"');
-            fc.write('[$idx:v]scale=$bw:$bh:force_original_aspect_ratio=decrease,'
-                'format=rgba$alpha,pad=$bw:$bh:(ow-iw)/2:(oh-ih)/2:color=black@0,'
-                'setpts=PTS-STARTPTS+${_secs(l.start)}/TB[l$idx];');
-            x = l.box!.left.round();
-            y = l.box!.top.round();
-            break;
-          case _ComposeLayerKind.video:
-            inputs.write(
-                ' -ss ${_secs(l.trimStart)} -t ${_secs(l.trimDuration)} -i "${l.path}"');
-            fc.write('[$idx:v]setpts=PTS-STARTPTS+${_secs(l.start)}/TB,'
-                'scale=$bw:$bh:force_original_aspect_ratio=decrease,'
-                'format=rgba$alpha,pad=$bw:$bh:(ow-iw)/2:(oh-ih)/2:color=black@0[l$idx];');
-            x = l.box!.left.round();
-            y = l.box!.top.round();
-            if (l.withAudio) {
-              final delayMs = (l.start * 1000).round();
-              fc.write('[$idx:a]asetpts=PTS-STARTPTS,volume=${l.volume},'
-                  'adelay=$delayMs|$delayMs[a$idx];');
-              audioLabels.add('[a$idx]');
+          case _ComposeLayerKind.motion:
+            final m = l.motion!;
+            final indices = <int>[];
+            for (final input in m.inputs) {
+              inputs.write(' $input');
+              indices.add(nextInput++);
             }
-            break;
+            fc.write(m.tileGraph(indices, 'tile$j'));
+            final g = _motionGraph(m, 'tile$j', 'l$j');
+            fc.write(g.filters);
+            overlayPos = '${g.x}:${g.y}';
+            if (m.withAudio) {
+              final delayMs = (m.start * 1000).round();
+              fc.write('[${indices.first}:a]asetpts=PTS-STARTPTS,'
+                  '${_atempoChain(m.speed)}'
+                  'volume=${m.volume.toStringAsFixed(4)},'
+                  'adelay=$delayMs|$delayMs[a$j];');
+              audioLabels.add('[a$j]');
+            }
         }
-        final outLabel = 'v$idx';
-        fc.write('[$prev][l$idx]overlay=${overlayPos ?? '$x:$y'}:'
+        final outLabel = 'v$j';
+        fc.write('[$prev][l$j]overlay=$overlayPos:'
             "enable='between(t,${_secs(l.start)},${_secs(l.end)})':"
             'eof_action=pass[$outLabel];');
         prev = outLabel;

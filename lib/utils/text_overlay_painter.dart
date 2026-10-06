@@ -14,8 +14,13 @@ class TextOverlayPainter {
   late final TextPainter _fill;
   TextPainter? _stroke;
 
+  /// Largest font size drawn (canvas pixels). The editor's slider and pinch
+  /// stop here so every size they offer is a size that renders.
+  static const double maxFontSize = 512.0;
+
   TextOverlayPainter(this.overlay, {double? fontSize})
-      : fontSize = (fontSize ?? overlay.fontSize).clamp(1.0, 512.0).toDouble() {
+      : fontSize =
+            (fontSize ?? overlay.fontSize).clamp(1.0, maxFontSize).toDouble() {
     _fill = TextPainter(
       text: TextSpan(text: overlay.text, style: style(this.fontSize)),
       textAlign: overlay.flutterTextAlign,
@@ -133,24 +138,37 @@ class TextAnimations {
     ('typewriter', 'Type', Icons.keyboard_rounded),
   ];
 
+  /// Animations for stickers and media overlays (typewriter is text-only).
+  static const List<(String, String, IconData)> motion = [
+    ('none', 'None', Icons.block_rounded),
+    ('fade', 'Fade', Icons.blur_on_rounded),
+    ('slide', 'Slide', Icons.swipe_up_rounded),
+    ('pop', 'Pop', Icons.bubble_chart_rounded),
+  ];
+
   /// Animation length: 0.5 s, or a third of the overlay when shorter.
-  static double seconds(TextOverlay o) {
-    final len = (o.endTime - o.startTime).inMilliseconds / 1000.0;
-    return math.min(0.5, len / 3);
-  }
+  static double seconds(TextOverlay o) =>
+      secondsFor((o.endTime - o.startTime).inMilliseconds / 1000.0);
+
+  /// Animation length for an item [len] seconds long.
+  static double secondsFor(double len) => math.min(0.5, len / 3);
 
   /// State of the text at [t] seconds into the overlay.
-  static TextAnimState at(TextOverlay o, double t) {
-    final len = (o.endTime - o.startTime).inMilliseconds / 1000.0;
-    final d = seconds(o);
+  static TextAnimState at(TextOverlay o, double t) => atTimes(o.animIn,
+      o.animOut, (o.endTime - o.startTime).inMilliseconds / 1000.0, t);
+
+  /// State of any animated item ([len] seconds long) at [t] seconds in.
+  static TextAnimState atTimes(
+      String animIn, String animOut, double len, double t) {
+    final d = secondsFor(len);
     var state = const TextAnimState();
     if (d <= 0) return state;
-    if (o.animIn != none && t < d) {
-      state = _apply(o.animIn, (t / d).clamp(0.0, 1.0), state);
+    if (animIn != none && t < d) {
+      state = _apply(animIn, (t / d).clamp(0.0, 1.0), state);
     }
     final fromEnd = len - t;
-    if (o.animOut != none && fromEnd < d) {
-      state = _apply(o.animOut, (fromEnd / d).clamp(0.0, 1.0), state);
+    if (animOut != none && fromEnd < d) {
+      state = _apply(animOut, (fromEnd / d).clamp(0.0, 1.0), state);
     }
     return state;
   }

@@ -1,8 +1,27 @@
+import 'dart:io';
+import 'dart:math' as math;
+
 import 'package:flutter/material.dart';
 import 'package:provider/provider.dart';
-import '../providers/video_editor_provider.dart';
-import '../models/video_project.dart';
+
 import '../main.dart' show AppColors;
+import '../models/video_project.dart';
+import '../providers/video_editor_provider.dart';
+import '../utils/snap_guides.dart';
+import '../utils/sticker_catalog.dart';
+import '../utils/text_overlay_painter.dart';
+
+/// Size of a sticker at scale 1, in canvas pixels of the 1920-px-tall
+/// preview design space (the exporter uses the same value).
+const double kStickerBaseSize = 600.0;
+
+/// Image provider for a stored sticker path (bundled asset or own image).
+ImageProvider stickerImageProvider(String path) {
+  final resolved = StickerCatalog.resolve(path);
+  return resolved.startsWith('assets/')
+      ? AssetImage(resolved)
+      : FileImage(File(resolved)) as ImageProvider;
+}
 
 class StickerLayer extends StatelessWidget {
   const StickerLayer({super.key});
@@ -44,154 +63,214 @@ class _DraggableStickerWidget extends StatefulWidget {
       _DraggableStickerWidgetState();
 }
 
-class _DraggableStickerWidgetState extends State<_DraggableStickerWidget> {
-  Offset? _localPosition;
-  double _pinchScale = 1.0;
-  double _baseScale = 1.0;
+class _DraggableStickerWidgetState extends State<_DraggableStickerWidget>
+    with SingleTickerProviderStateMixin {
+  // Drag/pinch state; null when idle.
+  Offset? _dragPos;
+  double? _dragScale;
+  double? _dragRotation;
+  double _startScale = 1;
+  double _startRotation = 0;
+
+  /// Aspect ratio (w/h) of the sticker image, once known.
+  double? _aspect;
+  ImageStream? _stream;
+  ImageStreamListener? _listener;
+
+  // Animations re-evaluate every frame while playing.
+  late final _ticker = createTicker((_) {
+    if (mounted) setState(() {});
+  });
+
+  @override
+  void initState() {
+    super.initState();
+    _resolveImage();
+  }
+
+  @override
+  void didUpdateWidget(_DraggableStickerWidget oldWidget) {
+    super.didUpdateWidget(oldWidget);
+    if (oldWidget.sticker.assetPath != widget.sticker.assetPath) {
+      _unlisten();
+      _resolveImage();
+    }
+  }
+
+  @override
+  void dispose() {
+    _unlisten();
+    _ticker.dispose();
+    super.dispose();
+  }
+
+  void _resolveImage() {
+    final stream = stickerImageProvider(widget.sticker.assetPath)
+        .resolve(ImageConfiguration.empty);
+    _listener = ImageStreamListener((info, _) {
+      final w = info.image.width;
+      final h = info.image.height;
+      if (!mounted || w == 0 || h == 0) return;
+      final a = w / h;
+      if (_aspect != a) setState(() => _aspect = a);
+    });
+    stream.addListener(_listener!);
+    _stream = stream;
+  }
+
+  void _unlisten() {
+    if (_listener != null) _stream?.removeListener(_listener!);
+    _stream = null;
+    _listener = null;
+  }
+
+  TextAnimState _anim(VideoEditorProvider p, bool selected) {
+    final s = widget.sticker;
+    final animated = s.animIn != 'none' || s.animOut != 'none';
+    if (!animated || selected || !p.isPlaying || _dragPos != null) {
+      if (_ticker.isActive) _ticker.stop();
+      return const TextAnimState();
+    }
+    final len = (s.endTime - s.startTime).inMilliseconds / 1000.0;
+    final t = (p.smoothPosition - s.startTime).inMicroseconds / 1e6;
+    final state = TextAnimations.atTimes(s.animIn, s.animOut, len, t);
+    if (state.isIdle) {
+      if (_ticker.isActive) _ticker.stop();
+    } else if (!_ticker.isActive) {
+      _ticker.start();
+    }
+    return state;
+  }
 
   @override
   Widget build(BuildContext context) {
     final provider = Provider.of<VideoEditorProvider>(context, listen: false);
-    final isSelected = provider.selectedStickerId == widget.sticker.id;
-    final position = _localPosition ?? widget.sticker.position;
+    final s = widget.sticker;
+    final isSelected = provider.selectedStickerId == s.id;
+    final position = _dragPos ?? s.position;
+    final scale = _dragScale ?? s.scale;
+    final rotation = _dragRotation ?? s.rotation;
+    final cw = widget.constraints.maxWidth;
+    final ch = widget.constraints.maxHeight;
 
-    // Default base size increased significantly for better visibility
-    const double baseSize = 600.0;
-    final effectiveSize = baseSize * widget.sticker.scale * _pinchScale;
+    // The picture is contain-fitted into a square (600 * scale) centred on
+    // the position, exactly as the exporter draws it. The widget covers
+    // only the picture, so empty space around it does not steal taps.
+    final side = kStickerBaseSize * scale;
+    final aspect = _aspect ?? 1.0;
+    final w = aspect >= 1 ? side : side * aspect;
+    final h = aspect >= 1 ? side / aspect : side;
+    final anim = _anim(provider, isSelected);
+    final buttonSize = (math.min(w, h) * 0.25).clamp(44.0, 80.0);
+
+    Widget picture = Image(
+      image: stickerImageProvider(s.assetPath),
+      fit: BoxFit.contain,
+      gaplessPlayback: true,
+      errorBuilder: (_, __, ___) =>
+          Icon(Icons.broken_image_outlined, color: AppColors.textTertiary),
+    );
+    if (s.flipX) picture = Transform.flip(flipX: true, child: picture);
 
     return Positioned(
-      left: position.dx * widget.constraints.maxWidth - (effectiveSize / 2),
-      top: position.dy * widget.constraints.maxHeight - (effectiveSize / 2),
+      left: position.dx * cw - w / 2,
+      top: position.dy * ch - h / 2,
+      width: w,
+      height: h,
       child: GestureDetector(
-        onTap: () => provider.selectSticker(widget.sticker.id),
         behavior: HitTestBehavior.opaque,
-        onScaleStart: (details) {
-          provider.selectSticker(widget.sticker.id);
-          _localPosition = widget.sticker.position;
-          _baseScale = _pinchScale;
-          provider.recordUndo();
-        },
-        onScaleUpdate: (details) {
+        onTap: () => provider.selectSticker(s.id),
+        onScaleStart: (_) {
+          provider.selectSticker(s.id);
+          _startScale = s.scale;
+          _startRotation = s.rotation;
           setState(() {
-            if (details.scale != 1.0) {
-              _pinchScale = (_baseScale * details.scale).clamp(0.1, 10.0);
-            }
-
-            final currentX = _localPosition!.dx * widget.constraints.maxWidth;
-            final currentY = _localPosition!.dy * widget.constraints.maxHeight;
-
-            final newX = currentX + details.focalPointDelta.dx;
-            final newY = currentY + details.focalPointDelta.dy;
-
-            _localPosition = Offset(
-              (newX / widget.constraints.maxWidth).clamp(0.0, 1.0),
-              (newY / widget.constraints.maxHeight).clamp(0.0, 1.0),
-            );
+            _dragPos = s.position;
+            _dragScale = s.scale;
+            _dragRotation = s.rotation;
           });
         },
-        onScaleEnd: (details) {
-          final finalScale =
-              (widget.sticker.scale * _pinchScale).clamp(0.1, 10.0);
-          provider.updateSticker(
-            widget.sticker.id,
-            position: _localPosition,
-            scale: finalScale,
-          );
-          _localPosition = null;
-          _pinchScale = 1.0;
-          _baseScale = 1.0;
+        onScaleUpdate: (d) {
+          final raw = (_dragPos ?? s.position) +
+              Offset(d.focalPointDelta.dx / cw, d.focalPointDelta.dy / ch);
+          setState(() {
+            _dragPos = Offset(raw.dx.clamp(0.0, 1.0), raw.dy.clamp(0.0, 1.0));
+            if (d.pointerCount >= 2) {
+              _dragScale = (_startScale * d.scale).clamp(0.1, 10.0);
+              _dragRotation = _startRotation + d.rotation;
+            }
+          });
+          // Show the guides the centre will snap to.
+          SnapGuides.snapCenter(_dragPos!);
         },
-        child: Transform.rotate(
-          angle: widget.sticker.rotation,
-          child: Container(
-            width: effectiveSize,
-            height: effectiveSize,
-            decoration: BoxDecoration(
-              border: isSelected
-                  ? Border.all(color: AppColors.primary, width: 2)
-                  : null,
-              borderRadius: BorderRadius.circular(8),
-            ),
-            child: Stack(
-              fit: StackFit.expand,
-              children: [
-                Image.asset(
-                  widget.sticker.assetPath,
-                  fit: BoxFit.contain,
-                  opacity: AlwaysStoppedAnimation(widget.sticker.opacity),
+        onScaleEnd: (_) {
+          final pos = SnapGuides.snapCenter(_dragPos ?? s.position);
+          SnapGuides.clear();
+          var rot = _dragRotation ?? s.rotation;
+          // Snap near-straight angles to the nearest quarter turn.
+          final quarter = (rot / (math.pi / 2)).round() * (math.pi / 2);
+          if ((rot - quarter).abs() < 0.07) rot = quarter;
+          // One undo step for the whole gesture.
+          provider.updateSticker(
+            s.id,
+            position: pos,
+            scale: _dragScale ?? s.scale,
+            rotation: rot,
+          );
+          setState(() {
+            _dragPos = null;
+            _dragScale = null;
+            _dragRotation = null;
+          });
+        },
+        child: Stack(
+          clipBehavior: Clip.none,
+          fit: StackFit.expand,
+          children: [
+            Transform.translate(
+              offset: Offset(0, anim.dy),
+              child: Transform.scale(
+                scale: anim.scale,
+                child: Transform.rotate(
+                  angle: rotation,
+                  child: Opacity(
+                    opacity: (s.opacity * anim.opacity).clamp(0.0, 1.0),
+                    child: Container(
+                      decoration: BoxDecoration(
+                        border: isSelected
+                            ? Border.all(color: AppColors.primary, width: 4)
+                            : null,
+                      ),
+                      child: picture,
+                    ),
+                  ),
                 ),
-                if (isSelected)
-                  _buildStickerControls(
-                      context, provider, widget.sticker, effectiveSize),
-              ],
+              ),
             ),
-          ),
+            if (isSelected)
+              Positioned(
+                top: 0,
+                right: 0,
+                child: GestureDetector(
+                  onTap: () => provider.removeSticker(s.id),
+                  child: Container(
+                    width: buttonSize,
+                    height: buttonSize,
+                    decoration: const BoxDecoration(
+                      color: AppColors.error,
+                      shape: BoxShape.circle,
+                      boxShadow: [
+                        BoxShadow(blurRadius: 4, color: Colors.black26)
+                      ],
+                    ),
+                    child: Icon(Icons.close,
+                        color: Colors.white, size: buttonSize * 0.55),
+                  ),
+                ),
+              ),
+          ],
         ),
       ),
-    );
-  }
-
-  Widget _buildStickerControls(
-    BuildContext context,
-    VideoEditorProvider provider,
-    StickerModel sticker,
-    double size,
-  ) {
-    return Stack(
-      clipBehavior: Clip.none,
-      children: [
-        // Delete button
-        Positioned(
-          top: -20,
-          right: -20,
-          child: GestureDetector(
-            onTap: () => provider.removeSticker(sticker.id),
-            child: Container(
-              width: 40,
-              height: 40,
-              decoration: const BoxDecoration(
-                color: AppColors.error,
-                shape: BoxShape.circle,
-                boxShadow: [BoxShadow(blurRadius: 4, color: Colors.black26)],
-              ),
-              child: const Icon(Icons.close, color: Colors.white, size: 24),
-            ),
-          ),
-        ),
-        // Duplicate button
-        Positioned(
-          bottom: -20,
-          right: -20,
-          child: GestureDetector(
-            onTap: () => _duplicateSticker(provider, sticker),
-            child: Container(
-              width: 40,
-              height: 40,
-              decoration: BoxDecoration(
-                color: AppColors.primary,
-                shape: BoxShape.circle,
-                boxShadow: [BoxShadow(blurRadius: 4, color: Colors.black26)],
-              ),
-              child: const Icon(Icons.copy, color: Colors.white, size: 20),
-            ),
-          ),
-        ),
-      ],
-    );
-  }
-
-  void _duplicateSticker(VideoEditorProvider provider, StickerModel sticker) {
-    provider.addSticker(
-      assetPath: sticker.assetPath,
-      position: Offset(
-        (sticker.position.dx + 0.05).clamp(0.0, 1.0),
-        (sticker.position.dy + 0.05).clamp(0.0, 1.0),
-      ),
-      scale: sticker.scale,
-      rotation: sticker.rotation,
-      startTime: sticker.startTime,
-      endTime: sticker.endTime,
-      opacity: sticker.opacity,
     );
   }
 }

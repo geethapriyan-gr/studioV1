@@ -1,8 +1,18 @@
+import 'dart:io';
+
+import 'package:file_picker/file_picker.dart';
 import 'package:flutter/material.dart';
 import 'package:provider/provider.dart';
-import '../providers/video_editor_provider.dart';
-import '../main.dart' show AppColors;
 
+import '../main.dart' show AppColors;
+import '../providers/video_editor_provider.dart';
+import '../utils/sticker_catalog.dart';
+import 'length_prompt.dart';
+import 'sticker_layer.dart' show stickerImageProvider;
+
+/// Sticker picker: categories, search, recently used, and the user's own
+/// images (PNG/WebP/JPG, or animated GIF). A tapped sticker is placed at
+/// the playhead.
 class StickerPanel extends StatefulWidget {
   const StickerPanel({super.key});
 
@@ -11,197 +21,311 @@ class StickerPanel extends StatefulWidget {
 }
 
 class _StickerPanelState extends State<StickerPanel> {
-  final List<String> _stickerAssets = [
-    'assets/stickers/angry.png',
-    'assets/stickers/april.png',
-    'assets/stickers/august.png',
-    'assets/stickers/awesome.png',
-    'assets/stickers/book.png',
-    'assets/stickers/books.png',
-    'assets/stickers/buffalo.png',
-    'assets/stickers/cheetah.png',
-    'assets/stickers/comet.png',
-    'assets/stickers/cow.png',
-    'assets/stickers/creativity (1).png',
-    'assets/stickers/creativity (2).png',
-    'assets/stickers/creativity.png',
-    'assets/stickers/crocodile.png',
-    'assets/stickers/december.png',
-    'assets/stickers/drawing-tablet.png',
-    'assets/stickers/education.png',
-    'assets/stickers/february.png',
-    'assets/stickers/feed-your-ideas.png',
-    'assets/stickers/flamingo.png',
-    'assets/stickers/friday.png',
-    'assets/stickers/good-things-are-coming.png',
-    'assets/stickers/graduate.png',
-    'assets/stickers/hedgehog.png',
-    'assets/stickers/horse.png',
-    'assets/stickers/january.png',
-    'assets/stickers/july.png',
-    'assets/stickers/june.png',
-    'assets/stickers/march.png',
-    'assets/stickers/may.png',
-    'assets/stickers/monday.png',
-    'assets/stickers/mortarboard.png',
-    'assets/stickers/new-ideas-in-process.png',
-    'assets/stickers/november.png',
-    'assets/stickers/october.png',
-    'assets/stickers/online-class.png',
-    'assets/stickers/online-education.png',
-    'assets/stickers/painting-palette.png',
-    'assets/stickers/pencil-case.png',
-    'assets/stickers/pig.png',
-    'assets/stickers/reading (1).png',
-    'assets/stickers/reading.png',
-    'assets/stickers/rocket (1).png',
-    'assets/stickers/rocket (2).png',
-    'assets/stickers/rocket.png',
-    'assets/stickers/saturday.png',
-    'assets/stickers/Screenshot_2026-04-01_100038-removebg-preview.png',
-    'assets/stickers/Screenshot_2026-04-01_100047-removebg-preview.png',
-    'assets/stickers/Screenshot_2026-04-01_100058-removebg-preview.png',
-    'assets/stickers/Screenshot_2026-04-01_100108-removebg-preview.png',
-    'assets/stickers/Screenshot_2026-04-01_100118-removebg-preview.png',
-    'assets/stickers/Screenshot_2026-04-01_100124-removebg-preview.png',
-    'assets/stickers/Screenshot_2026-04-01_100141-removebg-preview.png',
-    'assets/stickers/Screenshot_2026-04-01_100146-removebg-preview.png',
-    'assets/stickers/Screenshot_2026-04-01_100153-removebg-preview (1).png',
-    'assets/stickers/Screenshot_2026-04-01_100153-removebg-preview.png',
-    'assets/stickers/Screenshot_2026-04-01_100159-removebg-preview.png',
-    'assets/stickers/Screenshot_2026-04-01_100208-removebg-preview.png',
-    'assets/stickers/Screenshot_2026-04-01_100214-removebg-preview (1).png',
-    'assets/stickers/Screenshot_2026-04-01_100214-removebg-preview.png',
-    'assets/stickers/Screenshot_2026-04-01_100221-removebg-preview.png',
-    'assets/stickers/Screenshot_2026-04-01_100231-removebg-preview.png',
-    'assets/stickers/Screenshot_2026-04-01_100237-removebg-preview.png',
-    'assets/stickers/Screenshot_2026-04-01_100248-removebg-preview.png',
-    'assets/stickers/Screenshot_2026-04-01_100254-removebg-preview.png',
-    'assets/stickers/Screenshot_2026-04-01_100304-removebg-preview.png',
-    'assets/stickers/Screenshot_2026-04-01_100327-removebg-preview.png',
-    'assets/stickers/Screenshot_2026-04-01_100335-removebg-preview.png',
-    'assets/stickers/Screenshot_2026-04-01_100350-removebg-preview.png',
-    'assets/stickers/Screenshot_2026-04-01_100400-removebg-preview.png',
-    'assets/stickers/Screenshot_2026-04-01_100412-removebg-preview.png',
-    'assets/stickers/Screenshot_2026-04-01_100417-removebg-preview.png',
-    'assets/stickers/september.png',
-    'assets/stickers/sheep.png',
-    'assets/stickers/star.png',
-    'assets/stickers/study.png',
-    'assets/stickers/studying (1).png',
-    'assets/stickers/studying (2).png',
-    'assets/stickers/studying.png',
-    'assets/stickers/sunday.png',
-    'assets/stickers/thursday.png',
-    'assets/stickers/today-is-the-perfect-day.png',
-    'assets/stickers/tuesday.png',
-    'assets/stickers/wednesday.png',
-    'assets/stickers/yeah (1).png',
-    'assets/stickers/yeah.png',
-  ];
+  List<StickerEntry> _bundled = const [];
+  List<String> _recents = const [];
+  List<String> _custom = const [];
+  String _category = StickerCatalog.categories[2];
+  String _query = '';
+  bool _loading = true;
+  final _search = TextEditingController();
+
+  static const Duration _stickerLength = Duration(seconds: 5);
+
+  @override
+  void initState() {
+    super.initState();
+    _load();
+  }
+
+  @override
+  void dispose() {
+    _search.dispose();
+    super.dispose();
+  }
+
+  Future<void> _load() async {
+    final bundled = await StickerCatalog.bundled();
+    final recents = await StickerCatalog.recents();
+    final custom = (await StickerCatalog.custom())
+        .where((p) => File(p).existsSync())
+        .toList();
+    if (!mounted) return;
+    setState(() {
+      _bundled = bundled;
+      _recents = recents;
+      _custom = custom;
+      // Open on Recent when there is something in it.
+      if (_loading && recents.isNotEmpty) _category = StickerCatalog.recent;
+      _loading = false;
+    });
+  }
+
+  StickerEntry _entryFor(String path) {
+    for (final e in _bundled) {
+      if (e.path == path) return e;
+    }
+    return StickerEntry(path, 'My sticker', StickerCatalog.mine);
+  }
+
+  List<StickerEntry> get _visible {
+    final q = _query.trim().toLowerCase();
+    if (q.isNotEmpty) {
+      return [
+        for (final e in _bundled)
+          if (e.label.toLowerCase().contains(q) ||
+              e.category.toLowerCase().contains(q))
+            e,
+      ];
+    }
+    switch (_category) {
+      case StickerCatalog.recent:
+        return _recents
+            .where((p) => p.startsWith('assets/') || File(p).existsSync())
+            .map(_entryFor)
+            .toList();
+      case StickerCatalog.mine:
+        return _custom.map(_entryFor).toList();
+      default:
+        return _bundled.where((e) => e.category == _category).toList();
+    }
+  }
+
+  Future<void> _add(VideoEditorProvider provider, String path) async {
+    final start = provider.currentPosition;
+    final before = provider.totalDuration;
+    final id = await provider.addSticker(
+      assetPath: path,
+      startTime: start,
+      endTime: start + _stickerLength,
+    );
+    await StickerCatalog.markUsed(path);
+    if (id != null) provider.selectSticker(id);
+    if (!mounted) return;
+    await LengthPrompt.afterAdd(
+        context, provider, before, TimelineItemKind.sticker, id);
+    // Back to the timeline so the new sticker and its tools show.
+    provider.toggleTimeline();
+  }
+
+  Future<void> _importOwn(VideoEditorProvider provider) async {
+    try {
+      final result = await FilePicker.platform.pickFiles(
+        type: FileType.custom,
+        allowedExtensions: const ['png', 'webp', 'gif', 'jpg', 'jpeg'],
+      );
+      final picked = result?.files.single.path;
+      if (picked == null) return;
+      final saved = await provider.importCustomSticker(File(picked));
+      await _load();
+      if (!mounted) return;
+      setState(() => _category = StickerCatalog.mine);
+      await _add(provider, saved);
+    } catch (e) {
+      if (!mounted) return;
+      ScaffoldMessenger.of(context).showSnackBar(
+        SnackBar(content: Text('Could not use that image: $e')),
+      );
+    }
+  }
+
+  Future<void> _removeOwn(String path) async {
+    final ok = await showDialog<bool>(
+      context: context,
+      builder: (ctx) => AlertDialog(
+        backgroundColor: AppColors.surface,
+        title: Text('Remove from My stickers?',
+            style: TextStyle(color: AppColors.textPrimary)),
+        content: Text(
+            'Stickers already placed in projects stay where they are.',
+            style: TextStyle(color: AppColors.textSecondary)),
+        actions: [
+          TextButton(
+              onPressed: () => Navigator.pop(ctx, false),
+              child: const Text('Cancel')),
+          FilledButton(
+              onPressed: () => Navigator.pop(ctx, true),
+              child: const Text('Remove')),
+        ],
+      ),
+    );
+    if (ok != true) return;
+    await StickerCatalog.removeCustom(path);
+    await _load();
+  }
 
   @override
   Widget build(BuildContext context) {
-    final provider = Provider.of<VideoEditorProvider>(context);
-
+    final provider = Provider.of<VideoEditorProvider>(context, listen: false);
+    final items = _visible;
+    final isMine = _category == StickerCatalog.mine && _query.isEmpty;
     return Container(
       color: AppColors.surface,
       child: Column(
         children: [
-          _buildHeader(),
+          _buildHeader(provider),
+          _buildCategories(),
           Expanded(
-            child: GridView.builder(
-              padding: const EdgeInsets.all(16),
-              gridDelegate: const SliverGridDelegateWithFixedCrossAxisCount(
-                crossAxisCount: 4,
-                crossAxisSpacing: 16,
-                mainAxisSpacing: 16,
-                childAspectRatio: 1,
-              ),
-              itemCount: _stickerAssets.length,
-              itemBuilder: (context, index) {
-                return _buildStickerItem(
-                  context,
-                  provider,
-                  _stickerAssets[index],
-                );
-              },
-            ),
+            child: _loading
+                ? const Center(child: CircularProgressIndicator())
+                : (items.isEmpty && !isMine)
+                    ? _empty()
+                    : GridView.builder(
+                        padding: const EdgeInsets.all(12),
+                        gridDelegate:
+                            const SliverGridDelegateWithMaxCrossAxisExtent(
+                          maxCrossAxisExtent: 96,
+                          crossAxisSpacing: 10,
+                          mainAxisSpacing: 10,
+                        ),
+                        itemCount: items.length + (isMine ? 1 : 0),
+                        itemBuilder: (context, index) {
+                          if (isMine && index == 0) {
+                            return _addOwnTile(provider);
+                          }
+                          final e = items[isMine ? index - 1 : index];
+                          return _stickerTile(provider, e, removable: isMine);
+                        },
+                      ),
           ),
         ],
       ),
     );
   }
 
-  Widget _buildHeader() {
-    return Container(
-      height: 56,
-      padding: const EdgeInsets.symmetric(horizontal: 16),
-      decoration: BoxDecoration(
-        border: Border(
-          bottom: BorderSide(color: AppColors.border, width: 1),
-        ),
-      ),
+  Widget _empty() {
+    final text = _query.isNotEmpty
+        ? 'No stickers match "$_query".'
+        : _category == StickerCatalog.recent
+            ? 'Stickers you use show up here.'
+            : 'Nothing here yet.';
+    return Center(
+      child: Text(text, style: TextStyle(color: AppColors.textTertiary)),
+    );
+  }
+
+  Widget _buildHeader(VideoEditorProvider provider) {
+    return Padding(
+      padding: const EdgeInsets.fromLTRB(12, 10, 12, 6),
       child: Row(
         children: [
-          Text(
-            'Stickers',
-            style: TextStyle(
-              fontSize: 18,
-              fontWeight: FontWeight.w600,
-              color: AppColors.textPrimary,
+          Expanded(
+            child: TextField(
+              controller: _search,
+              onChanged: (v) => setState(() => _query = v),
+              style: TextStyle(color: AppColors.textPrimary, fontSize: 14),
+              decoration: InputDecoration(
+                isDense: true,
+                filled: true,
+                fillColor: AppColors.surfaceLight,
+                prefixIcon: Icon(Icons.search_rounded,
+                    color: AppColors.textTertiary, size: 20),
+                suffixIcon: _query.isEmpty
+                    ? null
+                    : IconButton(
+                        icon: const Icon(Icons.close_rounded, size: 18),
+                        onPressed: () {
+                          _search.clear();
+                          setState(() => _query = '');
+                        },
+                      ),
+                hintText: 'Search stickers',
+                hintStyle: TextStyle(color: AppColors.textTertiary),
+                border: OutlineInputBorder(
+                  borderRadius: BorderRadius.circular(12),
+                  borderSide: BorderSide.none,
+                ),
+              ),
             ),
+          ),
+          const SizedBox(width: 8),
+          IconButton.filledTonal(
+            tooltip: 'Add my own',
+            onPressed: () => _importOwn(provider),
+            icon: const Icon(Icons.add_photo_alternate_outlined),
+          ),
+          IconButton(
+            tooltip: 'Close',
+            onPressed: provider.toggleTimeline,
+            icon: Icon(Icons.close_rounded, color: AppColors.textSecondary),
           ),
         ],
       ),
     );
   }
 
-  Widget _buildStickerItem(
-    BuildContext context,
-    VideoEditorProvider provider,
-    String assetPath,
-  ) {
-    return GestureDetector(
-      onTap: () => _onStickerSelected(provider, assetPath),
+  Widget _buildCategories() {
+    return SizedBox(
+      height: 44,
+      child: ListView.separated(
+        scrollDirection: Axis.horizontal,
+        padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 4),
+        itemCount: StickerCatalog.categories.length,
+        separatorBuilder: (_, __) => const SizedBox(width: 6),
+        itemBuilder: (context, i) {
+          final c = StickerCatalog.categories[i];
+          final selected = _query.isEmpty && c == _category;
+          return ChoiceChip(
+            label: Text(c),
+            selected: selected,
+            onSelected: (_) {
+              _search.clear();
+              setState(() {
+                _query = '';
+                _category = c;
+              });
+            },
+          );
+        },
+      ),
+    );
+  }
+
+  Widget _addOwnTile(VideoEditorProvider provider) {
+    return InkWell(
+      onTap: () => _importOwn(provider),
+      borderRadius: BorderRadius.circular(12),
       child: Container(
         decoration: BoxDecoration(
-          color: AppColors.surfaceLight,
+          color: AppColors.primary.withValues(alpha: 0.1),
           borderRadius: BorderRadius.circular(12),
-          border: Border.all(color: AppColors.border, width: 1),
+          border: Border.all(color: AppColors.primary.withValues(alpha: 0.5)),
         ),
-        child: Center(
-          child: Image.asset(
-            assetPath,
-            width: 64,
-            height: 64,
-            fit: BoxFit.contain,
-          ),
+        child: Column(
+          mainAxisAlignment: MainAxisAlignment.center,
+          children: [
+            Icon(Icons.add_photo_alternate_outlined, color: AppColors.primary),
+            const SizedBox(height: 4),
+            Text('Add image',
+                style: TextStyle(color: AppColors.primary, fontSize: 11)),
+          ],
         ),
       ),
     );
   }
 
-  void _onStickerSelected(VideoEditorProvider provider, String assetPath) {
-    // Add sticker to the project at current timeline position
-    final start = provider.currentPosition;
-    final end = start + const Duration(seconds: 5);
-    
-    provider.addSticker(
-      assetPath: assetPath,
-      position: const Offset(0.5, 0.5),
-      scale: 1.0,
-      rotation: 0.0,
-      startTime: start,
-      endTime: end,
-      opacity: 1.0,
+  Widget _stickerTile(VideoEditorProvider provider, StickerEntry e,
+      {bool removable = false}) {
+    return Tooltip(
+      message: e.label,
+      child: GestureDetector(
+        onTap: () => _add(provider, e.path),
+        onLongPress: removable ? () => _removeOwn(e.path) : null,
+        child: Container(
+          padding: const EdgeInsets.all(8),
+          decoration: BoxDecoration(
+            color: AppColors.surfaceLight,
+            borderRadius: BorderRadius.circular(12),
+            border: Border.all(color: AppColors.border),
+          ),
+          child: Image(
+            image: ResizeImage(stickerImageProvider(e.path),
+                width: 160, allowUpscaling: false),
+            fit: BoxFit.contain,
+            errorBuilder: (_, __, ___) => Icon(Icons.broken_image_outlined,
+                color: AppColors.textTertiary),
+          ),
+        ),
+      ),
     );
-
-    _closeStickerPanel();
-  }
-
-  void _closeStickerPanel() {
-    final provider = Provider.of<VideoEditorProvider>(context, listen: false);
-    provider.toggleTimeline();
   }
 }

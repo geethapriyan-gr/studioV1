@@ -13,6 +13,8 @@ import '../services/media_picker_service.dart';
 import 'waveform_painter.dart';
 import '../utils/responsive.dart';
 import '../utils/track_allocation.dart';
+import 'length_prompt.dart';
+import 'sticker_layer.dart' show stickerImageProvider;
 
 /// Wrapper class to distinguish overlay clip drags from main video clip drags.
 /// This prevents cross-track drag-and-drop interference.
@@ -473,6 +475,26 @@ class _TimelineWidgetState extends State<TimelineWidget>
     }
   }
 
+  // Trimming an item: the whole drag is one undo step, and stretching it
+  // past the end of the video says so (with Undo).
+  Duration _trimLengthBefore = Duration.zero;
+  bool _itemTrimActive = false;
+
+  void _beginItemTrim(VideoEditorProvider provider, String key) {
+    _trimLengthBefore = provider.totalDuration;
+    _itemTrimActive = true;
+    provider.beginUndoGesture(key);
+  }
+
+  void _endItemTrim(VideoEditorProvider provider) {
+    if (!_itemTrimActive) return;
+    _itemTrimActive = false;
+    provider.endUndoGesture();
+    if (mounted) {
+      LengthPrompt.afterStretch(context, provider, _trimLengthBefore);
+    }
+  }
+
   void _finalizeTextTrim() {
     // Finalize any remaining accumulated delta
     if (_textTrimAccumulatedDeltaMs != 0) {
@@ -490,7 +512,9 @@ class _TimelineWidgetState extends State<TimelineWidget>
       final newStartTime = currentStart + delta;
       final newAudioOffset = currentAudioOffset + delta;
 
+      // The audio cannot start before the beginning of its file.
       if (newStartTime >= Duration.zero &&
+          newAudioOffset >= Duration.zero &&
           newStartTime < currentEnd - const Duration(seconds: 1)) {
         final provider =
             Provider.of<VideoEditorProvider>(context, listen: false);
@@ -905,12 +929,19 @@ class _TimelineWidgetState extends State<TimelineWidget>
       {int trackIndex = 0}) async {
     try {
       final media = await MediaPickerService.open(context);
-      if (media != null) {
-        final file = await media.getFile();
-        await provider.addOverlayClip(file, trackIndex: trackIndex);
-      }
+      if (media == null) return;
+      final file = await media.getFile();
+      final before = provider.totalDuration;
+      final id = await provider.addOverlayClip(file, trackIndex: trackIndex);
+      if (!mounted) return;
+      await LengthPrompt.afterAdd(
+          context, provider, before, TimelineItemKind.overlay, id);
     } catch (e) {
-      // ignore for now
+      if (!mounted) return;
+      final message = e.toString().replaceFirst('Exception: ', '');
+      ScaffoldMessenger.of(context).showSnackBar(
+        SnackBar(content: Text('Could not add overlay: $message')),
+      );
     }
   }
 
@@ -1339,6 +1370,7 @@ class _TimelineWidgetState extends State<TimelineWidget>
               child: Container(
                 width: width,
                 height: _trackHeight - 12,
+                padding: const EdgeInsets.symmetric(horizontal: 4, vertical: 2),
                 decoration: BoxDecoration(
                   color: isSelected
                       ? AppColors.primary
@@ -1348,11 +1380,31 @@ class _TimelineWidgetState extends State<TimelineWidget>
                       ? Border.all(color: AppColors.textPrimary, width: 2)
                       : null,
                 ),
-                child: Center(
-                  child: Text(
-                    'Sticker',
-                    style: TextStyle(color: AppColors.textPrimary, fontSize: 9),
-                    overflow: TextOverflow.ellipsis,
+                // The sticker's picture, repeated along the block.
+                child: ClipRect(
+                  child: Row(
+                    children: [
+                      for (int i = 0;
+                          i < math.max(1, (width / 40).floor()).clamp(1, 12);
+                          i++)
+                        Padding(
+                          padding: const EdgeInsets.only(right: 6),
+                          child: Image(
+                            image: ResizeImage(
+                                stickerImageProvider(sticker.assetPath),
+                                width: 64,
+                                allowUpscaling: false),
+                            width: 30,
+                            height: _trackHeight - 20,
+                            fit: BoxFit.contain,
+                            gaplessPlayback: true,
+                            errorBuilder: (_, __, ___) => Icon(
+                                Icons.emoji_emotions_outlined,
+                                size: 16,
+                                color: AppColors.textPrimary),
+                          ),
+                        ),
+                    ],
                   ),
                 ),
               ),
@@ -1367,6 +1419,10 @@ class _TimelineWidgetState extends State<TimelineWidget>
               width: 24,
               child: GestureDetector(
                 behavior: HitTestBehavior.translucent,
+                onHorizontalDragStart: (_) => _beginItemTrim(
+                    provider, 'sticker-trim:${sticker.id}'),
+                onHorizontalDragEnd: (_) => _endItemTrim(provider),
+                onHorizontalDragCancel: () => _endItemTrim(provider),
                 onHorizontalDragUpdate: (details) {
                   final deltaMs = (details.delta.dx / _timelineScale).round();
                   final delta = Duration(milliseconds: deltaMs);
@@ -1399,6 +1455,10 @@ class _TimelineWidgetState extends State<TimelineWidget>
               width: 24,
               child: GestureDetector(
                 behavior: HitTestBehavior.translucent,
+                onHorizontalDragStart: (_) => _beginItemTrim(
+                    provider, 'sticker-trim:${sticker.id}'),
+                onHorizontalDragEnd: (_) => _endItemTrim(provider),
+                onHorizontalDragCancel: () => _endItemTrim(provider),
                 onHorizontalDragUpdate: (details) {
                   final deltaMs = (details.delta.dx / _timelineScale).round();
                   final delta = Duration(milliseconds: deltaMs);
@@ -1582,6 +1642,26 @@ class _TimelineWidgetState extends State<TimelineWidget>
                       // Thumbnail strip (same as main video clips)
                       _buildClipThumbnailStrip(clip, width),
 
+                      // Motion keyframes
+                      for (final k in clip.keyframes)
+                        Positioned(
+                          left: (_durationToPixels(k.time) - 5)
+                              .clamp(0.0, math.max(0.0, width - 10)),
+                          bottom: 3,
+                          child: Transform.rotate(
+                            angle: math.pi / 4,
+                            child: Container(
+                              width: 8,
+                              height: 8,
+                              decoration: BoxDecoration(
+                                color: AppColors.warning,
+                                border: Border.all(
+                                    color: Colors.black54, width: 1),
+                              ),
+                            ),
+                          ),
+                        ),
+
                       // Gradient overlay for readability
                       Positioned(
                         left: 0,
@@ -1654,6 +1734,10 @@ class _TimelineWidgetState extends State<TimelineWidget>
               width: 24,
               child: GestureDetector(
                 behavior: HitTestBehavior.translucent,
+                onHorizontalDragStart: (_) =>
+                    _beginItemTrim(provider, 'overlay-trim:${clip.id}'),
+                onHorizontalDragEnd: (_) => _endItemTrim(provider),
+                onHorizontalDragCancel: () => _endItemTrim(provider),
                 onHorizontalDragUpdate: (details) {
                   final deltaMs = (details.delta.dx / _timelineScale).round();
                   final delta = Duration(milliseconds: deltaMs);
@@ -1669,7 +1753,10 @@ class _TimelineWidgetState extends State<TimelineWidget>
                     }
                     provider.trimOverlayClip(clip.id, delta, clip.trimEnd);
                   } else {
-                    final newTrimStart = clip.trimStart + delta;
+                    // Timeline drag -> source time at the overlay's speed.
+                    final newTrimStart = clip.trimStart +
+                        VideoEditorProvider.sourceLengthForTimeline(
+                            delta, clip.playbackSpeed);
                     if (newTrimStart < clip.sourceStart ||
                         newTrimStart >=
                             clip.trimEnd - const Duration(milliseconds: 100)) {
@@ -1699,13 +1786,21 @@ class _TimelineWidgetState extends State<TimelineWidget>
               width: 24,
               child: GestureDetector(
                 behavior: HitTestBehavior.translucent,
+                onHorizontalDragStart: (_) =>
+                    _beginItemTrim(provider, 'overlay-trim:${clip.id}'),
+                onHorizontalDragEnd: (_) => _endItemTrim(provider),
+                onHorizontalDragCancel: () => _endItemTrim(provider),
                 onHorizontalDragUpdate: (details) {
                   final deltaMs = (details.delta.dx / _timelineScale).round();
                   final delta = Duration(milliseconds: deltaMs);
                   final isImage = clip.mediaType == MediaType.image ||
                       clip.imageFile != null;
 
-                  final newTrimEnd = clip.trimEnd + delta;
+                  final newTrimEnd = clip.trimEnd +
+                      (isImage
+                          ? delta
+                          : VideoEditorProvider.sourceLengthForTimeline(
+                              delta, clip.playbackSpeed));
                   if (newTrimEnd <=
                       clip.trimStart + const Duration(milliseconds: 100)) {
                     return;
@@ -2012,8 +2107,10 @@ class _TimelineWidgetState extends State<TimelineWidget>
                   }
                   provider.trimVideoClip(clip.id, newTrimStart, clip.trimEnd);
                 },
+                onHorizontalDragStart: (_) =>
+                    _beginItemTrim(provider, 'clip-trim:${clip.id}'),
                 onHorizontalDragEnd: (_) {
-                  provider.recordUndo();
+                  _endItemTrim(provider);
                   _lastVideoTrimUpdate = null;
                 },
                 child: Container(
@@ -2067,9 +2164,11 @@ class _TimelineWidgetState extends State<TimelineWidget>
                     provider.trimVideoClip(clip.id, clip.trimStart, newTrimEnd);
                   }
                 },
+                onHorizontalDragStart: (_) =>
+                    _beginItemTrim(provider, 'clip-trim:${clip.id}'),
                 onHorizontalDragEnd: (_) {
-                  // Commit undo record on drag end (not during drag)
-                  provider.recordUndo();
+                  // The undo step was saved when the drag started.
+                  _endItemTrim(provider);
                   _lastVideoTrimUpdate = null;
                 },
                 child: Container(
@@ -2716,6 +2815,7 @@ class _TimelineWidgetState extends State<TimelineWidget>
                 behavior: HitTestBehavior.translucent,
                 onHorizontalDragStart: (_) {
                   _textTrimAccumulatedDeltaMs = 0;
+                  _beginItemTrim(provider, 'text-trim:${overlay.id}');
                 },
                 onHorizontalDragUpdate: (details) {
                   final deltaMs = (details.delta.dx / _timelineScale).round();
@@ -2728,6 +2828,7 @@ class _TimelineWidgetState extends State<TimelineWidget>
                 },
                 onHorizontalDragEnd: (_) {
                   _finalizeTextTrim();
+                  _endItemTrim(provider);
                 },
                 child: Container(
                   width: 8,
@@ -2752,6 +2853,7 @@ class _TimelineWidgetState extends State<TimelineWidget>
                 behavior: HitTestBehavior.translucent,
                 onHorizontalDragStart: (_) {
                   _textTrimAccumulatedDeltaMs = 0;
+                  _beginItemTrim(provider, 'text-trim:${overlay.id}');
                 },
                 onHorizontalDragUpdate: (details) {
                   final deltaMs = (details.delta.dx / _timelineScale).round();
@@ -2764,6 +2866,7 @@ class _TimelineWidgetState extends State<TimelineWidget>
                 },
                 onHorizontalDragEnd: (_) {
                   _finalizeTextTrim();
+                  _endItemTrim(provider);
                 },
                 child: Container(
                   width: 8,
@@ -2882,6 +2985,7 @@ class _TimelineWidgetState extends State<TimelineWidget>
                 behavior: HitTestBehavior.translucent,
                 onHorizontalDragStart: (_) {
                   _audioTrimAccumulatedDeltaMs = 0;
+                  _beginItemTrim(provider, 'audio-trim:${overlay.id}');
                 },
                 onHorizontalDragUpdate: (details) {
                   final deltaMs = (details.delta.dx / _timelineScale).round();
@@ -2895,6 +2999,7 @@ class _TimelineWidgetState extends State<TimelineWidget>
                 },
                 onHorizontalDragEnd: (_) {
                   _finalizeAudioTrim();
+                  _endItemTrim(provider);
                 },
                 child: Container(
                   width: 8,
@@ -2919,6 +3024,7 @@ class _TimelineWidgetState extends State<TimelineWidget>
                 behavior: HitTestBehavior.translucent,
                 onHorizontalDragStart: (_) {
                   _audioTrimAccumulatedDeltaMs = 0;
+                  _beginItemTrim(provider, 'audio-trim:${overlay.id}');
                 },
                 onHorizontalDragUpdate: (details) {
                   final deltaMs = (details.delta.dx / _timelineScale).round();
@@ -2931,6 +3037,7 @@ class _TimelineWidgetState extends State<TimelineWidget>
                 },
                 onHorizontalDragEnd: (_) {
                   _finalizeAudioTrim();
+                  _endItemTrim(provider);
                 },
                 child: Container(
                   width: 8,
@@ -2996,9 +3103,7 @@ class _TimelineWidgetState extends State<TimelineWidget>
           ),
           _buildControlButton(
             icon: Icons.content_cut_outlined,
-            onPressed: (provider.selectedVideoClipId != null ||
-                    provider.selectedAudioOverlayId != null ||
-                    provider.selectedOverlayClipId != null)
+            onPressed: hasItemSelection
                 ? () {
                     if (provider.selectedVideoClipId != null) {
                       provider.cutVideoClip(provider.selectedVideoClipId!);
@@ -3007,6 +3112,10 @@ class _TimelineWidgetState extends State<TimelineWidget>
                           .cutAudioOverlay(provider.selectedAudioOverlayId!);
                     } else if (provider.selectedOverlayClipId != null) {
                       provider.cutOverlayClip(provider.selectedOverlayClipId!);
+                    } else if (provider.selectedTextOverlayId != null) {
+                      provider.cutTextOverlay(provider.selectedTextOverlayId!);
+                    } else if (provider.selectedStickerId != null) {
+                      provider.cutSticker(provider.selectedStickerId!);
                     }
                   }
                 : null,
@@ -3222,9 +3331,9 @@ class _TimelineWidgetState extends State<TimelineWidget>
                         overlayColor: AppColors.primary.withOpacity(0.15),
                       ),
                       child: Slider(
-                        value: isMuted ? 0.0 : currentVol.clamp(0.0, 2.0),
+                        value: isMuted ? 0.0 : currentVol.clamp(0.0, 1.0),
                         min: 0.0,
-                        max: 2.0,
+                        max: 1.0,
                         onChanged: (v) {
                           setSheetState(() {
                             currentVol = v;

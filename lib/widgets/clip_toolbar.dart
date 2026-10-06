@@ -33,8 +33,8 @@ class ClipToolbar extends StatelessWidget {
         0;
     final length = (clip.endTime - clip.startTime).inMilliseconds / 1000;
 
-    final tools = <_Tool>[
-      _Tool(Icons.content_cut_rounded, 'Split', () {
+    final tools = <ToolbarTool>[
+      ToolbarTool(Icons.content_cut_rounded, 'Split', () {
         final pos = provider.currentPosition;
         if (pos <= clip.startTime || pos >= clip.endTime) {
           _snack(context, 'Move the playhead inside the clip to split it');
@@ -42,13 +42,13 @@ class ClipToolbar extends StatelessWidget {
         }
         provider.cutVideoClip(clip.id);
       }),
-      _Tool(Icons.speed_rounded, 'Speed',
+      ToolbarTool(Icons.speed_rounded, 'Speed',
           () => ClipToolSheets.speed(context, clip.id),
           badge: (clip.playbackSpeed - 1).abs() > 0.001
               ? '${clip.playbackSpeed}x'
               : null),
       if (isVideo)
-        _Tool(
+        ToolbarTool(
           clip.isMuted ? Icons.volume_off_rounded : Icons.volume_up_rounded,
           'Volume',
           () => ClipToolSheets.volume(context, clip.id),
@@ -56,40 +56,40 @@ class ClipToolbar extends StatelessWidget {
               ? 'off'
               : (clip.volume < 0.999 ? '${(clip.volume * 100).round()}' : null),
         ),
-      _Tool(Icons.auto_awesome_rounded, 'Effects',
+      ToolbarTool(Icons.auto_awesome_rounded, 'Effects',
           () => ClipToolSheets.effects(context, clip.id),
           badge: effectsCount > 0 ? '$effectsCount' : null, highlight: true),
       // Tapping an open panel's tool again returns to the timeline.
-      _Tool(
+      ToolbarTool(
           Icons.tune_rounded,
           'Filter',
           provider.showFilters
               ? provider.toggleTimeline
               : provider.toggleFilters,
           active: provider.showFilters),
-      _Tool(
+      ToolbarTool(
           Icons.crop_rounded,
           'Crop',
           provider.showCropEditor
               ? provider.toggleTimeline
               : provider.toggleCropEditor,
           active: provider.showCropEditor),
-      _Tool(Icons.rotate_90_degrees_ccw_rounded, 'Rotate',
+      ToolbarTool(Icons.rotate_90_degrees_ccw_rounded, 'Rotate',
           () => ClipToolSheets.rotate(context, clip.id),
           badge: clip.rotation.abs() > 0.5 || clip.isMirrored ? '•' : null),
       if (isVideo)
-        _Tool(Icons.replay_rounded, 'Reverse',
+        ToolbarTool(Icons.replay_rounded, 'Reverse',
             () => provider.toggleVideoClipReverse(clip.id),
             active: clip.isReversed),
       if (isVideo)
-        _Tool(Icons.filter_vintage_outlined, 'Chroma',
+        ToolbarTool(Icons.filter_vintage_outlined, 'Chroma',
             provider.toggleChromaKeyEditor,
             active: provider.editorPanelMode == EditorPanelMode.chromaKey),
-      _Tool(Icons.copy_rounded, 'Duplicate', () {
+      ToolbarTool(Icons.copy_rounded, 'Duplicate', () {
         provider.duplicateVideoClip(clip.id);
         _snack(context, 'Clip duplicated at the end of the timeline');
       }),
-      _Tool(Icons.delete_outline_rounded, 'Delete', () {
+      ToolbarTool(Icons.delete_outline_rounded, 'Delete', () {
         HapticFeedback.mediumImpact();
         provider.deleteVideoClip(clip.id);
         _snack(context, 'Clip deleted',
@@ -97,6 +97,37 @@ class ClipToolbar extends StatelessWidget {
       }, danger: true),
     ];
 
+    return SelectionToolbar(
+      title: 'Clip $index',
+      subtitle: '${length.toStringAsFixed(1)}s',
+      onClose: () => provider.selectVideoClip(null),
+      tools: tools,
+    );
+  }
+}
+
+/// Bottom toolbar for a selected timeline item: a leading tile naming the
+/// item (tap to close) and a scrolling row of that item's tools. Shared by
+/// clips, media overlays, text, stickers and audio.
+class SelectionToolbar extends StatelessWidget {
+  final String title;
+  final String subtitle;
+  final VoidCallback onClose;
+  final List<ToolbarTool> tools;
+  final Color? accent;
+
+  const SelectionToolbar({
+    super.key,
+    required this.title,
+    required this.subtitle,
+    required this.onClose,
+    required this.tools,
+    this.accent,
+  });
+
+  @override
+  Widget build(BuildContext context) {
+    final color = accent ?? AppColors.primary;
     // Dense toolbar: cap text scaling so labels never overflow the tiles.
     return MediaQuery.withClampedTextScaling(
       maxScaleFactor: 1.1,
@@ -108,35 +139,38 @@ class ClipToolbar extends StatelessWidget {
           height: 84,
           decoration: BoxDecoration(
             color: AppColors.surface,
-            border:
-                Border(top: BorderSide(color: AppColors.primary, width: 1.2)),
+            border: Border(top: BorderSide(color: color, width: 1.2)),
           ),
           child: Row(
             children: [
-              // Leading: which clip is being edited + close.
+              // Leading: which item is being edited + close.
               InkWell(
                 onTap: () {
                   HapticFeedback.selectionClick();
-                  provider.selectVideoClip(null);
+                  onClose();
                 },
                 child: Container(
                   width: 74,
                   height: double.infinity,
                   decoration: BoxDecoration(
-                    color: AppColors.primary.withValues(alpha: 0.12),
+                    color: color.withValues(alpha: 0.12),
                     border: Border(right: BorderSide(color: AppColors.border)),
                   ),
                   child: Column(
                     mainAxisAlignment: MainAxisAlignment.center,
                     children: [
                       Icon(Icons.keyboard_arrow_down_rounded,
-                          color: AppColors.primary, size: 26),
-                      Text('Clip $index',
+                          color: color, size: 26),
+                      Text(title,
+                          maxLines: 1,
+                          overflow: TextOverflow.ellipsis,
                           style: TextStyle(
                               color: AppColors.textPrimary,
                               fontSize: 12,
                               fontWeight: FontWeight.w700)),
-                      Text('${length.toStringAsFixed(1)}s',
+                      Text(subtitle,
+                          maxLines: 1,
+                          overflow: TextOverflow.ellipsis,
                           style: TextStyle(
                               color: AppColors.textTertiary, fontSize: 10.5)),
                     ],
@@ -150,7 +184,7 @@ class ClipToolbar extends StatelessWidget {
                       const EdgeInsets.symmetric(horizontal: 10, vertical: 8),
                   itemCount: tools.length,
                   separatorBuilder: (_, __) => const SizedBox(width: 6),
-                  itemBuilder: (context, i) => _ToolBox(tool: tools[i]),
+                  itemBuilder: (context, i) => ToolbarToolTile(tool: tools[i]),
                 ),
               ),
             ],
@@ -161,7 +195,7 @@ class ClipToolbar extends StatelessWidget {
   }
 }
 
-class _Tool {
+class ToolbarTool {
   final IconData icon;
   final String label;
   final VoidCallback onTap;
@@ -170,7 +204,7 @@ class _Tool {
   final bool highlight;
   final String? badge;
 
-  const _Tool(
+  const ToolbarTool(
     this.icon,
     this.label,
     this.onTap, {
@@ -181,9 +215,9 @@ class _Tool {
   });
 }
 
-class _ToolBox extends StatelessWidget {
-  final _Tool tool;
-  const _ToolBox({required this.tool});
+class ToolbarToolTile extends StatelessWidget {
+  final ToolbarTool tool;
+  const ToolbarToolTile({required this.tool});
 
   @override
   Widget build(BuildContext context) {

@@ -38,6 +38,8 @@ import '../widgets/clip_toolbar.dart';
 import 'export_screen.dart';
 import '../widgets/clip_tool_sheets.dart';
 import '../utils/text_overlay_painter.dart';
+import '../utils/snap_guides.dart';
+import '../widgets/item_toolbars.dart';
 
 class _RectClipper extends CustomClipper<Path> {
   final Rect rect;
@@ -63,6 +65,7 @@ class _DraggableTextWidget extends StatefulWidget {
   final Function(double fontSize)? onFontSizeChanged;
   final VoidCallback onSelected;
   final VoidCallback onDelete;
+  final VoidCallback onGestureEnd;
   final bool isSelected;
 
   const _DraggableTextWidget({
@@ -74,6 +77,7 @@ class _DraggableTextWidget extends StatefulWidget {
     required this.onDragEnd,
     required this.onSelected,
     required this.onDelete,
+    required this.onGestureEnd,
     this.isSelected = false,
     this.onFontSizeChanged,
   }) : super(key: key);
@@ -134,13 +138,60 @@ class _DraggableTextWidgetState extends State<_DraggableTextWidget>
     return state;
   }
 
+  // Size (normalized) and centre of the text when the gesture started, so a
+  // pinch grows the text around its centre instead of its corner.
+  Size _startSizeNorm = Size.zero;
+  Offset _startCenter = Offset.zero;
+  Offset _dragDelta = Offset.zero;
+  Offset? _snappedPosition;
+
+  /// Box the preview draws around the text: 3 px border + 4 px padding.
+  static const double _inset = 7.0;
+
+  Size _normSize(TextOverlayPainter painter) => Size(
+        (painter.size.width + _inset * 2) / widget.constraints.maxWidth,
+        (painter.size.height + _inset * 2) / widget.constraints.maxHeight,
+      );
+
   @override
   Widget build(BuildContext context) {
-    final position = _localPosition ?? widget.overlay.position;
+    final position =
+        _snappedPosition ?? _localPosition ?? widget.overlay.position;
     final effectiveFontSize = widget.overlay.fontSize * _pinchScale;
     final anim = _animState();
     final textPainter =
         TextOverlayPainter(widget.overlay, fontSize: effectiveFontSize);
+    final opacity =
+        (widget.overlay.opacity * anim.opacity).clamp(0.0, 1.0).toDouble();
+
+    Widget content = Container(
+      decoration: BoxDecoration(
+        borderRadius: BorderRadius.circular(8),
+        border: widget.isSelected
+            ? Border.all(color: AppColors.primary, width: 3)
+            : Border.all(color: Colors.transparent, width: 3),
+      ),
+      padding: const EdgeInsets.all(4),
+      // Drawn by the same painter the exporter uses (box, outline, shadow).
+      child: Opacity(
+        opacity: opacity,
+        child: CustomPaint(
+          size: textPainter.size,
+          painter: _OverlayTextPainter(textPainter, anim.reveal),
+        ),
+      ),
+    );
+    if (widget.overlay.rotation != 0) {
+      // Rotates around the text's centre, like the exporter.
+      content = Transform.rotate(
+          angle: widget.overlay.rotation * math.pi / 180, child: content);
+    }
+    // The in/out animation moves and scales the (rotated) text upright,
+    // as the exporter does with the rendered text image.
+    content = Transform.translate(
+      offset: Offset(0, anim.dy),
+      child: Transform.scale(scale: anim.scale, child: content),
+    );
 
     return Positioned(
       left: position.dx * widget.constraints.maxWidth,
@@ -153,85 +204,71 @@ class _DraggableTextWidgetState extends State<_DraggableTextWidget>
           widget.onDragStart();
           _localPosition = widget.overlay.position;
           _baseScale = _pinchScale;
+          _startSizeNorm = _normSize(textPainter);
+          _startCenter = widget.overlay.position +
+              Offset(_startSizeNorm.width / 2, _startSizeNorm.height / 2);
+          _dragDelta = Offset.zero;
         },
         onScaleUpdate: (details) {
           setState(() {
-            // Unconditionally use scale to handle pinch.
-            // Drag registers as 1.0 natively.
-            if (details.scale != 1.0) {
+            if (details.pointerCount >= 2) {
               _pinchScale = (_baseScale * details.scale).clamp(0.2, 5.0);
             }
-            // Handle drag via focal point delta
-            final currentX = _localPosition!.dx * widget.constraints.maxWidth;
-            final currentY = _localPosition!.dy * widget.constraints.maxHeight;
-
-            final newX = currentX + details.focalPointDelta.dx;
-            final newY = currentY + details.focalPointDelta.dy;
-
-            _localPosition = Offset(
-              newX / widget.constraints.maxWidth,
-              newY / widget.constraints.maxHeight,
+            _dragDelta += Offset(
+              details.focalPointDelta.dx / widget.constraints.maxWidth,
+              details.focalPointDelta.dy / widget.constraints.maxHeight,
             );
+            final size = Size(_startSizeNorm.width * _pinchScale,
+                _startSizeNorm.height * _pinchScale);
+            final center = _startCenter + _dragDelta;
+            // Keep at least a corner of the text on the canvas.
+            final raw = Offset(
+              (center.dx - size.width / 2).clamp(-size.width + 0.05, 0.95),
+              (center.dy - size.height / 2).clamp(-size.height + 0.05, 0.95),
+            );
+            _localPosition = raw;
+            _snappedPosition = SnapGuides.snapBox(raw, size);
           });
         },
         onScaleEnd: (details) {
-          widget.onDragEnd(_localPosition!);
+          SnapGuides.clear();
+          widget.onDragEnd(_snappedPosition ?? _localPosition!);
           // Commit the pinch-scaled fontSize
           if (_pinchScale != 1.0 && widget.onFontSizeChanged != null) {
-            final newFontSize =
-                (widget.overlay.fontSize * _pinchScale).clamp(4.0, 500.0);
+            final newFontSize = (widget.overlay.fontSize * _pinchScale)
+                .clamp(4.0, TextOverlayPainter.maxFontSize);
             widget.onFontSizeChanged!(newFontSize);
-            // Reset pinch scale since fontSize is now committed
+          }
+          widget.onGestureEnd();
+          setState(() {
             _pinchScale = 1.0;
             _baseScale = 1.0;
-          }
-          _localPosition = null;
+            _localPosition = null;
+            _snappedPosition = null;
+          });
         },
-        child: Container(
-          decoration: BoxDecoration(
-            borderRadius: BorderRadius.circular(8),
-            border: widget.isSelected
-                ? Border.all(color: AppColors.primary, width: 3)
-                : Border.all(color: Colors.transparent, width: 3),
-          ),
-          padding: const EdgeInsets.all(4),
-          child: Stack(
-            clipBehavior: Clip.none,
-            children: [
-              // Drawn by the same painter the exporter uses (box, outline,
-              // shadow), with the in/out animation applied on top.
-              Transform.translate(
-                offset: Offset(0, anim.dy),
-                child: Transform.scale(
-                  scale: anim.scale,
-                  child: Opacity(
-                    opacity: anim.opacity.clamp(0.0, 1.0),
-                    child: CustomPaint(
-                      size: textPainter.size,
-                      painter: _OverlayTextPainter(textPainter, anim.reveal),
+        child: Stack(
+          clipBehavior: Clip.none,
+          children: [
+            content,
+            if (widget.isSelected)
+              Positioned(
+                right: 0,
+                top: 0,
+                child: GestureDetector(
+                  onTap: widget.onDelete,
+                  child: Container(
+                    decoration: BoxDecoration(
+                      color: AppColors.error.withValues(alpha: 0.9),
+                      shape: BoxShape.circle,
                     ),
+                    padding: const EdgeInsets.all(10),
+                    child: const Icon(Icons.close,
+                        size: 28, color: Colors.white),
                   ),
                 ),
               ),
-              if (widget.isSelected)
-                Positioned(
-                  right: -14,
-                  top: -14,
-                  child: GestureDetector(
-                    onTap: widget.onDelete,
-                    child: Container(
-                      decoration: BoxDecoration(
-                        color: AppColors.error.withOpacity(0.9),
-                        shape: BoxShape.circle,
-                      ),
-                      padding: const EdgeInsets.all(6),
-                      child: const Icon(Icons.close,
-                          size: 16, color: Colors.white),
-                    ),
-                  ),
-                ),
-            ],
-          ),
+          ],
         ),
       ),
     );
@@ -941,22 +978,24 @@ class _VideoEditorScreenState extends State<VideoEditorScreen>
                                   overlayConstraints
                                       .maxHeight,
                                 ),
-                                previewController: provider
-                                    .previewController,
-                                onPositionChanged: () {},
-                                onUpdatePosition: (newPos) {
-                                  provider
-                                      .updateOverlayClipPosition(
-                                    overlayClip.id,
-                                    newPos,
-                                  );
-                                },
-                                onUpdateSize: (newSize) {
-                                  provider
-                                      .updateOverlayClipSize(
-                                    overlayClip.id,
-                                    newSize,
-                                  );
+                                timelinePosition:
+                                    provider.currentPosition,
+                                isPlaying: provider.isPlaying,
+                                masterVolume: provider.videoMasterVolume,
+                                onTransformEnd: (pos, size, rotation) {
+                                  // Move, resize and rotate: one undo step.
+                                  provider.beginUndoGesture(
+                                      'overlay-transform:${overlayClip.id}');
+                                  provider.updateOverlayClipBox(
+                                      overlayClip.id,
+                                      position: pos,
+                                      size: size);
+                                  if (rotation != overlayClip.rotation) {
+                                    provider.updateOverlayClipStyle(
+                                        overlayClip.id,
+                                        rotation: rotation);
+                                  }
+                                  provider.endUndoGesture();
                                 },
                                 onSelected: () {
                                   provider.selectOverlayClip(
@@ -992,9 +1031,12 @@ class _VideoEditorScreenState extends State<VideoEditorScreen>
                                   provider: provider,
                                   constraints:
                                       textConstraints,
+                                  // Move + pinch: one undo step.
                                   onDragStart: () {
-                                    provider.recordUndo();
+                                    provider.beginUndoGesture(
+                                        'text-gesture:${overlay.id}');
                                   },
+                                  onGestureEnd: provider.endUndoGesture,
                                   onDragEnd: (newPosition) {
                                     provider
                                         .updateTextOverlayPosition(
@@ -1032,6 +1074,9 @@ class _VideoEditorScreenState extends State<VideoEditorScreen>
                   ignoring: !interactive,
                   child: const StickerLayer(),
                 ),
+                // Snap guides shown while dragging text/stickers/overlays.
+                if (interactive)
+                  const Positioned.fill(child: SnapGuideOverlay()),
               ],
             ),
           ),
@@ -1079,12 +1124,55 @@ class _VideoEditorScreenState extends State<VideoEditorScreen>
   /// Bottom toolbar: the selected clip's own tools while a timeline clip is
   /// selected, otherwise the main toolbar. Switching slides between them.
   Widget _buildToolBar(VideoEditorProvider provider) {
-    VideoClip? selected;
-    final selectedId = provider.selectedVideoClipId;
-    if (selectedId != null) {
-      for (final c in provider.currentProject?.videoClips ?? const <VideoClip>[]) {
-        if (c.id == selectedId) selected = c;
+    final project = provider.currentProject;
+    T? find<T>(Iterable<T>? items, String? id, String Function(T) getId) {
+      if (id == null || items == null) return null;
+      for (final item in items) {
+        if (getId(item) == id) return item;
       }
+      return null;
+    }
+
+    // Each kind of selected item gets its own toolbar.
+    final Widget toolbar;
+    final clip = find<VideoClip>(
+        project?.videoClips, provider.selectedVideoClipId, (c) => c.id);
+    final overlay = find<VideoClip>(
+        project?.overlayClips, provider.selectedOverlayClipId, (c) => c.id);
+    final text = find<TextOverlay>(
+        project?.textOverlays, provider.selectedTextOverlayId, (t) => t.id);
+    final sticker = find<StickerModel>(
+        project?.stickers, provider.selectedStickerId, (s) => s.id);
+    final audio = find<AudioOverlay>(
+        project?.audioOverlays, provider.selectedAudioOverlayId, (a) => a.id);
+    if (clip != null) {
+      toolbar = ClipToolbar(
+          key: const ValueKey('clip-toolbar'), provider: provider, clip: clip);
+    } else if (overlay != null) {
+      toolbar = OverlayItemToolbar(
+          key: const ValueKey('overlay-toolbar'),
+          provider: provider,
+          clip: overlay);
+    } else if (text != null) {
+      toolbar = TextItemToolbar(
+          key: const ValueKey('text-toolbar'),
+          provider: provider,
+          overlay: text);
+    } else if (sticker != null) {
+      toolbar = StickerItemToolbar(
+          key: const ValueKey('sticker-toolbar'),
+          provider: provider,
+          sticker: sticker);
+    } else if (audio != null) {
+      toolbar = AudioItemToolbar(
+          key: const ValueKey('audio-toolbar'),
+          provider: provider,
+          overlay: audio);
+    } else {
+      toolbar = KeyedSubtree(
+        key: const ValueKey('main-toolbar'),
+        child: _buildMainToolBar(provider),
+      );
     }
     return AnimatedSwitcher(
       duration: const Duration(milliseconds: 220),
@@ -1098,16 +1186,7 @@ class _VideoEditorScreenState extends State<VideoEditorScreen>
           child: child,
         ),
       ),
-      child: selected != null
-          ? ClipToolbar(
-              key: const ValueKey('clip-toolbar'),
-              provider: provider,
-              clip: selected,
-            )
-          : KeyedSubtree(
-              key: const ValueKey('main-toolbar'),
-              child: _buildMainToolBar(provider),
-            ),
+      child: toolbar,
     );
   }
 

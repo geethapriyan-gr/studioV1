@@ -1,6 +1,7 @@
 import 'dart:async';
 import 'dart:io';
 import 'dart:ui' as ui;
+import 'dart:math' as math;
 import 'package:flutter/material.dart';
 import 'package:video_editor/video_editor.dart';
 import 'package:video_player/video_player.dart';
@@ -23,6 +24,7 @@ import '../services/hive_service.dart';
 import '../services/video_thumbnail_service.dart';
 import '../utils/track_allocation.dart';
 import '../utils/audio_fades.dart';
+import '../utils/sticker_catalog.dart';
 
 class VideoEditorProvider extends ChangeNotifier {
   VideoProject? _currentProject;
@@ -485,6 +487,11 @@ class VideoEditorProvider extends ChangeNotifier {
 
   Future<File> _importFileToAppDocs(File sourceFile) async {
     final appDir = await getApplicationDocumentsDirectory();
+    // Already in app storage (an earlier import, a recording, extracted
+    // audio): use it as is instead of storing another copy.
+    if (p.isWithin(appDir.path, sourceFile.path) && sourceFile.existsSync()) {
+      return sourceFile;
+    }
     final fileName = p.basename(sourceFile.path);
     final uniqueName = '${_uuid.v4()}_$fileName';
     final newPath = p.join(appDir.path, uniqueName);
@@ -494,53 +501,93 @@ class VideoEditorProvider extends ChangeNotifier {
 
   Future<void> _healProjectPaths(VideoProject project) async {
     final appDir = await getApplicationDocumentsDirectory();
-    final fixedClips = <VideoClip>[];
+    _currentProject = healProjectPaths(project, appDir.path);
+  }
 
-    for (final clip in project.videoClips) {
-      File? video = clip.videoFile;
-      File? image = clip.imageFile;
-
-      if (video != null && !video.existsSync()) {
-        final filename = p.basename(video.path);
-        final potentialPath = p.join(appDir.path, filename);
-        // Try exact match in new sandbox container
-        if (File(potentialPath).existsSync()) {
-          video = File(potentialPath);
-        } else {
-          // If UUID prefix makes it hard to find, we might need more logic,
-          // but usually the filename persists if we copied it there.
-          // For now, if we can't find it, we keep the old path and let it fail gracefully or user re-imports.
-        }
-      }
-
-      if (image != null && !image.existsSync()) {
-        final filename = p.basename(image.path);
-        final potentialPath = p.join(appDir.path, filename);
-        if (File(potentialPath).existsSync()) {
-          image = File(potentialPath);
-        }
-      }
-
-      fixedClips.add(clip.copyWith(videoFile: video, imageFile: image));
+  /// After an app update or restore the app's sandbox directory can move.
+  /// Points every media path that no longer exists at the file with the same
+  /// name in [appDirPath], when there is one. Paths that cannot be found are
+  /// left alone.
+  static VideoProject healProjectPaths(VideoProject project, String appDirPath) {
+    String healPath(String path) {
+      if (path.startsWith('assets/') || File(path).existsSync()) return path;
+      final candidate = p.join(appDirPath, p.basename(path));
+      return File(candidate).existsSync() ? candidate : path;
     }
 
-    final fixedAudio = <AudioOverlay>[];
-    for (final overlay in project.audioOverlays) {
-      File audio = overlay.audioFile;
-      if (!audio.existsSync()) {
-        final filename = p.basename(audio.path);
-        final potentialPath = p.join(appDir.path, filename);
-        if (File(potentialPath).existsSync()) {
-          audio = File(potentialPath);
-        }
-      }
-      fixedAudio.add(overlay.copyWith(audioFile: audio));
+    File? healFile(File? f) => f == null ? null : File(healPath(f.path));
+
+    ChromaKeySettings? healChroma(ChromaKeySettings? s) {
+      final bg = s?.backgroundPath;
+      if (s == null || bg == null) return s;
+      final healed = healPath(bg);
+      return healed == bg ? s : s.copyWith(backgroundPath: healed);
     }
 
-    _currentProject = project.copyWith(
-      videoClips: fixedClips,
-      audioOverlays: fixedAudio,
+    VideoClip healClip(VideoClip c) => c.copyWith(
+          videoFile: healFile(c.videoFile),
+          imageFile: healFile(c.imageFile),
+          reversedFilePath:
+              c.reversedFilePath == null ? null : healPath(c.reversedFilePath!),
+          chromaKeySettings: healChroma(c.chromaKeySettings),
+        );
+
+    return project.copyWith(
+      videoClips: project.videoClips.map(healClip).toList(),
+      overlayClips: project.overlayClips.map(healClip).toList(),
+      audioOverlays: project.audioOverlays
+          .map((a) => a.copyWith(audioFile: healFile(a.audioFile)))
+          .toList(),
+      stickers: project.stickers
+          .map((s) => s.copyWith(assetPath: healPath(s.assetPath)))
+          .toList(),
+      chromaKeyBackgrounds:
+          project.chromaKeyBackgrounds.map(healPath).toList(),
+      lastModified: project.lastModified,
     );
+  }
+
+  /// Every media file [project] uses (clips, overlays, audio, custom
+  /// stickers, chroma backgrounds, reversed/processed copies).
+  static Set<String> mediaPathsOf(VideoProject project) {
+    final paths = <String>{};
+    void add(String? path) {
+      if (path != null && path.isNotEmpty && !path.startsWith('assets/')) {
+        paths.add(path);
+      }
+    }
+
+    for (final c in [...project.videoClips, ...project.overlayClips]) {
+      add(c.videoFile?.path);
+      add(c.imageFile?.path);
+      add(c.reversedFilePath);
+      add(c.chromaKeySettings?.backgroundPath);
+    }
+    for (final a in project.audioOverlays) {
+      add(a.audioFile.path);
+    }
+    for (final s in project.stickers) {
+      add(s.assetPath);
+    }
+    project.chromaKeyBackgrounds.forEach(add);
+    return paths;
+  }
+
+  /// Media files of [deleted] that can be removed from disk: copies the app
+  /// made inside [appDirPath] that no project in [remaining] still uses.
+  /// Files outside app storage (the user's gallery) are never touched.
+  static Set<String> unusedMediaAfterDelete(VideoProject deleted,
+      Iterable<VideoProject> remaining, String appDirPath,
+      {Set<String> alsoKeep = const {}}) {
+    final stillUsed = <String>{...alsoKeep};
+    for (final other in remaining) {
+      if (other.id == deleted.id) continue;
+      stillUsed.addAll(mediaPathsOf(other));
+    }
+    return mediaPathsOf(deleted)
+        .where((f) => p.isWithin(appDirPath, f))
+        .where((f) => !stillUsed.contains(f))
+        .toSet();
   }
 
   Future<void> _manageControllerMemory(String newPath) async {
@@ -612,29 +659,21 @@ class VideoEditorProvider extends ChangeNotifier {
     notifyListeners();
   }
 
-  Duration get totalDuration {
-    if (_currentProject == null) {
-      return Duration.zero;
-    }
-    final clipsDuration = _currentProject!.videoClips.isEmpty
-        ? Duration.zero
-        : _currentProject!.calculateTotalDuration();
+  /// Length of the video: the end of the last item of any kind (clips,
+  /// media overlays, text, stickers, audio). The exporter renders exactly
+  /// this length.
+  Duration get totalDuration =>
+      _currentProject?.contentEnd ?? Duration.zero;
 
-    Duration overlaysDuration = Duration.zero;
-    for (final a in _currentProject!.audioOverlays) {
-      if (a.endTime > overlaysDuration) overlaysDuration = a.endTime;
-    }
-
-    // Also check text overlays end time
-    Duration textOverlaysDuration = Duration.zero;
-    for (final t in _currentProject!.textOverlays) {
-      if (t.endTime > textOverlaysDuration) textOverlaysDuration = t.endTime;
-    }
-
-    // Return the maximum of all content durations
-    final maxDuration = [clipsDuration, overlaysDuration, textOverlaysDuration]
-        .reduce((a, b) => a > b ? a : b);
-    return maxDuration;
+  /// Start time that keeps an item of [length] inside the current video when
+  /// it is moved to [desired]. Moving never makes the video longer; only
+  /// adding or stretching items does (and the editor asks first).
+  Duration clampMoveStart(Duration desired, Duration length) {
+    var start = desired < Duration.zero ? Duration.zero : desired;
+    final maxStart = totalDuration - length;
+    if (maxStart <= Duration.zero) return Duration.zero;
+    if (start > maxStart) start = maxStart;
+    return start;
   }
 
   /// Returns the duration of video clips only (excluding overlays).
@@ -731,11 +770,7 @@ class VideoEditorProvider extends ChangeNotifier {
     if (index == -1) return;
     final overlay = _currentProject!.audioOverlays[index];
     final duration = overlay.endTime - overlay.startTime;
-
-    // Only clamp start time to not be negative
-    // Audio overlays CAN extend beyond video duration
-    Duration clampedStart = newStartTime;
-    if (clampedStart < Duration.zero) clampedStart = Duration.zero;
+    final clampedStart = clampMoveStart(newStartTime, duration);
 
     // Check if there's already a clip in the target track at the same time range
     int finalTrackIndex = trackIndex ?? overlay.trackIndex;
@@ -990,11 +1025,15 @@ class VideoEditorProvider extends ChangeNotifier {
             startTrim >= originalClip.trimEnd - const Duration(milliseconds: 100)) {
           return;
         }
-        final newDuration = originalClip.trimEnd - startTrim;
+        // Timeline length follows the overlay's playback speed.
+        final newDuration = timelineLengthForSource(
+            originalClip.trimEnd - startTrim, originalClip.playbackSpeed);
+        final endTime = originalClip.endTime;
+        if (endTime - newDuration < Duration.zero) return;
         updatedClip = originalClip.copyWith(
-          startTime: newStartTime,
+          startTime: endTime - newDuration,
           trimStart: startTrim,
-          endTime: newStartTime + newDuration,
+          endTime: endTime,
         );
       }
     } else if (endTrim != originalClip.trimEnd) {
@@ -1019,7 +1058,8 @@ class VideoEditorProvider extends ChangeNotifier {
             endTrim > originalClip.sourceEnd) {
           return;
         }
-        final newDuration = endTrim - originalClip.trimStart;
+        final newDuration = timelineLengthForSource(
+            endTrim - originalClip.trimStart, originalClip.playbackSpeed);
         updatedClip = originalClip.copyWith(
           trimEnd: endTrim,
           endTime: originalClip.startTime + newDuration,
@@ -2727,7 +2767,7 @@ class VideoEditorProvider extends ChangeNotifier {
     notifyListeners();
   }
 
-  Future<void> addTextOverlay({
+  Future<String?> addTextOverlay({
     required String text,
     required Offset position,
     required Duration startTime,
@@ -2745,7 +2785,7 @@ class VideoEditorProvider extends ChangeNotifier {
     double outlineWidth = 0,
     bool shadow = true,
   }) async {
-    if (_currentProject == null) return;
+    if (_currentProject == null) return null;
 
     // Convert Flutter types to our enum types
     final fontStyleEnum = fontStyle == FontStyle.italic
@@ -2799,6 +2839,7 @@ class VideoEditorProvider extends ChangeNotifier {
     _currentProject = _currentProject!.addTextOverlay(overlay);
     _scheduleAutoSave();
     notifyListeners();
+    return overlay.id;
   }
 
   Future<void> updateTextOverlay(
@@ -2823,10 +2864,13 @@ class VideoEditorProvider extends ChangeNotifier {
     bool clearOutline = false,
     double? outlineWidth,
     bool? shadow,
+    String? undoKey,
   }) async {
     if (_currentProject == null) return;
-    final overlay =
-        _currentProject!.textOverlays.firstWhere((o) => o.id == overlayId);
+    final index =
+        _currentProject!.textOverlays.indexWhere((o) => o.id == overlayId);
+    if (index == -1) return;
+    final overlay = _currentProject!.textOverlays[index];
 
     // Convert Flutter types to our enum types if provided
     FontStyleEnum? fontStyleEnum;
@@ -2884,7 +2928,7 @@ class VideoEditorProvider extends ChangeNotifier {
       outlineWidth: outlineWidth,
       shadow: shadow,
     );
-    recordUndo();
+    recordUndo(coalesceKey: undoKey);
     _currentProject =
         _currentProject!.updateTextOverlay(overlayId, updatedOverlay);
     _scheduleAutoSave();
@@ -2902,7 +2946,7 @@ class VideoEditorProvider extends ChangeNotifier {
     notifyListeners();
   }
 
-  Future<void> addAudioOverlay({
+  Future<String?> addAudioOverlay({
     required File audioFile,
     required Duration startTime,
     required Duration endTime,
@@ -2912,7 +2956,7 @@ class VideoEditorProvider extends ChangeNotifier {
     bool fadeOut = false,
     int? trackIndex,
   }) async {
-    if (_currentProject == null) return;
+    if (_currentProject == null) return null;
 
     // Use selected audio track index if provided, otherwise use the provider's selected track or default to 0
     int finalTrackIndex = trackIndex ?? _selectedAudioTrackIndex ?? 0;
@@ -2986,6 +3030,7 @@ class VideoEditorProvider extends ChangeNotifier {
 
     _scheduleAutoSave();
     notifyListeners();
+    return overlay.id;
   }
 
   Future<void> updateAudioOverlay(
@@ -2997,13 +3042,21 @@ class VideoEditorProvider extends ChangeNotifier {
     double? volume,
     bool? fadeIn,
     bool? fadeOut,
+    String? undoKey,
   }) async {
     if (_currentProject == null) return;
-    final overlay =
-        _currentProject!.audioOverlays.firstWhere((o) => o.id == overlayId);
+    final index =
+        _currentProject!.audioOverlays.indexWhere((o) => o.id == overlayId);
+    if (index == -1) return;
+    final overlay = _currentProject!.audioOverlays[index];
+    if (audioStartOffset != null && audioStartOffset < Duration.zero) {
+      audioStartOffset = Duration.zero;
+    }
 
     File? savedAudioFile;
-    if (audioFile != null) {
+    // Only a different file is imported; passing the current one is a no-op
+    // (it used to copy the whole file on every volume-slider tick).
+    if (audioFile != null && audioFile.path != overlay.audioFile.path) {
       savedAudioFile = await _importFileToAppDocs(audioFile);
       final oldPlayer = _audioPlayers.remove(overlayId);
       if (oldPlayer != null) {
@@ -3027,7 +3080,7 @@ class VideoEditorProvider extends ChangeNotifier {
       fadeOut: fadeOut,
     );
     _audioSourceConfigCache.remove(overlayId);
-    recordUndo();
+    recordUndo(coalesceKey: undoKey);
     _currentProject =
         _currentProject!.updateAudioOverlay(overlayId, updatedOverlay);
     final player = _audioPlayers[overlayId];
@@ -3090,6 +3143,7 @@ class VideoEditorProvider extends ChangeNotifier {
       volume: original.volume,
       fadeIn: original.fadeIn,
       fadeOut: false,
+      trackIndex: original.trackIndex,
     );
     final secondPart = AudioOverlay(
       id: _uuid.v4(),
@@ -3100,6 +3154,7 @@ class VideoEditorProvider extends ChangeNotifier {
       volume: original.volume,
       fadeIn: false,
       fadeOut: original.fadeOut,
+      trackIndex: original.trackIndex,
     );
     final overlays = List<AudioOverlay>.from(_currentProject!.audioOverlays);
     overlays.removeAt(index);
@@ -3143,7 +3198,8 @@ class VideoEditorProvider extends ChangeNotifier {
     final isImage = originalClip.mediaType == MediaType.image;
     // Overlay preview and export both play trimStart..trimEnd, so each half
     // keeps its own part of that window.
-    final firstSourceEnd = originalClip.trimStart + firstDuration;
+    final firstSourceEnd = originalClip.trimStart +
+        sourceLengthForTimeline(firstDuration, originalClip.playbackSpeed);
     final firstClip = originalClip.copyWith(
       id: _uuid.v4(),
       startTime: originalClip.startTime,
@@ -3162,10 +3218,20 @@ class VideoEditorProvider extends ChangeNotifier {
       trimStart: isImage ? Duration.zero : firstSourceEnd,
       trimEnd: isImage ? secondDuration : originalClip.trimEnd,
     );
+    final (firstFrames, secondFrames) =
+        splitKeyframes(originalClip, firstDuration);
     final updatedClips = List<VideoClip>.from(_currentProject!.overlayClips);
     updatedClips.removeAt(clipIndex);
-    updatedClips.insert(clipIndex, firstClip);
-    updatedClips.insert(clipIndex + 1, secondClip);
+    updatedClips.insert(
+        clipIndex,
+        firstClip.copyWith(
+            animOut: 'none',
+            keyframeData: OverlayKeyframe.encode(firstFrames)));
+    updatedClips.insert(
+        clipIndex + 1,
+        secondClip.copyWith(
+            animIn: 'none',
+            keyframeData: OverlayKeyframe.encode(secondFrames)));
     recordUndo();
     _currentProject = _currentProject!.copyWith(overlayClips: updatedClips);
     _selectedOverlayClipId = secondClip.id;
@@ -3767,8 +3833,11 @@ class VideoEditorProvider extends ChangeNotifier {
     if (overlayIndex == -1) return;
     final overlay = _currentProject!.textOverlays[overlayIndex];
     final updatedOverlay = overlay.copyWith(position: newPosition);
+    // Inside a drag gesture this merges into the gesture's undo step.
+    recordUndo(coalesceKey: 'text-move:$overlayId');
     _currentProject =
         _currentProject!.updateTextOverlay(overlayId, updatedOverlay);
+    _scheduleAutoSave();
     notifyListeners();
   }
 
@@ -3779,22 +3848,7 @@ class VideoEditorProvider extends ChangeNotifier {
     if (overlayIndex == -1) return;
     final overlay = _currentProject!.textOverlays[overlayIndex];
     final duration = overlay.endTime - overlay.startTime;
-    final maxVideoDuration = videoClipsDuration;
-
-    // Clamp start time to keep overlay within video bounds
-    Duration clampedStart = newStartTime;
-    if (clampedStart < Duration.zero) clampedStart = Duration.zero;
-
-    // Ensure overlay doesn't extend beyond video duration
-    if (maxVideoDuration > Duration.zero) {
-      final maxStart = maxVideoDuration - duration;
-      if (maxStart > Duration.zero && clampedStart > maxStart) {
-        clampedStart = maxStart;
-      } else if (maxStart <= Duration.zero) {
-        // If overlay is longer than video, start at 0
-        clampedStart = Duration.zero;
-      }
-    }
+    final clampedStart = clampMoveStart(newStartTime, duration);
 
     final clampedEndTime = clampedStart + duration;
     final updatedOverlay = overlay.copyWith(
@@ -3872,7 +3926,7 @@ class VideoEditorProvider extends ChangeNotifier {
     notifyListeners();
   }
 
-  Future<void> addSticker({
+  Future<String?> addSticker({
     required String assetPath,
     Offset position = const Offset(0.5, 0.5),
     double scale = 1.0,
@@ -3880,8 +3934,11 @@ class VideoEditorProvider extends ChangeNotifier {
     required Duration startTime,
     required Duration endTime,
     double opacity = 1.0,
+    bool flipX = false,
+    String animIn = 'none',
+    String animOut = 'none',
   }) async {
-    if (_currentProject == null) return;
+    if (_currentProject == null) return null;
     final sticker = StickerModel(
       id: _uuid.v4(),
       assetPath: assetPath,
@@ -3891,11 +3948,23 @@ class VideoEditorProvider extends ChangeNotifier {
       startTime: startTime,
       endTime: endTime,
       opacity: opacity,
+      flipX: flipX,
+      animIn: animIn,
+      animOut: animOut,
     );
     recordUndo();
     _currentProject = _currentProject!.addSticker(sticker);
     _scheduleAutoSave();
     notifyListeners();
+    return sticker.id;
+  }
+
+  /// Imports one of the user's images as a sticker file (kept in app
+  /// storage and listed under "My stickers").
+  Future<String> importCustomSticker(File image) async {
+    final saved = await _importFileToAppDocs(image);
+    await StickerCatalog.addCustom(saved.path);
+    return saved.path;
   }
 
   Future<void> updateSticker(
@@ -3907,10 +3976,16 @@ class VideoEditorProvider extends ChangeNotifier {
     Duration? startTime,
     Duration? endTime,
     double? opacity,
+    bool? flipX,
+    String? animIn,
+    String? animOut,
+    String? undoKey,
   }) async {
     if (_currentProject == null) return;
-    final sticker =
-        _currentProject!.stickers.firstWhere((s) => s.id == stickerId);
+    final index =
+        _currentProject!.stickers.indexWhere((s) => s.id == stickerId);
+    if (index == -1) return;
+    final sticker = _currentProject!.stickers[index];
     final updatedSticker = sticker.copyWith(
       assetPath: assetPath,
       position: position,
@@ -3919,8 +3994,11 @@ class VideoEditorProvider extends ChangeNotifier {
       startTime: startTime,
       endTime: endTime,
       opacity: opacity,
+      flipX: flipX,
+      animIn: animIn,
+      animOut: animOut,
     );
-    recordUndo();
+    recordUndo(coalesceKey: undoKey);
     _currentProject = _currentProject!.updateSticker(stickerId, updatedSticker);
     _scheduleAutoSave();
     notifyListeners();
@@ -3933,20 +4011,7 @@ class VideoEditorProvider extends ChangeNotifier {
     if (stickerIndex == -1) return;
     final sticker = _currentProject!.stickers[stickerIndex];
     final duration = sticker.endTime - sticker.startTime;
-    final maxVideoDuration = totalDuration;
-
-    // Clamp start time to keep sticker within bounds
-    Duration clampedStart = newStartTime;
-    if (clampedStart < Duration.zero) clampedStart = Duration.zero;
-
-    if (maxVideoDuration > Duration.zero) {
-      final maxStart = maxVideoDuration - duration;
-      if (maxStart > Duration.zero && clampedStart > maxStart) {
-        clampedStart = maxStart;
-      } else if (maxStart <= Duration.zero) {
-        clampedStart = Duration.zero;
-      }
-    }
+    final clampedStart = clampMoveStart(newStartTime, duration);
 
     final clampedEndTime = clampedStart + duration;
     final updatedSticker = sticker.copyWith(
@@ -5225,8 +5290,35 @@ class VideoEditorProvider extends ChangeNotifier {
     super.dispose();
   }
 
-  void recordUndo() {
+  // Undo coalescing: edits that share a key and follow each other quickly
+  // (typing, slider drags) or happen inside one gesture form one undo step.
+  String? _undoCoalesceKey;
+  DateTime _undoCoalesceAt = DateTime.fromMillisecondsSinceEpoch(0);
+  String? _gestureUndoKey;
+  static const Duration _undoCoalesceWindow = Duration(milliseconds: 1500);
+  // A gesture that never ended (widget disposed mid-drag) stops merging
+  // edits after this much inactivity.
+  static const Duration _gestureUndoWindow = Duration(seconds: 10);
+
+  /// Saves the current project for undo. Calls with the same [coalesceKey]
+  /// within a short window (or inside the same [beginUndoGesture] gesture)
+  /// are merged into a single undo step.
+  void recordUndo({String? coalesceKey}) {
     if (_currentProject == null) return;
+    // Inside a gesture every edit belongs to the gesture's step.
+    final key = _gestureUndoKey ?? coalesceKey;
+    final now = DateTime.now();
+    if (key != null && key == _undoCoalesceKey) {
+      final window = key == _gestureUndoKey
+          ? _gestureUndoWindow
+          : _undoCoalesceWindow;
+      if (now.difference(_undoCoalesceAt) < window) {
+        _undoCoalesceAt = now;
+        return;
+      }
+    }
+    _undoCoalesceKey = key;
+    _undoCoalesceAt = now;
     if (_undoStack.length >= _maxHistory) {
       _undoStack.removeAt(0);
     }
@@ -5234,11 +5326,35 @@ class VideoEditorProvider extends ChangeNotifier {
     _redoStack.clear();
   }
 
+  /// Starts a gesture (drag, pinch, trim): every edit until
+  /// [endUndoGesture] becomes one undo step.
+  void beginUndoGesture(String key) {
+    _gestureUndoKey = null;
+    recordUndo(coalesceKey: key);
+    _gestureUndoKey = key;
+  }
+
+  void endUndoGesture() {
+    _gestureUndoKey = null;
+    sealUndo();
+  }
+
+  /// Ends the current merged edit; the next change starts a new undo step.
+  void sealUndo() {
+    _undoCoalesceKey = null;
+  }
+
+  void _resetUndoCoalescing() {
+    _gestureUndoKey = null;
+    _undoCoalesceKey = null;
+  }
+
   bool get canUndo => _undoStack.isNotEmpty;
   bool get canRedo => _redoStack.isNotEmpty;
 
   Future<void> undo() async {
     if (!canUndo) return;
+    _resetUndoCoalescing();
     if (_currentProject != null) {
       _redoStack.add(_currentProject!);
     }
@@ -5253,6 +5369,7 @@ class VideoEditorProvider extends ChangeNotifier {
 
   Future<void> redo() async {
     if (!canRedo) return;
+    _resetUndoCoalescing();
     if (_currentProject != null) {
       _undoStack.add(_currentProject!);
     }
@@ -5354,6 +5471,7 @@ class VideoEditorProvider extends ChangeNotifier {
 
       _undoStack.clear();
       _redoStack.clear();
+      _resetUndoCoalescing();
       _updateTrackCountsFromProject();
 
       if (_currentProject!.videoClips.isNotEmpty) {
@@ -5372,6 +5490,17 @@ class VideoEditorProvider extends ChangeNotifier {
 
       notifyListeners();
     }
+  }
+
+  /// Puts [project] in the editor without creating players or controllers
+  /// (unit tests have no audio/video platform).
+  @visibleForTesting
+  void debugSetProject(VideoProject project) {
+    _currentProject = project;
+    _undoStack.clear();
+    _redoStack.clear();
+    _resetUndoCoalescing();
+    notifyListeners();
   }
 
   /// Pre-loads all audio players and waveform data when project is loaded
@@ -5431,8 +5560,41 @@ class VideoEditorProvider extends ChangeNotifier {
   }
 
   Future<void> deleteProject(String projectId) async {
+    final project = HiveService.getProject(projectId);
     await HiveService.deleteProject(projectId);
+    if (project != null) {
+      await _deleteUnusedMedia(project);
+    }
     notifyListeners();
+  }
+
+  /// Removes the media copies [deleted] brought into app storage, unless
+  /// another project (or the project open in the editor) still uses them.
+  Future<void> _deleteUnusedMedia(VideoProject deleted) async {
+    try {
+      final appDir = await getApplicationDocumentsDirectory();
+      final open = _currentProject;
+      final unused = unusedMediaAfterDelete(
+        deleted,
+        HiveService.getAllProjects(),
+        appDir.path,
+        alsoKeep: {
+          if (open != null && open.id != deleted.id) ...mediaPathsOf(open),
+          // The user's sticker library outlives any one project.
+          ...await StickerCatalog.custom(),
+        },
+      );
+      for (final path in unused) {
+        try {
+          final f = File(path);
+          if (await f.exists()) await f.delete();
+        } catch (e) {
+          debugPrint('Could not delete $path: $e');
+        }
+      }
+    } catch (e) {
+      debugPrint('Media cleanup failed: $e');
+    }
   }
 
   Future<void> _pauseAllAudioPlayers() async {
@@ -6015,9 +6177,35 @@ class VideoEditorProvider extends ChangeNotifier {
   }
 
   /// Overlay clip helpers (separate timeline layer)
-  Future<void> addOverlayClip(File mediaFile, {int trackIndex = 0}) async {
-    if (_currentProject == null) return;
-    try {
+  /// Aspect ratio (width / height) of the preview box at [time]: the box
+  /// text, stickers and media overlays are laid out in. Mirrors the editor's
+  /// preview canvas and the exporter's clip area.
+  double canvasAspectAt(Duration time) {
+    final project = _currentProject;
+    if (project == null) return 16 / 9;
+    final res = project.outputResolution;
+    final fallback =
+        (res.width > 0 && res.height > 0) ? res.width / res.height : 16 / 9;
+    final clip = _clipAtTimeline(time) ?? project.videoClips.firstOrNull;
+    if (clip == null || clip.mediaType == MediaType.image) return fallback;
+    final path = clip.videoFile?.path;
+    final value = path == null ? null : _previewControllers[path]?.value;
+    if (value == null || !value.isInitialized || value.size.isEmpty) {
+      return fallback;
+    }
+    var aspect = value.aspectRatio;
+    if ((value.rotationCorrection % 180) != 0) aspect = 1 / aspect;
+    return aspect;
+  }
+
+  /// Adds a picture-in-picture overlay at the playhead and returns its id.
+  /// Throws an [Exception] with a readable message when the file cannot be
+  /// used.
+  Future<String> addOverlayClip(File mediaFile, {int trackIndex = 0}) async {
+    if (_currentProject == null) {
+      throw Exception('Open a project first');
+    }
+    {
       final savedFile = await _importFileToAppDocs(mediaFile);
 
       final ext = p.extension(savedFile.path).toLowerCase();
@@ -6031,11 +6219,12 @@ class VideoEditorProvider extends ChangeNotifier {
 
       if (videoExts.contains(ext)) {
         mediaType = MediaType.video;
-        // Initialize a temporary controller just to read metadata, then dispose
-        // immediately. The DraggableMediaOverlay widget creates its own controller
-        // for playback — keeping a second one here doubles memory and causes OOM.
+        videoFile = savedFile;
+        // Read metadata with a temporary controller and dispose it right away;
+        // the preview overlay widget creates its own for playback.
+        VideoPlayerController? controller;
         try {
-          final controller = VideoPlayerController.file(savedFile);
+          controller = VideoPlayerController.file(savedFile);
           await controller.initialize();
           duration = controller.value.duration;
           final rot = controller.value.rotationCorrection;
@@ -6046,93 +6235,47 @@ class VideoEditorProvider extends ChangeNotifier {
             mediaWidth = controller.value.size.width;
             mediaHeight = controller.value.size.height;
           }
-          await controller.dispose(); // free memory immediately
-          videoFile = savedFile;
         } catch (e) {
-          videoFile = savedFile;
+          throw Exception(
+              'This video could not be opened (unsupported format or damaged file).');
+        } finally {
+          await controller?.dispose();
+        }
+        if (duration <= Duration.zero) {
+          throw Exception('This video has no playable length.');
         }
       } else {
         imageFile = savedFile;
-        // Get image dimensions (respecting EXIF orientation)
-        try {
-          final imgSize = await _readImageDisplaySize(savedFile);
-          if (imgSize != null && imgSize.width > 0 && imgSize.height > 0) {
-            mediaWidth = imgSize.width;
-            mediaHeight = imgSize.height;
-          }
-        } catch (e) {
-          // Fallback to default dimensions if we can't read the image
+        final imgSize = await _readImageDisplaySize(savedFile);
+        if (imgSize == null || imgSize.width <= 0 || imgSize.height <= 0) {
+          throw Exception('This file is not a supported image or video.');
         }
+        mediaWidth = imgSize.width;
+        mediaHeight = imgSize.height;
       }
 
-      Duration nextStart = Duration.zero;
-      if (_currentProject != null && _currentProject!.overlayClips.isNotEmpty) {
-        for (final c in _currentProject!.overlayClips) {
-          if (c.trackIndex == trackIndex && c.endTime > nextStart) {
-            nextStart = c.endTime;
-          }
-        }
-      }
+      // New items go where the playhead is.
+      final start = _currentPosition;
 
-      // Calculate initial overlay size that maintains the overlay's true aspect ratio
-      // in parent normalized coordinate space:
-      // absoluteWidth / absoluteHeight == (overlayWidth * parentWidth) / (overlayHeight * parentHeight) == mediaWidth / mediaHeight.
-      final parentWidth = _currentProject?.outputResolution.width ?? 1920.0;
-      final parentHeight = _currentProject?.outputResolution.height ?? 1080.0;
-      final parentAspectRatio = (parentWidth > 0 && parentHeight > 0)
-          ? (parentWidth / parentHeight)
-          : (16.0 / 9.0);
-      final mediaAspectRatio = (mediaWidth > 0 && mediaHeight > 0)
-          ? (mediaWidth / mediaHeight)
-          : 1.0;
-
-      // normalizedRatio is the ratio of overlayWidth / overlayHeight in normalized coords [0..1]
-      final normalizedRatio = mediaAspectRatio / parentAspectRatio;
-
-      const maxDimensionFraction = 0.45;
-      double overlayWidth;
-      double overlayHeight;
-
-      if (normalizedRatio >= 1.0) {
-        // Overlay is wider than tall relative to canvas
-        overlayWidth = maxDimensionFraction;
-        overlayHeight = overlayWidth / normalizedRatio;
-        if (overlayHeight > maxDimensionFraction) {
-          overlayHeight = maxDimensionFraction;
-          overlayWidth = overlayHeight * normalizedRatio;
-        }
-      } else {
-        // Overlay is taller than wide relative to canvas (e.g. portrait video/image)
-        overlayHeight = maxDimensionFraction;
-        overlayWidth = overlayHeight * normalizedRatio;
-        if (overlayWidth > maxDimensionFraction) {
-          overlayWidth = maxDimensionFraction;
-          overlayHeight = overlayWidth / normalizedRatio;
-        }
-      }
-
-      overlayWidth = overlayWidth.clamp(0.05, 1.0);
-      overlayHeight = overlayHeight.clamp(0.05, 1.0);
-
-      final overlayDx =
-          ((1.0 - overlayWidth) / 2.0).clamp(0.0, 1.0 - overlayWidth);
-      final overlayDy =
-          ((1.0 - overlayHeight) / 2.0).clamp(0.0, 1.0 - overlayHeight);
-
+      final size = initialOverlaySize(
+        mediaAspect: mediaWidth / mediaHeight,
+        canvasAspect: canvasAspectAt(start),
+      );
       final clip = VideoClip(
         id: _uuid.v4(),
         mediaType: mediaType,
         videoFile: videoFile,
         imageFile: imageFile,
-        startTime: nextStart,
-        endTime: nextStart + duration,
+        startTime: start,
+        endTime: start + duration,
         sourceStart: Duration.zero,
         sourceEnd: duration,
         trimStart: Duration.zero,
         trimEnd: duration,
         trackIndex: trackIndex,
-        overlayPosition: Offset(overlayDx, overlayDy),
-        overlaySize: Size(overlayWidth, overlayHeight),
+        overlayPosition:
+            Offset((1.0 - size.width) / 2.0, (1.0 - size.height) / 2.0),
+        overlaySize: size,
       );
 
       if (videoFile != null) {
@@ -6143,11 +6286,38 @@ class VideoEditorProvider extends ChangeNotifier {
 
       recordUndo();
       _currentProject = _currentProject!.addOverlayClip(clip);
+      _selectedOverlayClipId = clip.id;
+      _selectedVideoClipId = null;
+      _selectedAudioOverlayId = null;
+      _selectedTextOverlayId = null;
+      _selectedStickerId = null;
       _scheduleAutoSave();
       notifyListeners();
-    } catch (e) {
-      // ignore
+      return clip.id;
     }
+  }
+
+  /// Normalized box size (fractions of the preview box) for a new overlay:
+  /// at most 45% of the box on its longer side, with the box's on-screen
+  /// shape matching the media ([mediaAspect]) inside a preview box of
+  /// [canvasAspect].
+  static Size initialOverlaySize(
+      {required double mediaAspect, required double canvasAspect}) {
+    const maxFraction = 0.45;
+    final media = mediaAspect > 0 ? mediaAspect : 1.0;
+    final canvas = canvasAspect > 0 ? canvasAspect : 16 / 9;
+    // width/height in normalized units that keeps the on-screen aspect.
+    final ratio = media / canvas;
+    double w;
+    double h;
+    if (ratio >= 1.0) {
+      w = maxFraction;
+      h = w / ratio;
+    } else {
+      h = maxFraction;
+      w = h * ratio;
+    }
+    return Size(w.clamp(0.05, 1.0), h.clamp(0.05, 1.0));
   }
 
   void moveOverlayClip(String clipId, Duration newStartTime,
@@ -6158,8 +6328,7 @@ class VideoEditorProvider extends ChangeNotifier {
     if (clipIndex == -1) return;
     final originalClip = _currentProject!.overlayClips[clipIndex];
     final clipDuration = originalClip.endTime - originalClip.startTime;
-    Duration desiredStart = newStartTime;
-    if (desiredStart < Duration.zero) desiredStart = Duration.zero;
+    final desiredStart = clampMoveStart(newStartTime, clipDuration);
 
     // Check if there's already a clip in the target track at the same time range
     int finalTrackIndex = trackIndex ?? originalClip.trackIndex;
@@ -6250,33 +6419,62 @@ class VideoEditorProvider extends ChangeNotifier {
     }
   }
 
-  /// Update the overlay clip's position on the screen
+  /// Update the overlay clip's position on the screen. With motion
+  /// keyframes, edits the keyframe at the playhead instead.
   void updateOverlayClipPosition(String clipId, Offset newPosition) {
-    if (_currentProject == null) return;
-    final clipIndex = getOverlayClipIndexById(clipId);
-    if (clipIndex == null || clipIndex == -1) return;
-
-    final originalClip = _currentProject!.overlayClips[clipIndex];
-    final updatedClip = originalClip.copyWith(overlayPosition: newPosition);
-    final updatedClips = List<VideoClip>.from(_currentProject!.overlayClips);
-    updatedClips[clipIndex] = updatedClip;
-
-    _currentProject = _currentProject!.copyWith(overlayClips: updatedClips);
-    _scheduleAutoSave();
-    notifyListeners();
+    updateOverlayClipBox(clipId, position: newPosition);
   }
 
-  /// Update the overlay clip's size on the screen
+  /// Update the overlay clip's size on the screen. With motion keyframes,
+  /// edits the keyframe at the playhead instead.
   void updateOverlayClipSize(String clipId, Size newSize) {
+    updateOverlayClipBox(clipId, size: newSize);
+  }
+
+  /// Moves/resizes an overlay. Inside a drag gesture
+  /// ([beginUndoGesture]) the whole drag is one undo step.
+  void updateOverlayClipBox(String clipId, {Offset? position, Size? size}) {
     if (_currentProject == null) return;
     final clipIndex = getOverlayClipIndexById(clipId);
     if (clipIndex == null || clipIndex == -1) return;
+    final clip = _currentProject!.overlayClips[clipIndex];
 
-    final originalClip = _currentProject!.overlayClips[clipIndex];
-    final updatedClip = originalClip.copyWith(overlaySize: newSize);
+    VideoClip updated;
+    if (clip.keyframeData.isEmpty) {
+      updated = clip.copyWith(overlayPosition: position, overlaySize: size);
+    } else {
+      final local = _overlayLocalTime(clip);
+      final (curPos, curSize) = OverlayKeyframe.boxAt(clip, local);
+      updated = _withKeyframe(
+          clip, OverlayKeyframe(local, position ?? curPos, size ?? curSize));
+    }
+    recordUndo(coalesceKey: 'overlay-box:$clipId');
+    _replaceOverlayClip(clipIndex, updated);
+  }
+
+  /// Time into [clip] at the playhead, clamped to the clip.
+  Duration _overlayLocalTime(VideoClip clip) {
+    var local = _currentPosition - clip.startTime;
+    final len = clip.endTime - clip.startTime;
+    if (local < Duration.zero) local = Duration.zero;
+    if (local > len) local = len;
+    return local;
+  }
+
+  /// Keyframes closer than this to the playhead are edited, not duplicated.
+  static const Duration _keyframeSnap = Duration(milliseconds: 80);
+
+  VideoClip _withKeyframe(VideoClip clip, OverlayKeyframe frame) {
+    final frames = clip.keyframes
+        .where((k) => (k.time - frame.time).abs() > _keyframeSnap)
+        .toList()
+      ..add(frame);
+    return clip.copyWith(keyframeData: OverlayKeyframe.encode(frames));
+  }
+
+  void _replaceOverlayClip(int index, VideoClip updated) {
     final updatedClips = List<VideoClip>.from(_currentProject!.overlayClips);
-    updatedClips[clipIndex] = updatedClip;
-
+    updatedClips[index] = updated;
     _currentProject = _currentProject!.copyWith(overlayClips: updatedClips);
     _scheduleAutoSave();
     notifyListeners();
@@ -6289,18 +6487,16 @@ class VideoEditorProvider extends ChangeNotifier {
     if (clipIndex == null || clipIndex == -1) return;
 
     final originalClip = _currentProject!.overlayClips[clipIndex];
-    final updatedClip = originalClip.copyWith(overlayOpacity: opacity);
-    final updatedClips = List<VideoClip>.from(_currentProject!.overlayClips);
-    updatedClips[clipIndex] = updatedClip;
-
-    _currentProject = _currentProject!.copyWith(overlayClips: updatedClips);
-    _scheduleAutoSave();
-    notifyListeners();
+    recordUndo(coalesceKey: 'overlay-opacity:$clipId');
+    _replaceOverlayClip(clipIndex,
+        originalClip.copyWith(overlayOpacity: opacity.clamp(0.0, 1.0)));
   }
 
   /// Remove an overlay clip from the project
   void removeOverlayClip(String clipId) {
     if (_currentProject == null) return;
+    if (!_currentProject!.overlayClips.any((c) => c.id == clipId)) return;
+    recordUndo();
     final updatedClips = List<VideoClip>.from(_currentProject!.overlayClips);
     updatedClips.removeWhere((clip) => clip.id == clipId);
 
@@ -6323,7 +6519,8 @@ class VideoEditorProvider extends ChangeNotifier {
     if (clipIndex == null || clipIndex == -1) return;
 
     final originalClip = _currentProject!.overlayClips[clipIndex];
-    final updatedClip = originalClip.copyWith(volume: volume.clamp(0.0, 2.0));
+    // 0..100%: the preview player cannot go louder, so neither does export.
+    final updatedClip = originalClip.copyWith(volume: volume.clamp(0.0, 1.0));
     final updatedClips = List<VideoClip>.from(_currentProject!.overlayClips);
     updatedClips[clipIndex] = updatedClip;
 
@@ -6351,4 +6548,517 @@ class VideoEditorProvider extends ChangeNotifier {
     _scheduleAutoSave();
     notifyListeners();
   }
+
+  // ═══════════════════════════════════════════════════════════════════════
+  // Item tools: split, duplicate, layer order, overlay look and motion.
+  // Every action is one undo step.
+  // ═══════════════════════════════════════════════════════════════════════
+
+  int _indexOf<T>(List<T> items, String id, String Function(T) getId) =>
+      items.indexWhere((e) => getId(e) == id);
+
+  /// Splits [clip]'s keyframes at [cut] (time into the clip). Both halves
+  /// get a keyframe at the cut so the motion stays continuous.
+  static (List<OverlayKeyframe>, List<OverlayKeyframe>) splitKeyframes(
+      VideoClip clip, Duration cut) {
+    final frames = clip.keyframes;
+    if (frames.isEmpty) return (const [], const []);
+    final (pos, size) = OverlayKeyframe.boxAt(clip, cut);
+    final first = [
+      ...frames.where((k) => k.time < cut),
+      OverlayKeyframe(cut, pos, size),
+    ];
+    final second = [
+      OverlayKeyframe(Duration.zero, pos, size),
+      ...frames
+          .where((k) => k.time > cut)
+          .map((k) => OverlayKeyframe(k.time - cut, k.position, k.size)),
+    ];
+    return (first, second);
+  }
+
+  void _selectOnly({String? text, String? sticker, String? audio, String? overlay}) {
+    _selectedTextOverlayId = text;
+    _selectedStickerId = sticker;
+    _selectedAudioOverlayId = audio;
+    _selectedOverlayClipId = overlay;
+    _selectedVideoClipId = null;
+  }
+
+  void _commitEdit() {
+    _scheduleAutoSave();
+    notifyListeners();
+  }
+
+  // ── Text ───────────────────────────────────────────────────────────────
+
+  /// Splits a text overlay at the playhead. The first half keeps the in
+  /// animation, the second half the out animation.
+  bool cutTextOverlay(String overlayId) {
+    final project = _currentProject;
+    if (project == null) return false;
+    final i = _indexOf<TextOverlay>(project.textOverlays, overlayId, (t) => t.id);
+    if (i == -1) return false;
+    final o = project.textOverlays[i];
+    final cut = _currentPosition;
+    if (cut <= o.startTime || cut >= o.endTime) return false;
+    final first = TextOverlay(
+      id: _uuid.v4(),
+      text: o.text,
+      position: o.position,
+      fontSize: o.fontSize,
+      color: o.color,
+      fontFamily: o.fontFamily,
+      fontWeight: o.fontWeight,
+      startTime: o.startTime,
+      endTime: cut,
+      rotation: o.rotation,
+      opacity: o.opacity,
+      fontStyle: o.fontStyle,
+      textAlign: o.textAlign,
+      animIn: o.animIn,
+      animOut: 'none',
+      boxColor: o.boxColor,
+      outlineColor: o.outlineColor,
+      outlineWidth: o.outlineWidth,
+      shadow: o.shadow,
+    );
+    final second = TextOverlay(
+      id: _uuid.v4(),
+      text: o.text,
+      position: o.position,
+      fontSize: o.fontSize,
+      color: o.color,
+      fontFamily: o.fontFamily,
+      fontWeight: o.fontWeight,
+      startTime: cut,
+      endTime: o.endTime,
+      rotation: o.rotation,
+      opacity: o.opacity,
+      fontStyle: o.fontStyle,
+      textAlign: o.textAlign,
+      animIn: 'none',
+      animOut: o.animOut,
+      boxColor: o.boxColor,
+      outlineColor: o.outlineColor,
+      outlineWidth: o.outlineWidth,
+      shadow: o.shadow,
+    );
+    final list = List<TextOverlay>.from(project.textOverlays)
+      ..removeAt(i)
+      ..insertAll(i, [first, second]);
+    recordUndo();
+    _currentProject = project.copyWith(textOverlays: list);
+    _selectOnly(text: second.id);
+    _commitEdit();
+    return true;
+  }
+
+  /// Copies a text overlay (same time, nudged on screen) and selects it.
+  String? duplicateTextOverlay(String overlayId) {
+    final project = _currentProject;
+    if (project == null) return null;
+    final i = _indexOf<TextOverlay>(project.textOverlays, overlayId, (t) => t.id);
+    if (i == -1) return null;
+    final o = project.textOverlays[i];
+    final copy = TextOverlay(
+      id: _uuid.v4(),
+      text: o.text,
+      position: Offset((o.position.dx + 0.04).clamp(0.0, 0.95),
+          (o.position.dy + 0.04).clamp(0.0, 0.95)),
+      fontSize: o.fontSize,
+      color: o.color,
+      fontFamily: o.fontFamily,
+      fontWeight: o.fontWeight,
+      startTime: o.startTime,
+      endTime: o.endTime,
+      rotation: o.rotation,
+      opacity: o.opacity,
+      fontStyle: o.fontStyle,
+      textAlign: o.textAlign,
+      animIn: o.animIn,
+      animOut: o.animOut,
+      boxColor: o.boxColor,
+      outlineColor: o.outlineColor,
+      outlineWidth: o.outlineWidth,
+      shadow: o.shadow,
+    );
+    recordUndo();
+    _currentProject = project.addTextOverlay(copy);
+    _selectOnly(text: copy.id);
+    _commitEdit();
+    return copy.id;
+  }
+
+  // ── Stickers ───────────────────────────────────────────────────────────
+
+  bool cutSticker(String stickerId) {
+    final project = _currentProject;
+    if (project == null) return false;
+    final i = _indexOf<StickerModel>(project.stickers, stickerId, (s) => s.id);
+    if (i == -1) return false;
+    final s = project.stickers[i];
+    final cut = _currentPosition;
+    if (cut <= s.startTime || cut >= s.endTime) return false;
+    final first = s.copyWith(id: _uuid.v4(), endTime: cut, animOut: 'none');
+    final second = s.copyWith(id: _uuid.v4(), startTime: cut, animIn: 'none');
+    final list = List<StickerModel>.from(project.stickers)
+      ..removeAt(i)
+      ..insertAll(i, [first, second]);
+    recordUndo();
+    _currentProject = project.copyWith(stickers: list);
+    _selectOnly(sticker: second.id);
+    _commitEdit();
+    return true;
+  }
+
+  String? duplicateSticker(String stickerId) {
+    final project = _currentProject;
+    if (project == null) return null;
+    final i = _indexOf<StickerModel>(project.stickers, stickerId, (s) => s.id);
+    if (i == -1) return null;
+    final s = project.stickers[i];
+    final copy = s.copyWith(
+      id: _uuid.v4(),
+      position: Offset((s.position.dx + 0.05).clamp(0.0, 1.0),
+          (s.position.dy + 0.05).clamp(0.0, 1.0)),
+    );
+    recordUndo();
+    _currentProject = project.addSticker(copy);
+    _selectOnly(sticker: copy.id);
+    _commitEdit();
+    return copy.id;
+  }
+
+  /// Moves a sticker within the sticker stack (later = drawn on top).
+  void moveStickerLayer(String stickerId, LayerMove move) {
+    final project = _currentProject;
+    if (project == null) return;
+    final list = _reorder(project.stickers, stickerId, (s) => s.id, move);
+    if (list == null) return;
+    recordUndo();
+    _currentProject = project.copyWith(stickers: list);
+    _commitEdit();
+  }
+
+  // ── Audio ──────────────────────────────────────────────────────────────
+
+  /// Copies an audio clip and places the copy right after the original.
+  String? duplicateAudioOverlay(String overlayId) {
+    final project = _currentProject;
+    if (project == null) return null;
+    final i =
+        _indexOf<AudioOverlay>(project.audioOverlays, overlayId, (a) => a.id);
+    if (i == -1) return null;
+    final a = project.audioOverlays[i];
+    final len = a.endTime - a.startTime;
+    final copy = AudioOverlay(
+      id: _uuid.v4(),
+      audioFile: a.audioFile,
+      startTime: a.endTime,
+      endTime: a.endTime + len,
+      audioStartOffset: a.audioStartOffset,
+      volume: a.volume,
+      fadeIn: a.fadeIn,
+      fadeOut: a.fadeOut,
+      trackIndex: a.trackIndex,
+    );
+    recordUndo();
+    _currentProject = project.addAudioOverlay(copy);
+    _waveformCache[copy.id] = _waveformCache[a.id] ?? const [];
+    if (_waveformCache[copy.id]!.isEmpty) _waveformCache.remove(copy.id);
+    _selectOnly(audio: copy.id);
+    if (_isPlaying) unawaited(_syncAudioPlayback(force: true));
+    _commitEdit();
+    return copy.id;
+  }
+
+  // ── Media overlays ─────────────────────────────────────────────────────
+
+  VideoClip? overlayClipById(String clipId) {
+    for (final c in _currentProject?.overlayClips ?? const <VideoClip>[]) {
+      if (c.id == clipId) return c;
+    }
+    return null;
+  }
+
+  /// Changes how a media overlay looks. [undoKey] merges repeated changes
+  /// (slider drags) into one undo step.
+  void updateOverlayClipStyle(
+    String clipId, {
+    String? maskShape,
+    double? borderWidth,
+    Color? borderColor,
+    bool clearBorder = false,
+    bool? shadow,
+    String? animIn,
+    String? animOut,
+    double? rotation,
+    bool? isMirrored,
+    String? undoKey,
+  }) {
+    final index = getOverlayClipIndexById(clipId) ?? -1;
+    if (_currentProject == null || index == -1) return;
+    final c = _currentProject!.overlayClips[index];
+    recordUndo(coalesceKey: undoKey);
+    _replaceOverlayClip(
+      index,
+      c.copyWith(
+        maskShape: maskShape,
+        borderWidth: borderWidth,
+        borderColor: borderColor,
+        clearBorderColor: clearBorder,
+        shadow: shadow,
+        animIn: animIn,
+        animOut: animOut,
+        rotation: rotation,
+        isMirrored: isMirrored,
+      ),
+    );
+  }
+
+  /// Sets an overlay video's speed; its timeline length follows.
+  void setOverlayClipSpeed(String clipId, double speed) {
+    final index = getOverlayClipIndexById(clipId) ?? -1;
+    if (_currentProject == null || index == -1) return;
+    final c = _currentProject!.overlayClips[index];
+    if (c.mediaType != MediaType.video) return;
+    final s = _safeSpeed(speed);
+    final len = timelineLengthForSource(c.trimEnd - c.trimStart, s);
+    final oldLen = c.endTime - c.startTime;
+    // Keyframe times stretch with the clip.
+    final ratio = oldLen.inMicroseconds == 0
+        ? 1.0
+        : len.inMicroseconds / oldLen.inMicroseconds;
+    final frames = c.keyframes
+        .map((k) => OverlayKeyframe(
+            Duration(microseconds: (k.time.inMicroseconds * ratio).round()),
+            k.position,
+            k.size))
+        .toList();
+    recordUndo();
+    _replaceOverlayClip(
+      index,
+      c.copyWith(
+        playbackSpeed: s,
+        endTime: c.startTime + len,
+        keyframeData: OverlayKeyframe.encode(frames),
+      ),
+    );
+  }
+
+  /// Crops an overlay to [crop] (normalized to the media, null = no crop).
+  /// The box keeps its width and takes the cropped picture's shape.
+  void setOverlayCrop(String clipId, Rect? crop) {
+    final index = getOverlayClipIndexById(clipId) ?? -1;
+    if (_currentProject == null || index == -1) return;
+    final c = _currentProject!.overlayClips[index];
+    double factor(Rect? r) =>
+        r == null || r.height <= 0 ? 1.0 : r.width / r.height;
+    final scale = factor(c.cropRect) / factor(crop);
+    Size resize(Size s) => Size(s.width, (s.height * scale).clamp(0.05, 1.0));
+    final frames = c.keyframes
+        .map((k) => OverlayKeyframe(k.time, k.position, resize(k.size)))
+        .toList();
+    recordUndo();
+    _replaceOverlayClip(
+      index,
+      c.copyWith(
+        cropRect: crop,
+        clearCropRect: crop == null,
+        overlaySize: resize(c.overlaySize),
+        keyframeData: OverlayKeyframe.encode(frames),
+      ),
+    );
+  }
+
+  /// Green-screen keying for an overlay (null turns it off).
+  void setOverlayChromaKey(String clipId, ChromaKeySettings? settings,
+      {String? undoKey}) {
+    final index = getOverlayClipIndexById(clipId) ?? -1;
+    if (_currentProject == null || index == -1) return;
+    final c = _currentProject!.overlayClips[index];
+    recordUndo(coalesceKey: undoKey);
+    _replaceOverlayClip(
+      index,
+      settings == null
+          ? c.copyWith(clearChromaKeySettings: true)
+          : c.copyWith(chromaKeySettings: settings),
+    );
+  }
+
+  /// Copies an overlay (same time, nudged on screen) and selects it.
+  String? duplicateOverlayClip(String clipId) {
+    final c = overlayClipById(clipId);
+    if (_currentProject == null || c == null) return null;
+    Offset nudge(Offset o, Size s) => Offset(
+        (o.dx + 0.04).clamp(0.0, math.max(0.0, 1.0 - s.width)),
+        (o.dy + 0.04).clamp(0.0, math.max(0.0, 1.0 - s.height)));
+    final frames = c.keyframes
+        .map((k) => OverlayKeyframe(k.time, nudge(k.position, k.size), k.size))
+        .toList();
+    final copy = c.copyWith(
+      id: _uuid.v4(),
+      overlayPosition: nudge(c.overlayPosition, c.overlaySize),
+      keyframeData: OverlayKeyframe.encode(frames),
+    );
+    recordUndo();
+    _currentProject = _currentProject!.addOverlayClip(copy);
+    _selectOnly(overlay: copy.id);
+    _commitEdit();
+    return copy.id;
+  }
+
+  /// Changes which overlays are drawn on top (the list's last is topmost,
+  /// in the preview and in the export).
+  void moveOverlayLayer(String clipId, LayerMove move) {
+    final project = _currentProject;
+    if (project == null) return;
+    final list = _reorder(project.overlayClips, clipId, (c) => c.id, move);
+    if (list == null) return;
+    recordUndo();
+    _currentProject = project.copyWith(overlayClips: list);
+    _commitEdit();
+  }
+
+  /// Layer position of an overlay: (index from the bottom, count).
+  (int, int) overlayLayerOf(String clipId) {
+    final list = _currentProject?.overlayClips ?? const <VideoClip>[];
+    return (list.indexWhere((c) => c.id == clipId), list.length);
+  }
+
+  static List<T>? _reorder<T>(
+      List<T> items, String id, String Function(T) getId, LayerMove move) {
+    final i = items.indexWhere((e) => getId(e) == id);
+    if (i == -1) return null;
+    final target = switch (move) {
+      LayerMove.front => items.length - 1,
+      LayerMove.back => 0,
+      LayerMove.forward => math.min(items.length - 1, i + 1),
+      LayerMove.backward => math.max(0, i - 1),
+    };
+    if (target == i) return null;
+    final list = List<T>.from(items);
+    final item = list.removeAt(i);
+    list.insert(target, item);
+    return list;
+  }
+
+  /// True when [clipId] has a motion keyframe at the playhead.
+  bool overlayHasKeyframeAtPlayhead(String clipId) {
+    final c = overlayClipById(clipId);
+    if (c == null) return false;
+    final local = _overlayLocalTime(c);
+    return c.keyframes.any((k) => (k.time - local).abs() <= _keyframeSnap);
+  }
+
+  /// Adds a motion keyframe at the playhead holding the overlay's current
+  /// box. The first keyframe also pins the start so the overlay moves from
+  /// where it is now.
+  void addOverlayKeyframeAtPlayhead(String clipId) {
+    final index = getOverlayClipIndexById(clipId) ?? -1;
+    if (_currentProject == null || index == -1) return;
+    final c = _currentProject!.overlayClips[index];
+    final local = _overlayLocalTime(c);
+    final (pos, size) = OverlayKeyframe.boxAt(c, local);
+    var updated = _withKeyframe(c, OverlayKeyframe(local, pos, size));
+    if (c.keyframeData.isEmpty && local > _keyframeSnap) {
+      updated = _withKeyframe(updated, OverlayKeyframe(Duration.zero, pos, size));
+    }
+    recordUndo();
+    _replaceOverlayClip(index, updated);
+  }
+
+  void removeOverlayKeyframeAtPlayhead(String clipId) {
+    final index = getOverlayClipIndexById(clipId) ?? -1;
+    if (_currentProject == null || index == -1) return;
+    final c = _currentProject!.overlayClips[index];
+    final local = _overlayLocalTime(c);
+    final frames = c.keyframes
+        .where((k) => (k.time - local).abs() > _keyframeSnap)
+        .toList();
+    if (frames.length == c.keyframes.length) return;
+    // Without keyframes the overlay stays where it is right now.
+    final (pos, size) = OverlayKeyframe.boxAt(c, local);
+    recordUndo();
+    _replaceOverlayClip(
+      index,
+      c.copyWith(
+        keyframeData: OverlayKeyframe.encode(frames),
+        overlayPosition: frames.isEmpty ? pos : null,
+        overlaySize: frames.isEmpty ? size : null,
+      ),
+    );
+  }
+
+  /// Removes all motion; the overlay stays where it is at the playhead.
+  void clearOverlayKeyframes(String clipId) {
+    final index = getOverlayClipIndexById(clipId) ?? -1;
+    if (_currentProject == null || index == -1) return;
+    final c = _currentProject!.overlayClips[index];
+    if (c.keyframeData.isEmpty) return;
+    final (pos, size) = OverlayKeyframe.boxAt(c, _overlayLocalTime(c));
+    recordUndo();
+    _replaceOverlayClip(
+      index,
+      c.copyWith(
+          keyframeData: const [], overlayPosition: pos, overlaySize: size),
+    );
+  }
+
+  // ── Video length ───────────────────────────────────────────────────────
+
+  /// Shortens an item so it ends at [end] (used when the user chooses
+  /// "Trim to fit" after adding something longer than the video). Merges
+  /// into the undo step of the add.
+  void trimItemToEnd(TimelineItemKind kind, String id, Duration end) {
+    final project = _currentProject;
+    if (project == null) return;
+    switch (kind) {
+      case TimelineItemKind.text:
+        final i = _indexOf<TextOverlay>(project.textOverlays, id, (t) => t.id);
+        if (i == -1 || project.textOverlays[i].startTime >= end) return;
+        _currentProject = project.updateTextOverlay(
+            id, project.textOverlays[i].copyWith(endTime: end));
+      case TimelineItemKind.sticker:
+        final i = _indexOf<StickerModel>(project.stickers, id, (s) => s.id);
+        if (i == -1 || project.stickers[i].startTime >= end) return;
+        _currentProject = project.updateSticker(
+            id, project.stickers[i].copyWith(endTime: end));
+      case TimelineItemKind.audio:
+        final i =
+            _indexOf<AudioOverlay>(project.audioOverlays, id, (a) => a.id);
+        if (i == -1 || project.audioOverlays[i].startTime >= end) return;
+        _currentProject = project.updateAudioOverlay(
+            id, project.audioOverlays[i].copyWith(endTime: end));
+        _audioSourceConfigCache.remove(id);
+      case TimelineItemKind.overlay:
+        final i = getOverlayClipIndexById(id) ?? -1;
+        if (i == -1) return;
+        final c = project.overlayClips[i];
+        if (c.startTime >= end) return;
+        final len = end - c.startTime;
+        final isImage = c.mediaType == MediaType.image;
+        final srcLen =
+            isImage ? len : sourceLengthForTimeline(len, c.playbackSpeed);
+        final updated = c.copyWith(
+          endTime: end,
+          trimEnd: c.trimStart + srcLen,
+          sourceEnd: isImage ? c.trimStart + srcLen : null,
+          keyframeData: OverlayKeyframe.encode(
+              c.keyframes.where((k) => k.time <= len).toList()),
+        );
+        final list = List<VideoClip>.from(project.overlayClips);
+        list[i] = updated;
+        _currentProject = project.copyWith(overlayClips: list);
+    }
+    if (_isPlaying) unawaited(_syncAudioPlayback(force: true));
+    _commitEdit();
+  }
 }
+
+/// Where to move an item in its layer stack.
+enum LayerMove { front, forward, backward, back }
+
+/// Kinds of items that live on the timeline above the main clips.
+enum TimelineItemKind { text, sticker, audio, overlay }

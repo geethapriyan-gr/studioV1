@@ -1,6 +1,8 @@
 import 'dart:io';
 import 'package:flutter/material.dart';
 import 'package:hive_flutter/hive_flutter.dart';
+import 'package:path/path.dart' as p;
+import 'package:path_provider/path_provider.dart';
 import '../models/transition.dart';
 import '../models/video_project.dart';
 import '../models/chroma_key_settings.dart';
@@ -61,16 +63,63 @@ class HiveService {
       Hive.registerAdapter(TextAlignEnumAdapter());
     }
 
+    if (_projectsBox?.isOpen == true) return;
     try {
-      // Try to open the box
       _projectsBox = await Hive.openBox<VideoProject>(_projectsBoxName);
     } catch (e) {
-      // If opening fails due to schema mismatch, delete the box and recreate it
-      print('Failed to open projects box: $e');
-      print('Deleting and recreating projects box...');
-      await Hive.deleteBoxFromDisk(_projectsBoxName);
-      _projectsBox = await Hive.openBox<VideoProject>(_projectsBoxName);
+      // Never throw the user's projects away: rescue every project that can
+      // still be read, keep a copy of the original file, then start a fresh
+      // box holding the rescued projects.
+      debugPrint('Failed to open projects box: $e');
+      _projectsBox = await _recoverProjectsBox();
     }
+  }
+
+  /// Number of projects that could not be read during the last recovery
+  /// (0 when the box opened normally). The original file is kept next to the
+  /// box as `projects.hive.bak-<timestamp>`.
+  static int lastRecoveryLostProjects = 0;
+
+  static Future<Box<VideoProject>> _recoverProjectsBox() async {
+    final rescued = <String, VideoProject>{};
+    var lost = 0;
+
+    // Back the file up before touching it (Hive.initFlutter stores boxes in
+    // the application documents directory).
+    try {
+      final dir = await getApplicationDocumentsDirectory();
+      final file = File(p.join(dir.path, '$_projectsBoxName.hive'));
+      if (file.existsSync()) {
+        final stamp = DateTime.now().millisecondsSinceEpoch;
+        await file.copy('${file.path}.bak-$stamp');
+      }
+    } catch (e) {
+      debugPrint('Could not back up projects box: $e');
+    }
+
+    try {
+      // A lazy box reads values one at a time, so one unreadable project
+      // does not take the others down with it.
+      final lazy = await Hive.openLazyBox<VideoProject>(_projectsBoxName);
+      for (final key in lazy.keys.toList()) {
+        try {
+          final p = await lazy.get(key);
+          if (p != null) rescued[key.toString()] = p;
+        } catch (e) {
+          lost++;
+          debugPrint('Could not read project $key: $e');
+        }
+      }
+      await lazy.close();
+    } catch (e) {
+      debugPrint('Lazy recovery of projects box failed: $e');
+    }
+
+    await Hive.deleteBoxFromDisk(_projectsBoxName);
+    final box = await Hive.openBox<VideoProject>(_projectsBoxName);
+    await box.putAll(rescued);
+    lastRecoveryLostProjects = lost;
+    return box;
   }
 
   /// Register built-in type adapters for Flutter/Dart types
