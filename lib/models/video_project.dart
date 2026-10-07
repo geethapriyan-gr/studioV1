@@ -83,6 +83,10 @@ class TextOverlay {
   final double outlineWidth;
   @HiveField(18, defaultValue: true)
   final bool shadow;
+  // Motion keyframes, flattened as [ItemKeyframe.encode] produces (size =
+  // font size).
+  @HiveField(19, defaultValue: <double>[])
+  final List<double> keyframeData;
 
   TextOverlay({
     required this.id,
@@ -104,9 +108,14 @@ class TextOverlay {
     this.outlineColor,
     this.outlineWidth = 0,
     this.shadow = true,
+    this.keyframeData = const [],
   });
 
+  List<ItemKeyframe> get keyframes => ItemKeyframe.decode(keyframeData);
+
   TextOverlay copyWith({
+    String? id,
+    List<double>? keyframeData,
     String? text,
     Offset? position,
     double? fontSize,
@@ -129,7 +138,8 @@ class TextOverlay {
     bool? shadow,
   }) {
     return TextOverlay(
-      id: id,
+      id: id ?? this.id,
+      keyframeData: keyframeData ?? this.keyframeData,
       text: text ?? this.text,
       position: position ?? this.position,
       fontSize: fontSize ?? this.fontSize,
@@ -200,7 +210,89 @@ class TextOverlay {
       'outlineColor': outlineColor?.toARGB32(),
       'outlineWidth': outlineWidth,
       'shadow': shadow,
+      'keyframes': keyframeData,
     };
+  }
+}
+
+/// A text or sticker motion keyframe: where the item is (text: top-left,
+/// sticker: centre; normalized to the preview box) and how big it is
+/// (text: font size, sticker: scale) [time] after the item starts. Between
+/// keyframes the item moves linearly; preview and export share [at].
+class ItemKeyframe {
+  final Duration time;
+  final Offset position;
+  final double size;
+
+  const ItemKeyframe(this.time, this.position, this.size);
+
+  static const int _stride = 4;
+
+  static List<ItemKeyframe> decode(List<double> data) {
+    final out = <ItemKeyframe>[];
+    for (int i = 0; i + _stride <= data.length; i += _stride) {
+      out.add(ItemKeyframe(Duration(microseconds: (data[i] * 1000).round()),
+          Offset(data[i + 1], data[i + 2]), data[i + 3]));
+    }
+    out.sort((a, b) => a.time.compareTo(b.time));
+    return out;
+  }
+
+  static List<double> encode(List<ItemKeyframe> frames) {
+    final sorted = List<ItemKeyframe>.from(frames)
+      ..sort((a, b) => a.time.compareTo(b.time));
+    return [
+      for (final k in sorted) ...[
+        k.time.inMicroseconds / 1000.0,
+        k.position.dx,
+        k.position.dy,
+        k.size,
+      ]
+    ];
+  }
+
+  /// Position and size [local] time into the item. Without keyframes this
+  /// is the item's own ([position], [size]).
+  static (Offset, double) at(
+      List<double> data, Duration local, Offset position, double size) {
+    final frames = decode(data);
+    if (frames.isEmpty) return (position, size);
+    if (local <= frames.first.time) {
+      return (frames.first.position, frames.first.size);
+    }
+    if (local >= frames.last.time) {
+      return (frames.last.position, frames.last.size);
+    }
+    for (int i = 0; i < frames.length - 1; i++) {
+      final a = frames[i];
+      final b = frames[i + 1];
+      if (local >= a.time && local <= b.time) {
+        final span = (b.time - a.time).inMicroseconds;
+        final t = span <= 0 ? 1.0 : (local - a.time).inMicroseconds / span;
+        return (
+          Offset.lerp(a.position, b.position, t)!,
+          a.size + (b.size - a.size) * t,
+        );
+      }
+    }
+    return (frames.last.position, frames.last.size);
+  }
+
+  /// Splits keyframes at [cut]; both halves get a keyframe at the cut.
+  static (List<double>, List<double>) split(
+      List<double> data, Duration cut, Offset position, double size) {
+    final frames = decode(data);
+    if (frames.isEmpty) return (const [], const []);
+    final (pos, sz) = at(data, cut, position, size);
+    return (
+      encode([...frames.where((k) => k.time < cut), ItemKeyframe(cut, pos, sz)]),
+      encode([
+        ItemKeyframe(Duration.zero, pos, sz),
+        ...frames
+            .where((k) => k.time > cut)
+            .map((k) => ItemKeyframe(k.time - cut, k.position, k.size)),
+      ]),
+    );
   }
 }
 
@@ -601,6 +693,10 @@ class StickerModel {
   final String animIn;
   @HiveField(10, defaultValue: 'none')
   final String animOut;
+  // Motion keyframes, flattened as [ItemKeyframe.encode] produces (position
+  // = centre, size = scale).
+  @HiveField(11, defaultValue: <double>[])
+  final List<double> keyframeData;
 
   StickerModel({
     required this.id,
@@ -614,7 +710,10 @@ class StickerModel {
     this.flipX = false,
     this.animIn = 'none',
     this.animOut = 'none',
+    this.keyframeData = const [],
   });
+
+  List<ItemKeyframe> get keyframes => ItemKeyframe.decode(keyframeData);
 
   /// Bundled stickers are asset paths; stickers made from the user's own
   /// images are absolute file paths.
@@ -635,8 +734,10 @@ class StickerModel {
     bool? flipX,
     String? animIn,
     String? animOut,
+    List<double>? keyframeData,
   }) {
     return StickerModel(
+      keyframeData: keyframeData ?? this.keyframeData,
       id: id ?? this.id,
       assetPath: assetPath ?? this.assetPath,
       position: position ?? this.position,
@@ -664,6 +765,7 @@ class StickerModel {
       'flipX': flipX,
       'animIn': animIn,
       'animOut': animOut,
+      'keyframes': keyframeData,
     };
   }
 }

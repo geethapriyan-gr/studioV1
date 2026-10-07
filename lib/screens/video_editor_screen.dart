@@ -21,13 +21,13 @@ import '../widgets/filter_editor.dart';
 import '../widgets/crop_editor.dart';
 import '../widgets/trim_editor.dart';
 import '../widgets/chroma_key_editor.dart';
+import '../widgets/chroma_composite.dart';
 import '../widgets/sticker_panel.dart';
 import '../widgets/sticker_layer.dart';
 
 import '../widgets/draggable_media_overlay_widget.dart';
 import '../models/video_project.dart';
 import '../models/editor_panel_mode.dart';
-import '../models/chroma_key_settings.dart';
 import '../models/transition.dart';
 import '../transitions/transition_factory.dart';
 import '../main.dart' show AppColors;
@@ -124,18 +124,34 @@ class _DraggableTextWidgetState extends State<_DraggableTextWidget>
     final p = widget.provider;
     final animated = o.animIn != TextAnimations.none ||
         o.animOut != TextAnimations.none;
+    // Moving text re-evaluates every frame while playing, too.
+    final moving = o.keyframeData.isNotEmpty && p.isPlaying;
     if (!animated || widget.isSelected || !p.isPlaying) {
-      if (_ticker.isActive) _ticker.stop();
+      _setTicking(moving);
       return const TextAnimState();
     }
     final t = (p.smoothPosition - o.startTime).inMicroseconds / 1e6;
     final state = TextAnimations.at(o, t);
-    if (state.isIdle) {
-      if (_ticker.isActive) _ticker.stop();
-    } else if (!_ticker.isActive) {
-      _ticker.start();
-    }
+    _setTicking(moving || !state.isIdle);
     return state;
+  }
+
+  void _setTicking(bool on) {
+    if (on && !_ticker.isActive) {
+      _ticker.start();
+    } else if (!on && _ticker.isActive) {
+      _ticker.stop();
+    }
+  }
+
+  /// Top-left and font size at the current time (motion keyframes).
+  (Offset, double) _motionState() {
+    final o = widget.overlay;
+    if (o.keyframeData.isEmpty) return (o.position, o.fontSize);
+    final p = widget.provider;
+    final now = p.isPlaying ? p.smoothPosition : p.currentPosition;
+    return ItemKeyframe.at(
+        o.keyframeData, now - o.startTime, o.position, o.fontSize);
   }
 
   // Size (normalized) and centre of the text when the gesture started, so a
@@ -144,6 +160,7 @@ class _DraggableTextWidgetState extends State<_DraggableTextWidget>
   Offset _startCenter = Offset.zero;
   Offset _dragDelta = Offset.zero;
   Offset? _snappedPosition;
+  double _gestureFont = 0;
 
   /// Box the preview draws around the text: 3 px border + 4 px padding.
   static const double _inset = 7.0;
@@ -155,9 +172,9 @@ class _DraggableTextWidgetState extends State<_DraggableTextWidget>
 
   @override
   Widget build(BuildContext context) {
-    final position =
-        _snappedPosition ?? _localPosition ?? widget.overlay.position;
-    final effectiveFontSize = widget.overlay.fontSize * _pinchScale;
+    final (motionPos, motionFont) = _motionState();
+    final position = _snappedPosition ?? _localPosition ?? motionPos;
+    final effectiveFontSize = motionFont * _pinchScale;
     final anim = _animState();
     final textPainter =
         TextOverlayPainter(widget.overlay, fontSize: effectiveFontSize);
@@ -202,10 +219,11 @@ class _DraggableTextWidgetState extends State<_DraggableTextWidget>
         // Use scale gesture for both drag and pinch-to-zoom
         onScaleStart: (details) {
           widget.onDragStart();
-          _localPosition = widget.overlay.position;
+          _localPosition = motionPos;
+          _gestureFont = motionFont;
           _baseScale = _pinchScale;
           _startSizeNorm = _normSize(textPainter);
-          _startCenter = widget.overlay.position +
+          _startCenter = motionPos +
               Offset(_startSizeNorm.width / 2, _startSizeNorm.height / 2);
           _dragDelta = Offset.zero;
         },
@@ -235,7 +253,7 @@ class _DraggableTextWidgetState extends State<_DraggableTextWidget>
           widget.onDragEnd(_snappedPosition ?? _localPosition!);
           // Commit the pinch-scaled fontSize
           if (_pinchScale != 1.0 && widget.onFontSizeChanged != null) {
-            final newFontSize = (widget.overlay.fontSize * _pinchScale)
+            final newFontSize = (_gestureFont * _pinchScale)
                 .clamp(4.0, TextOverlayPainter.maxFontSize);
             widget.onFontSizeChanged!(newFontSize);
           }
@@ -1037,20 +1055,16 @@ class _VideoEditorScreenState extends State<VideoEditorScreen>
                                         'text-gesture:${overlay.id}');
                                   },
                                   onGestureEnd: provider.endUndoGesture,
-                                  onDragEnd: (newPosition) {
-                                    provider
-                                        .updateTextOverlayPosition(
-                                            overlay.id,
-                                            newPosition);
-                                  },
-                                  onFontSizeChanged:
-                                      (newFontSize) {
-                                    provider
-                                        .updateTextOverlay(
-                                      overlay.id,
-                                      fontSize: newFontSize,
-                                    );
-                                  },
+                                  // Motion-aware: edits the keyframe at
+                                  // the playhead when the text moves.
+                                  onDragEnd: (newPosition) =>
+                                      provider.updateTextTransform(
+                                          overlay.id,
+                                          position: newPosition),
+                                  onFontSizeChanged: (newFontSize) =>
+                                      provider.updateTextTransform(
+                                          overlay.id,
+                                          fontSize: newFontSize),
                                   onSelected: () {
                                     provider
                                         .selectTextOverlay(
@@ -1077,6 +1091,9 @@ class _VideoEditorScreenState extends State<VideoEditorScreen>
                 // Snap guides shown while dragging text/stickers/overlays.
                 if (interactive)
                   const Positioned.fill(child: SnapGuideOverlay()),
+                // Green screen: tap to pick the colour, drag/pinch to place
+                // the person over the background.
+                if (interactive) ..._buildChromaInteraction(provider),
               ],
             ),
           ),
@@ -1084,6 +1101,127 @@ class _VideoEditorScreenState extends State<VideoEditorScreen>
       ),
     );
     return canvas;
+  }
+
+  // Subject drag/pinch state for the green-screen layer.
+  Offset _chromaStartPos = const Offset(0.5, 0.5);
+  double _chromaStartScale = 1.0;
+  Offset _chromaDrag = Offset.zero;
+  bool _chromaPicking = false;
+
+  /// Layers over the preview while the green-screen panel is open on the
+  /// clip under the playhead.
+  List<Widget> _buildChromaInteraction(VideoEditorProvider provider) {
+    if (provider.editorPanelMode != EditorPanelMode.chromaKey) return const [];
+    final clip = provider.currentVideoClip;
+    if (clip == null || clip.id != provider.selectedVideoClipId) return const [];
+    final s = provider.currentChromaKeySettings;
+    final picking = provider.chromaPickMode;
+    if (!picking && (s == null || !s.enabled)) return const [];
+    final size =
+        Size(_getPreviewWidth(provider), _getPreviewHeight(provider));
+
+    /// Canvas point → position in the clip's own picture (0..1).
+    Offset toPicture(Offset local) {
+      var uv = Offset(local.dx / size.width, local.dy / size.height);
+      if (s != null && s.enabled) {
+        // Undo the subject's move/scale.
+        uv = (uv - s.position) / s.scale + const Offset(0.5, 0.5);
+      }
+      final crop = clip.cropRect;
+      if (crop != null) {
+        uv = Offset(crop.left + uv.dx * crop.width,
+            crop.top + uv.dy * crop.height);
+      }
+      if (clip.isMirrored) uv = Offset(1 - uv.dx, uv.dy);
+      return uv;
+    }
+
+    return [
+      Positioned.fill(
+        child: GestureDetector(
+          behavior: HitTestBehavior.opaque,
+          onTapUp: picking
+              ? (d) async {
+                  setState(() => _chromaPicking = true);
+                  final ok = await provider
+                      .pickChromaColorAt(toPicture(d.localPosition));
+                  if (!mounted) return;
+                  setState(() => _chromaPicking = false);
+                  HapticFeedback.lightImpact();
+                  if (!ok) {
+                    ScaffoldMessenger.of(context).showSnackBar(const SnackBar(
+                        content: Text('Could not read this frame — '
+                            'try another moment of the clip.')));
+                  }
+                }
+              : null,
+          onScaleStart: picking
+              ? null
+              : (d) {
+                  _chromaStartPos = s!.position;
+                  _chromaStartScale = s.scale;
+                  _chromaDrag = Offset.zero;
+                  provider.beginUndoGesture('chroma-subject');
+                },
+          onScaleUpdate: picking
+              ? null
+              : (d) {
+                  _chromaDrag += Offset(d.focalPointDelta.dx / size.width,
+                      d.focalPointDelta.dy / size.height);
+                  var pos = _chromaStartPos + _chromaDrag;
+                  // Snap back to the centre lines.
+                  if ((pos.dx - 0.5).abs() < 0.015) pos = Offset(0.5, pos.dy);
+                  if ((pos.dy - 0.5).abs() < 0.015) pos = Offset(pos.dx, 0.5);
+                  provider.updateChromaKeySettings(
+                    position: Offset(
+                        pos.dx.clamp(-0.5, 1.5), pos.dy.clamp(-0.5, 1.5)),
+                    scale: d.pointerCount >= 2
+                        ? (_chromaStartScale * d.scale).clamp(0.2, 3.0)
+                        : null,
+                  );
+                },
+          onScaleEnd: picking ? null : (_) => provider.endUndoGesture(),
+        ),
+      ),
+      if (picking)
+        Positioned(
+          top: 60,
+          left: 0,
+          right: 0,
+          child: IgnorePointer(
+            child: Center(
+              child: Container(
+                padding:
+                    const EdgeInsets.symmetric(horizontal: 48, vertical: 28),
+                decoration: BoxDecoration(
+                  color: Colors.black.withValues(alpha: 0.7),
+                  borderRadius: BorderRadius.circular(60),
+                ),
+                child: Row(
+                  mainAxisSize: MainAxisSize.min,
+                  children: [
+                    _chromaPicking
+                        ? const SizedBox(
+                            width: 56,
+                            height: 56,
+                            child: CircularProgressIndicator(
+                                strokeWidth: 6, color: Colors.white))
+                        : const Icon(Icons.colorize_rounded,
+                            color: Colors.white, size: 64),
+                    const SizedBox(width: 24),
+                    const Text('Tap the background colour',
+                        style: TextStyle(
+                            color: Colors.white,
+                            fontSize: 52,
+                            fontWeight: FontWeight.w600)),
+                  ],
+                ),
+              ),
+            ),
+          ),
+        ),
+    ];
   }
 
   double _getPreviewWidth(VideoEditorProvider provider) {
@@ -1325,8 +1463,6 @@ class _VideoEditorScreenState extends State<VideoEditorScreen>
                     : null,
               ),
               const SizedBox(width: 6),
-              _buildTrimButton(provider),
-              const SizedBox(width: 6),
               _buildChromaKeyButton(provider),
             ],
           ),
@@ -1408,76 +1544,6 @@ class _VideoEditorScreenState extends State<VideoEditorScreen>
             ),
           ],
         ),
-      ),
-    );
-  }
-
-  Widget _buildTrimButton(VideoEditorProvider provider) {
-    return PopupMenuButton<String>(
-      onSelected: (value) async {
-        if (provider.selectedVideoClipId == null) {
-          ScaffoldMessenger.of(context).showSnackBar(
-            const SnackBar(content: Text('Select a clip first')),
-          );
-          return;
-        }
-
-        final clipId = provider.selectedVideoClipId!;
-
-        switch (value) {
-          case 'left':
-            // Left Trim: Delete everything before current position, keep from current position onwards
-            await provider.applyLeftTrimAtCursor(clipId);
-            ScaffoldMessenger.of(context).showSnackBar(
-              const SnackBar(
-                  content:
-                      Text('Left portion deleted - video starts from cursor')),
-            );
-            break;
-          case 'right':
-            // Right Trim: Delete everything after current position
-            await provider.applyRightTrimAtCursor(clipId);
-            ScaffoldMessenger.of(context).showSnackBar(
-              const SnackBar(content: Text('Right portion deleted')),
-            );
-            break;
-        }
-      },
-      itemBuilder: (context) => [
-        PopupMenuItem(
-          value: 'left',
-          child: Row(
-            children: [
-              Icon(Icons.first_page, color: AppColors.textSecondary, size: 18),
-              SizedBox(width: 8),
-              Text('Left Trim', style: TextStyle(color: AppColors.textPrimary)),
-            ],
-          ),
-        ),
-        PopupMenuItem(
-          value: 'right',
-          child: Row(
-            children: [
-              Icon(Icons.last_page, color: AppColors.textSecondary, size: 18),
-              SizedBox(width: 8),
-              Text('Right Trim',
-                  style: TextStyle(color: AppColors.textPrimary)),
-            ],
-          ),
-        ),
-      ],
-      color: AppColors.surface,
-      shape: RoundedRectangleBorder(
-        borderRadius: BorderRadius.circular(8),
-        side: BorderSide(color: AppColors.border),
-      ),
-      child: _buildPremiumToolBox(
-        icon: provider.showTrimEditor
-            ? Icons.content_cut
-            : Icons.content_cut_outlined,
-        label: 'Trim',
-        isActive: provider.showTrimEditor,
-        isEnabled: true,
       ),
     );
   }
@@ -1769,12 +1835,6 @@ class _VideoEditorScreenState extends State<VideoEditorScreen>
       return const StickerPanel();
     }
     return const SizedBox.shrink();
-  }
-
-  bool _isVideoExtension(String? ext) {
-    if (ext == null) return false;
-    final e = ext.toLowerCase();
-    return ['mp4', 'mov', 'm4v', 'avi', 'mkv', 'webm'].contains(e);
   }
 
   Future<void> _exportVideo() async {
@@ -2393,98 +2453,56 @@ class _VideoEditorScreenState extends State<VideoEditorScreen>
       );
     }
 
+    // ============ GREEN SCREEN ============
+    // While the panel is open on this clip it shows the live draft (and
+    // "hold to compare" shows the original).
+    final panelOnClip = provider.editorPanelMode == EditorPanelMode.chromaKey &&
+        selectedClipId != null &&
+        clip.id == selectedClipId;
+    final chroma = panelOnClip
+        ? provider.currentChromaKeySettings
+        : clip.chromaKeySettings;
+    final keyed = chroma != null &&
+        chroma.enabled &&
+        !(panelOnClip && provider.chromaCompare);
+    // Same order as the exporter: key, then the colour filter.
+    if (keyed) mediaWidget = ChromaComposite.keyOut(chroma, mediaWidget);
+
     mediaWidget = ColorFiltered(
       colorFilter: ui.ColorFilter.matrix(_calculateColorMatrix(colorFilter)),
       child: mediaWidget,
     );
 
     if (colorFilter.warmth != 0.0 || colorFilter.tint != 0.0) {
-      mediaWidget = Stack(
-        fit: StackFit.expand,
-        children: [
-          mediaWidget,
-          Container(
-            color: _getFilterOverlayColor(colorFilter),
-          ),
-        ],
-      );
-    }
-
-    // ============ CHROMA KEY PREVIEW SUPPORT ============
-    // Apply chroma key effect - show background behind video.
-    // Use per-clip settings; fall back to the editor draft only when the
-    // chroma panel is open on this clip.
-    final chromaKeySettings =
-        (provider.editorPanelMode == EditorPanelMode.chromaKey &&
-                selectedClipId != null &&
-                clip.id == selectedClipId)
-            ? provider.currentChromaKeySettings
-            : clip.chromaKeySettings;
-    if (chromaKeySettings != null && chromaKeySettings.enabled) {
-      final backgrounds = provider.currentProject?.chromaKeyBackgrounds ?? [];
-      if (backgrounds.isNotEmpty) {
-        // Get the active background path
-        final backgroundPath = chromaKeySettings.backgroundPath;
-        if (backgroundPath != null && backgrounds.contains(backgroundPath)) {
-          // Build the background widget
-          final isBgVideo = _isVideoExtension(backgroundPath.split('.').last);
-
-          Widget backgroundWidget;
-          if (isBgVideo) {
-            // For video background in preview, show a static placeholder
-            backgroundWidget = Container(
-              color: AppColors.background,
-              child: Center(
-                child: Column(
-                  mainAxisAlignment: MainAxisAlignment.center,
-                  children: [
-                    Icon(
-                      Icons.movie_outlined,
-                      size: 48,
-                      color: AppColors.textTertiary.withOpacity(0.5),
-                    ),
-                    const SizedBox(height: 8),
-                    Text(
-                      'Video Background',
-                      style: TextStyle(
-                        color: AppColors.textTertiary.withOpacity(0.5),
-                        fontSize: 12,
-                      ),
-                    ),
-                  ],
-                ),
-              ),
-            );
-          } else {
-            // For image background, show the actual image
-            backgroundWidget = Image.file(
-              File(backgroundPath),
-              fit: BoxFit.cover,
-              width: double.infinity,
-              height: double.infinity,
-              errorBuilder: (_, __, ___) => Container(
-                color: AppColors.background,
-                child: Center(
-                  child: Icon(
-                    Icons.image_not_supported_outlined,
-                    size: 48,
-                    color: AppColors.textTertiary,
-                  ),
-                ),
-              ),
-            );
-          }
-
-          // Apply chroma key preview: stack background behind media
-          mediaWidget = _buildChromaKeyPreview(
+      if (keyed) {
+        // Tint only the subject, never the keyed-out (transparent) area.
+        mediaWidget = ColorFiltered(
+          colorFilter: ui.ColorFilter.mode(
+              _getFilterOverlayColor(colorFilter), BlendMode.srcATop),
+          child: mediaWidget,
+        );
+      } else {
+        mediaWidget = Stack(
+          fit: StackFit.expand,
+          children: [
             mediaWidget,
-            backgroundWidget,
-            chromaKeySettings,
-          );
-        }
+            Container(
+              color: _getFilterOverlayColor(colorFilter),
+            ),
+          ],
+        );
       }
     }
-    // ============ END CHROMA KEY PREVIEW ============
+
+    if (keyed) {
+      mediaWidget = ChromaComposite(
+        keyedMedia: mediaWidget,
+        settings: chroma,
+        localTime: provider.currentPosition - clip.startTime,
+        isPlaying: provider.isPlaying,
+      );
+    }
+    // ============ END GREEN SCREEN ============
 
     final crop = clip.cropRect;
     if (!applyCrop || crop == null) return mediaWidget;
@@ -2899,26 +2917,6 @@ class _VideoEditorScreenState extends State<VideoEditorScreen>
       (g * 255).toInt(),
       (b * 255).toInt(),
       opacity,
-    );
-  }
-
-  /// Build chroma key preview
-  /// Note: For real-time preview, we simply stack the background behind the video.
-  /// The actual green removal happens in the export using FFmpeg's chroma key filter
-  /// with our new HSV-based settings.
-  Widget _buildChromaKeyPreview(
-    Widget foreground,
-    Widget background,
-    ChromaKeySettings settings,
-  ) {
-    return Stack(
-      fit: StackFit.expand,
-      children: [
-        // Background at bottom
-        background,
-        // Video on top
-        foreground,
-      ],
     );
   }
 

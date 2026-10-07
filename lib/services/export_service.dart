@@ -17,6 +17,7 @@ import '../models/transition.dart';
 import '../models/video_effect.dart';
 import '../effects/effect_engine.dart';
 import '../utils/audio_fades.dart';
+import '../utils/chroma_key.dart';
 import '../utils/overlay_shapes.dart';
 import '../utils/sticker_catalog.dart';
 import '../utils/text_overlay_painter.dart';
@@ -596,15 +597,9 @@ class ExportService {
 
     // Check for chroma key settings
     final chromaKeySettings = clip.chromaKeySettings;
-    final hasChromaKey = chromaKeySettings != null &&
-        chromaKeySettings.enabled &&
-        chromaKeySettings.backgroundPath != null;
 
-    String? backgroundPath =
-        hasChromaKey ? chromaKeySettings.backgroundPath : null;
-
-    // ============ CHROMA KEY WITH BACKGROUND ============
-    if (hasChromaKey && backgroundPath != null) {
+    // ============ CHROMA KEY (background optional) ============
+    if (chromaKeySettings != null && chromaKeySettings.enabled) {
       return await _processClipWithChromaKey(
           clip,
           workDir,
@@ -617,8 +612,8 @@ class ExportService {
           sourceStartSeconds,
           durationSeconds,
           chromaKeySettings,
-          backgroundPath,
           outputPath,
+          colorFilter: colorFilter,
           forceKeyFrameAt: forceKeyFrameAt);
     }
     // ============ END CHROMA KEY ============
@@ -641,21 +636,16 @@ class ExportService {
         forceKeyFrameAt: forceKeyFrameAt);
   }
 
-  /// Process clip with chroma key (green screen) effect using a SINGLE FFmpeg pass.
+  /// Green-screen clip in a single FFmpeg pass, matching the editor preview:
   ///
-  /// WHY single pass: H.264/MP4 does not support alpha channels, so the old
-  /// 3-step approach (key → save → overlay) silently dropped the alpha channel
-  /// when writing the intermediate .mp4, making keyed pixels opaque black and
-  /// fully covering the background in step 3.
+  ///   [fg] crop → mirror → rotate → speed → RGBA → colorkey → despill →
+  ///        fit into the frame × subject scale → color filter (RGBA)
+  ///   [bg] background photo/video (cover, video loops) or black
+  ///   [bg][fg] overlay with the subject's centre at its position → yuv420p
   ///
-  /// WHY libx264 only: hardware encoders (h264_mediacodec) cannot accept the
-  /// YUVA frames that chromakey produces. libx264 accepts any pixel format and
-  /// will receive a composed yuv420p stream from the overlay filter.
-  ///
-  /// CORRECT filter chain:
-  ///   [fg]  apply transforms → chromakey (on raw YUV – NO format=rgba) → [fg_keyed]
-  ///   [bg]  scale/crop → [bg_ready]
-  ///   [bg_ready][fg_keyed] overlay → format=yuv420p → [out]
+  /// The key never has to survive an intermediate file (MP4 has no alpha):
+  /// it is composited in the same pass. libx264 is used because hardware
+  /// encoders reject the RGBA frames in the graph.
   static Future<String?> _processClipWithChromaKey(
       VideoClip clip,
       Directory workDir,
@@ -667,167 +657,161 @@ class ExportService {
       Function(double) onClipProgress,
       double sourceStartSeconds,
       double durationSeconds,
-      ChromaKeySettings chromaKeySettings,
-      String backgroundPath,
+      ChromaKeySettings settings,
       String outputPath,
-      {double? forceKeyFrameAt}) async {
+      {ColorFilter? colorFilter,
+      double? forceKeyFrameAt}) async {
     final inputPath = (clip.isReversed &&
-                clip.reversedFilePath != null &&
-                File(clip.reversedFilePath!).existsSync())
+            clip.reversedFilePath != null &&
+            File(clip.reversedFilePath!).existsSync())
         ? clip.reversedFilePath
         : (clip.videoFile?.path ?? clip.imageFile?.path);
     if (inputPath == null) return null;
 
-    // If chroma key is disabled fall through to normal processing
-    if (!chromaKeySettings.enabled ||
-        chromaKeySettings.backgroundPath == null) {
-      return _processClipComprehensiveNoChromaKey(
-          clip, workDir, index, targetWidth, targetHeight, targetFps,
-          _softwareEncoder, onClipProgress, sourceStartSeconds, durationSeconds,
-          outputPath, preset: 'ultrafast', forceKeyFrameAt: forceKeyFrameAt);
-    }
+    final graph = chromaKeyGraph(
+      settings: settings,
+      clip: clip,
+      targetWidth: targetWidth,
+      targetHeight: targetHeight,
+      targetFps: targetFps,
+      colorFilter: colorFilter,
+      backgroundPath: settings.backgroundPath != null &&
+              File(settings.backgroundPath!).existsSync()
+          ? settings.backgroundPath
+          : null,
+    );
 
-    final keyColorHex = chromaKeySettings.keyColorHex;
-    final similarity = chromaKeySettings.similarity.clamp(0.0, 0.6);
-    final blend = chromaKeySettings.blend.clamp(0.0, 0.5);
-    final scale = chromaKeySettings.scale.clamp(0.1, 3.0);
-    final position = chromaKeySettings.position;
-
-    final double speed = clip.playbackSpeed;
+    final double speed = clip.playbackSpeed <= 0 ? 1.0 : clip.playbackSpeed;
     final double outputDurationSeconds = durationSeconds / speed;
-    final bool isBgVideo =
-        _isVideoExtension(backgroundPath.split('.').last);
     final bool isFgImage = clip.mediaType == MediaType.image;
+    final bgPath = settings.backgroundPath;
+    final hasBg = bgPath != null && File(bgPath).existsSync();
+    final bool isBgVideo = hasBg && _isVideoExtension(bgPath.split('.').last);
 
-    // ── Build inputs ────────────────────────────────────────────────────────
-    // Input 0: foreground (green-screen clip)
-    // Input 1: background (image or video)
+    // Input 0: the green-screen clip; 1: background (or black); 2: silence.
     final String fgInput = isFgImage
         ? '-loop 1 -t $outputDurationSeconds -i "$inputPath"'
         : '-ss $sourceStartSeconds -t $durationSeconds -i "$inputPath"';
-
-    final String bgInput = isBgVideo
-        ? '-ss $sourceStartSeconds -t $durationSeconds -i "$backgroundPath"'
-        : '-loop 1 -t $outputDurationSeconds -i "$backgroundPath"';
-
-    // Input 2: silent audio (fallback when clip has no audio or is muted)
-    final String nullAudio =
-        '-f lavfi -t $outputDurationSeconds -i anullsrc=channel_layout=stereo:sample_rate=44100';
+    final String bgInput = !hasBg
+        ? '-f lavfi -t $outputDurationSeconds '
+            '-i color=c=black:s=${targetWidth}x$targetHeight:r=$targetFps'
+        : isBgVideo
+            // The preview loops a background video from the clip's start.
+            ? '-stream_loop -1 -t $outputDurationSeconds -i "$bgPath"'
+            : '-loop 1 -t $outputDurationSeconds -i "$bgPath"';
+    final String nullAudio = '-f lavfi -t $outputDurationSeconds '
+        '-i anullsrc=channel_layout=stereo:sample_rate=44100';
 
     final bool hasAudio = clip.mediaType == MediaType.video &&
         await _hasAudioStream(inputPath);
-
-    // ── Build filtergraph ───────────────────────────────────────────────────
-    final parts = <String>[];
-    String cur = '[0:v]';
-
-    // Crop (if specified)
-    if (clip.cropRect != null) {
-      final r = clip.cropRect!;
-      if (r.right <= 1.001) {
-        final w = (r.right - r.left).clamp(0.0, 1.0);
-        final h = (r.bottom - r.top).clamp(0.0, 1.0);
-        parts.add('${cur}crop=w=trunc(iw*$w/2)*2:h=trunc(ih*$h/2)*2'
-            ':x=trunc(iw*${r.left}):y=trunc(ih*${r.top})[ck_cropped]');
-        cur = '[ck_cropped]';
-      }
-    }
-
-    // Mirror
-    if (clip.isMirrored) {
-      parts.add('${cur}hflip[ck_mirrored]');
-      cur = '[ck_mirrored]';
-    }
-
-    // Rotation
-    if (clip.rotation != 0) {
-      final rot = clip.rotation % 360;
-      if ((rot - 90).abs() < 0.1) {
-        parts.add('${cur}transpose=1[ck_rot]');
-      } else if ((rot - 180).abs() < 0.1) {
-        parts.add('${cur}transpose=2,transpose=2[ck_rot]');
-      } else if ((rot - 270).abs() < 0.1) {
-        parts.add('${cur}transpose=2[ck_rot]');
-      } else {
-        parts.add("${cur}rotate=$rot*PI/180:fillcolor=black"
-            ":ow='hypot(iw,ih)':oh='hypot(iw,ih)'[ck_rot]");
-      }
-      cur = '[ck_rot]';
-    }
-
-    // Speed
-    if (speed != 1.0 && !isFgImage) {
-      parts.add('${cur}setpts=PTS/$speed[ck_speed]');
-      cur = '[ck_speed]';
-    }
-
-    // Scale foreground to fit canvas, applying the user-specified scale factor
-    final int scaledW = (targetWidth * scale).round();
-    final int scaledH = (targetHeight * scale).round();
-    parts.add('${cur}scale=w=$scaledW:h=$scaledH'
-        ':force_original_aspect_ratio=decrease'
-        ',pad=$scaledW:$scaledH:(ow-iw)/2:(oh-ih)/2:color=black@0'
-        ',setsar=1[ck_scaled]');
-    cur = '[ck_scaled]';
-
-    // Apply chromakey on YUV input (correct — no format=rgba before this)
-    parts.add('${cur}chromakey=0x$keyColorHex:$similarity:$blend[ck_keyed]');
-
-    // Background: scale to fill the full canvas
-    parts.add('[1:v]scale=w=$targetWidth:h=$targetHeight'
-        ':force_original_aspect_ratio=increase'
-        ',crop=$targetWidth:$targetHeight[ck_bg]');
-
-    // Composite: background under keyed foreground, then convert to yuv420p
-    final overlayX = '(W-w)*${position.dx}';
-    final overlayY = '(H-h)*${position.dy}';
-    parts.add('[ck_bg][ck_keyed]overlay=$overlayX:$overlayY:shortest=1'
-        ',fps=$targetFps,format=yuv420p[ck_out]');
-
-    final filterComplex = parts.join(';');
-
-    // ── Build audio handling ────────────────────────────────────────────────
-    final int audioInputIdx = 2; // nullAudio is always input index 2
     String audioMap;
     String audioFilter = '';
     if (isFgImage || clip.isMuted || !hasAudio) {
-      audioMap = '-map $audioInputIdx:a';
+      audioMap = '-map 2:a';
     } else {
       audioMap = '-map 0:a';
       final aFilters = <String>[];
       if (clip.volume != 1.0) aFilters.add('volume=${clip.volume}');
-      if (speed != 1.0) {
-        double ts = speed;
-        while (ts > 2.0) { aFilters.add('atempo=2.0'); ts /= 2.0; }
-        while (ts < 0.5) { aFilters.add('atempo=0.5'); ts *= 2.0; }
-        aFilters.add('atempo=$ts');
-      }
+      final tempo = _atempoChain(speed);
+      if (tempo.isNotEmpty) aFilters.add(tempo.substring(0, tempo.length - 1));
       if (aFilters.isNotEmpty) audioFilter = '-af "${aFilters.join(',')}"';
     }
 
-    // ── Single-pass command ─────────────────────────────────────────────────
-    // Both inputs + composite + encode in one FFmpeg invocation.
-    // libx264 is mandatory here: hardware encoders reject YUVA frames from
-    // chromakey, and alpha must not be stored in an intermediate file.
     final cmd = '-y $fgInput $bgInput $nullAudio '
-        '-filter_complex "$filterComplex" '
+        '-filter_complex "$graph" '
         '-map "[ck_out]" $audioMap $audioFilter '
         '-c:v $_softwareEncoder -preset ultrafast -tune fastdecode -threads 0 -crf $_crf -pix_fmt yuv420p '
-        '-c:a aac -ar 44100 -ac 2 -shortest '
+        '-c:a aac -ar 44100 -ac 2 -t ${_secs(outputDurationSeconds)} '
         '${forceKeyFrameAt != null ? '-force_key_frames ${_secs(forceKeyFrameAt)} ' : ''}'
         '"$outputPath"';
 
     final result = await _executeFFmpeg(cmd, onClipProgress,
         outputPath: outputPath, duration: outputDurationSeconds);
 
-    // If single-pass fails fall back to standard export (no chroma key)
+    // If the keyed pass fails, export the clip without the key rather than
+    // failing the whole export.
     if (result == null) {
       return _processClipComprehensiveNoChromaKey(
           clip, workDir, index, targetWidth, targetHeight, targetFps,
           _softwareEncoder, onClipProgress, sourceStartSeconds, durationSeconds,
-          outputPath, preset: 'ultrafast', forceKeyFrameAt: forceKeyFrameAt);
+          outputPath,
+          colorFilter: colorFilter,
+          preset: 'ultrafast',
+          forceKeyFrameAt: forceKeyFrameAt);
     }
     return result;
+  }
+
+  /// Filter graph for a green-screen clip (inputs: 0 = clip, 1 = background
+  /// or black, output pad `[ck_out]`).
+  @visibleForTesting
+  static String chromaKeyGraph({
+    required ChromaKeySettings settings,
+    required VideoClip clip,
+    required int targetWidth,
+    required int targetHeight,
+    required double targetFps,
+    ColorFilter? colorFilter,
+    String? backgroundPath,
+  }) {
+    final parts = <String>[];
+    final fg = <String>[];
+
+    final r = clip.cropRect;
+    if (r != null && r.right <= 1.001) {
+      final w = (r.right - r.left).clamp(0.0, 1.0);
+      final h = (r.bottom - r.top).clamp(0.0, 1.0);
+      fg.add('crop=w=trunc(iw*$w/2)*2:h=trunc(ih*$h/2)*2'
+          ':x=trunc(iw*${r.left}):y=trunc(ih*${r.top})');
+    }
+    if (clip.isMirrored) fg.add('hflip');
+    if (clip.rotation != 0) {
+      final rot = clip.rotation % 360;
+      if ((rot - 90).abs() < 0.1) {
+        fg.add('transpose=1');
+      } else if ((rot - 180).abs() < 0.1) {
+        fg.add('transpose=2,transpose=2');
+      } else if ((rot - 270).abs() < 0.1) {
+        fg.add('transpose=2');
+      } else {
+        fg.add("format=rgba,rotate=$rot*PI/180:fillcolor=black@0"
+            ":ow='hypot(iw,ih)':oh='hypot(iw,ih)'");
+      }
+    }
+    final speed = clip.playbackSpeed <= 0 ? 1.0 : clip.playbackSpeed;
+    if ((speed - 1).abs() > 0.001 && clip.mediaType != MediaType.image) {
+      fg.add('setpts=PTS/$speed');
+    }
+    fg.add('format=rgba');
+    fg.add(keyFilters(settings));
+
+    // Fit into the frame, times the subject's scale.
+    final scale = settings.scale.clamp(0.1, 4.0);
+    final sw = _even(targetWidth * scale);
+    final sh = _even(targetHeight * scale);
+    fg.add('scale=w=$sw:h=$sh:force_original_aspect_ratio=decrease');
+    fg.add('pad=$sw:$sh:(ow-iw)/2:(oh-ih)/2:color=black@0');
+    fg.add('setsar=1');
+    if (colorFilter != null) {
+      fg.addAll(colorFilterSteps(colorFilter, keepAlpha: true));
+    }
+    parts.add('[0:v]${fg.join(',')}[ck_fg]');
+
+    if (backgroundPath != null) {
+      parts.add('[1:v]scale=w=$targetWidth:h=$targetHeight'
+          ':force_original_aspect_ratio=increase'
+          ',crop=$targetWidth:$targetHeight,setsar=1,fps=$targetFps[ck_bg]');
+    } else {
+      parts.add('[1:v]setsar=1[ck_bg]');
+    }
+
+    // The subject's centre sits at its position (0.5, 0.5 = centred).
+    final px = settings.position.dx.clamp(-0.5, 1.5);
+    final py = settings.position.dy.clamp(-0.5, 1.5);
+    parts.add('[ck_bg][ck_fg]overlay='
+        "x='W*${px.toStringAsFixed(4)}-w/2':y='H*${py.toStringAsFixed(4)}-h/2'"
+        ':eof_action=repeat,fps=$targetFps,format=yuv420p[ck_out]');
+    return parts.join(';');
   }
 
   /// Process clip without chroma key - extracted for reuse
@@ -912,55 +896,11 @@ class ExportService {
 
 
     // === BAKED COLOR FILTERS - matching preview exactly ===
-    if (colorFilter != null && colorFilter.hasFilters) {
-      final mat = _calculateColorMatrix(colorFilter);
-
-      // Simulate the UI's Stack overlay Container for Warmth/Tint!
-      // The preview UI overlays a colored container AFTER the ColorFilter. 
-      // We must mathematically blend this into the FFmpeg filters.
-      double ovR = 0.5; double ovG = 0.5; double ovB = 0.5;
-      if (colorFilter.warmth != 0.0) {
-        ovR += colorFilter.warmth * 0.2;
-        ovB -= colorFilter.warmth * 0.2;
-      }
-      if (colorFilter.tint != 0.0) {
-        ovG += colorFilter.tint * 0.1;
-      }
-      ovR = ovR.clamp(0.0, 1.0);
-      ovG = ovG.clamp(0.0, 1.0);
-      ovB = ovB.clamp(0.0, 1.0);
-
-      double opacity = 0.0;
-      if (colorFilter.warmth != 0.0) opacity += colorFilter.warmth.abs() * 0.2;
-      if (colorFilter.tint != 0.0) opacity += colorFilter.tint.abs() * 0.2;
-      opacity = opacity.clamp(0.0, 0.4);
-      final invAlpha = 1.0 - opacity;
-
-      // Channel multipliers → colorchannelmixer (scaled by (1 - opacity))
-      final rr = mat[0] * invAlpha; final rg = mat[1] * invAlpha; final rb = mat[2] * invAlpha;
-      final gr = mat[5] * invAlpha; final gg = mat[6] * invAlpha; final gb = mat[7] * invAlpha;
-      final br = mat[10] * invAlpha; final bg = mat[11] * invAlpha; final bb = mat[12] * invAlpha;
-
-      // Offsets: (originalOffset * invAlpha) + (overlayColorPixels * opacity)
-      final roVal = (mat[4] * invAlpha) + (ovR * 255.0 * opacity);
-      final goVal = (mat[9] * invAlpha) + (ovG * 255.0 * opacity);
-      final boVal = (mat[14] * invAlpha) + (ovB * 255.0 * opacity);
-
-      // Explicitly format to rgb24 BEFORE applying color multipliers and offsets.
-      filters.add('${inputFilter}format=rgb24[rgb_in]');
-      inputFilter = '[rgb_in]';
-
-      // Apply color channel mixing (RGB multipliers)
-      filters.add('${inputFilter}colorchannelmixer=rr=$rr:rg=$rg:rb=$rb:gr=$gr:gg=$gg:gb=$gb:br=$br:bg=$bg:bb=$bb[ccm_out]');
-      inputFilter = '[ccm_out]';
-
-      // Apply color offsets via SIMD-accelerated lookup table (lutrgb) instead of slow per-pixel geq
-      if (roVal.abs() > 0.001 || goVal.abs() > 0.001 || boVal.abs() > 0.001) {
-        final ro = roVal.toStringAsFixed(4);
-        final go = goVal.toStringAsFixed(4);
-        final bo = boVal.toStringAsFixed(4);
-        filters.add("${inputFilter}lutrgb=r='clip(val+$ro,0,255)':g='clip(val+$go,0,255)':b='clip(val+$bo,0,255)'[lut_out]");
-        inputFilter = '[lut_out]';
+    if (colorFilter != null) {
+      final steps = colorFilterSteps(colorFilter);
+      for (int i = 0; i < steps.length; i++) {
+        filters.add('$inputFilter${steps[i]}[cf$i]');
+        inputFilter = '[cf$i]';
       }
     }
     // === END BAKED COLOR FILTERS ===
@@ -1022,6 +962,64 @@ class ExportService {
 
     return await _executeFFmpeg(command, onClipProgress,
         outputPath: outputPath, duration: outputDurationSeconds);
+  }
+
+  /// FFmpeg filters baking a clip's color filter, matching the preview's
+  /// ColorFiltered matrix plus its warmth/tint overlay. With [keepAlpha]
+  /// the frame stays RGBA (green-screen clips), so keyed-out pixels stay
+  /// transparent.
+  @visibleForTesting
+  static List<String> colorFilterSteps(ColorFilter colorFilter,
+      {bool keepAlpha = false}) {
+    if (!colorFilter.hasFilters) return const [];
+    final mat = _calculateColorMatrix(colorFilter);
+
+    // The preview overlays a colored container AFTER the ColorFilter for
+    // warmth/tint; blend that into the same filters.
+    double ovR = 0.5;
+    double ovG = 0.5;
+    double ovB = 0.5;
+    if (colorFilter.warmth != 0.0) {
+      ovR += colorFilter.warmth * 0.2;
+      ovB -= colorFilter.warmth * 0.2;
+    }
+    if (colorFilter.tint != 0.0) {
+      ovG += colorFilter.tint * 0.1;
+    }
+    ovR = ovR.clamp(0.0, 1.0);
+    ovG = ovG.clamp(0.0, 1.0);
+    ovB = ovB.clamp(0.0, 1.0);
+
+    double opacity = 0.0;
+    if (colorFilter.warmth != 0.0) opacity += colorFilter.warmth.abs() * 0.2;
+    if (colorFilter.tint != 0.0) opacity += colorFilter.tint.abs() * 0.2;
+    opacity = opacity.clamp(0.0, 0.4);
+    final invAlpha = 1.0 - opacity;
+
+    // Channel multipliers → colorchannelmixer (scaled by (1 - opacity))
+    final rr = mat[0] * invAlpha, rg = mat[1] * invAlpha, rb = mat[2] * invAlpha;
+    final gr = mat[5] * invAlpha, gg = mat[6] * invAlpha, gb = mat[7] * invAlpha;
+    final br = mat[10] * invAlpha, bg = mat[11] * invAlpha, bb = mat[12] * invAlpha;
+
+    // Offsets: (originalOffset * invAlpha) + (overlayColorPixels * opacity)
+    final roVal = (mat[4] * invAlpha) + (ovR * 255.0 * opacity);
+    final goVal = (mat[9] * invAlpha) + (ovG * 255.0 * opacity);
+    final boVal = (mat[14] * invAlpha) + (ovB * 255.0 * opacity);
+
+    final steps = <String>[
+      keepAlpha ? 'format=rgba' : 'format=rgb24',
+      'colorchannelmixer=rr=$rr:rg=$rg:rb=$rb:gr=$gr:gg=$gg:gb=$gb'
+          ':br=$br:bg=$bg:bb=$bb',
+    ];
+    // Offsets via a lookup table (fast) instead of per-pixel geq.
+    if (roVal.abs() > 0.001 || goVal.abs() > 0.001 || boVal.abs() > 0.001) {
+      final ro = roVal.toStringAsFixed(4);
+      final go = goVal.toStringAsFixed(4);
+      final bo = boVal.toStringAsFixed(4);
+      steps.add("lutrgb=r='clip(val+$ro,0,255)':g='clip(val+$go,0,255)'"
+          ":b='clip(val+$bo,0,255)'");
+    }
+    return steps;
   }
 
   static Future<bool> _hasAudioStream(String path) async {
@@ -2667,6 +2665,14 @@ class ExportService {
         ':${s.blend.clamp(0.0, 1.0).toStringAsFixed(4)}';
   }
 
+  /// Colour key plus the optional edge clean-up ("despill"), exactly what
+  /// the preview shader does.
+  @visibleForTesting
+  static String keyFilters(ChromaKeySettings s) {
+    final despill = ChromaKey.despillFilter(s);
+    return despill == null ? colorKeyFilter(s) : '${colorKeyFilter(s)},$despill';
+  }
+
   /// Draws [paint] on a [width] x [height] transparent canvas and writes a
   /// PNG. Returns null on failure.
   static Future<File?> _writeCanvasPng(int width, int height,
@@ -2702,18 +2708,27 @@ class ExportService {
     final kr = s.keyColor.r, kg = s.keyColor.g, kb = s.keyColor.b;
     final sim = s.similarity.clamp(0.0, 1.0);
     final blend = s.blend.clamp(0.0, 1.0);
+    final despill = ChromaKey.despillMode(s);
     for (int i = 0; i < src.length; i += 4) {
-      final r = src[i] / 255.0, g = src[i + 1] / 255.0, b = src[i + 2] / 255.0;
+      final r = src[i] / 255.0;
+      var g = src[i + 1] / 255.0;
+      var b = src[i + 2] / 255.0;
       final dr = r - kr, dg = g - kg, db = b - kb;
       final diff = math.sqrt((dr * dr + dg * dg + db * db) / 3.0);
       final k = blend > 0.0001
           ? ((diff - sim) / blend).clamp(0.0, 1.0)
           : (diff > sim ? 1.0 : 0.0);
+      // Edge clean-up, as FFmpeg's despill / the preview shader.
+      if (despill == 1) {
+        g = math.max(0.0, g - math.max(0.0, g - 0.5 * r - 0.5 * b));
+      } else if (despill == 2) {
+        b = math.max(0.0, b - math.max(0.0, b - 0.5 * r - 0.5 * g));
+      }
       final a = src[i + 3] / 255.0 * k;
       // rgba8888 is premultiplied.
-      out[i] = (src[i] * a).round();
-      out[i + 1] = (src[i + 1] * a).round();
-      out[i + 2] = (src[i + 2] * a).round();
+      out[i] = (r * 255 * a).round();
+      out[i + 1] = (g * 255 * a).round();
+      out[i + 2] = (b * 255 * a).round();
       out[i + 3] = (a * 255).round();
     }
     final completer = Completer<ui.Image>();
@@ -2937,7 +2952,7 @@ class ExportService {
           }
           if (o.isMirrored) f.write('hflip,');
           f.write('format=rgba,');
-          if (keyed) f.write('${colorKeyFilter(key)},');
+          if (keyed) f.write('${keyFilters(key)},');
           f.write(masked
               ? 'scale=$bw:$bh:force_original_aspect_ratio=increase,'
                   'crop=$bw:$bh,'
@@ -2985,49 +3000,168 @@ class ExportService {
     return layers;
   }
 
-  /// Animated GIF sticker → motion layer (the GIF plays, looping, for the
-  /// sticker's whole duration).
-  static Future<_ComposeLayer?> _gifStickerLayer(VideoProject project,
-      StickerModel st, int targetWidth, int targetHeight, double fps) async {
+  /// Sticker → motion layer, for animated GIFs (the GIF plays, looping,
+  /// for the sticker's whole duration) and for stickers with motion
+  /// keyframes. The tile is the picture at its largest size, unrotated.
+  static Future<_ComposeLayer?> _stickerMotionLayer(
+      VideoProject project,
+      StickerModel st,
+      int index,
+      Directory workDir,
+      int targetWidth,
+      int targetHeight,
+      double fps) async {
     final start = st.startTime.inMilliseconds / 1000.0;
     final end = st.endTime.inMilliseconds / 1000.0;
     if (end <= start) return null;
     final img = await _loadStickerImage(st.assetPath);
     if (img == null) return null;
     final aspect = img.width / math.max(1, img.height);
-    img.dispose();
     final area =
         await _clipAreaAt(project, st.startTime, targetWidth, targetHeight);
     final s = area.height / 1920.0;
-    final side = _stickerBaseSize * st.scale * s;
+    final frames = st.keyframes;
+    final maxScale = frames.isEmpty
+        ? st.scale
+        : frames.map((k) => k.size).reduce(math.max);
+    final side = _stickerBaseSize * maxScale * s;
     final bw = _even(aspect >= 1 ? side : side * aspect);
     final bh = _even(aspect >= 1 ? side / aspect : side);
-    final file = StickerCatalog.resolve(st.assetPath);
     final dur = end - start;
-    return _ComposeLayer.motion(_MotionLayer(
-      inputs: ['-ignore_loop 0 -t ${_secs(dur)} -i "$file"'],
-      tileGraph: (idx, out) => '[${idx[0]}:v]setpts=PTS-STARTPTS,'
+
+    // Centre (output px) of a normalized sticker position.
+    (double, double) centre(Offset p) =>
+        (area.left + p.dx * area.width, area.top + p.dy * area.height);
+    final motionPath = frames.isEmpty
+        ? [(0.0, centre(st.position).$1, centre(st.position).$2, st.scale / maxScale)]
+        : [
+            for (final k in frames)
+              (
+                k.time.inMicroseconds / 1e6,
+                centre(k.position).$1,
+                centre(k.position).$2,
+                k.size / maxScale,
+              )
+          ];
+
+    List<String> inputs;
+    String Function(List<int>, String) tileGraph;
+    if (st.isAnimated) {
+      img.dispose();
+      final file = StickerCatalog.resolve(st.assetPath);
+      inputs = ['-ignore_loop 0 -t ${_secs(dur)} -i "$file"'];
+      tileGraph = (idx, out) => '[${idx[0]}:v]setpts=PTS-STARTPTS,'
           'fps=${_n(fps)},format=rgba,scale=$bw:$bh,setsar=1'
-          '${st.flipX ? ',hflip' : ''}[$out];',
+          '${st.flipX ? ',hflip' : ''}[$out];';
+    } else {
+      final tile = await _writeCanvasPng(bw, bh, (c) {
+        final box = Rect.fromLTWH(0, 0, bw.toDouble(), bh.toDouble());
+        if (st.flipX) {
+          c.translate(bw.toDouble(), 0);
+          c.scale(-1, 1);
+        }
+        c.drawImageRect(
+          img,
+          Rect.fromLTWH(0, 0, img.width.toDouble(), img.height.toDouble()),
+          box,
+          Paint()..filterQuality = FilterQuality.high,
+        );
+      }, path.join(workDir.path, 'sticker_tile_$index.png'));
+      img.dispose();
+      if (tile == null) return null;
+      inputs = [
+        '-loop 1 -framerate ${_n(fps)} -t ${_secs(dur)} -i "${tile.path}"'
+      ];
+      tileGraph = (idx, out) => '[${idx[0]}:v]format=rgba[$out];';
+    }
+
+    return _ComposeLayer.motion(_MotionLayer(
+      inputs: inputs,
+      tileGraph: tileGraph,
       tileW: bw,
       tileH: bh,
       start: start,
       end: end,
-      path: [
-        (
-          0.0,
-          area.left + st.position.dx * area.width,
-          area.top + st.position.dy * area.height,
-          1.0,
-        )
-      ],
+      path: motionPath,
       rotationDeg: st.rotation * 180 / math.pi,
       opacity: st.opacity.clamp(0.0, 1.0).toDouble(),
       animIn: st.animIn,
       animOut: st.animOut,
       animSeconds: TextAnimations.secondsFor(dur),
       animScale: s,
-      isVideo: true,
+      isVideo: st.isAnimated,
+    ));
+  }
+
+  /// Text with motion keyframes → motion layer. The text is drawn once at
+  /// its largest font size and scaled along the keyframes (text size grows
+  /// in proportion to the font size).
+  static Future<_ComposeLayer?> _textMotionLayer(
+      VideoProject project,
+      TextOverlay t,
+      int index,
+      Directory workDir,
+      int targetWidth,
+      int targetHeight,
+      double fps) async {
+    final start = t.startTime.inMilliseconds / 1000.0;
+    final end = t.endTime.inMilliseconds / 1000.0;
+    if (end <= start) return null;
+    try {
+      await GoogleFonts.pendingFonts(TextOverlayPainter(t).styles);
+    } catch (_) {}
+    final clipAspect = await _getClipAspectRatio(project, t.startTime);
+    final area =
+        await _clipAreaAt(project, t.startTime, targetWidth, targetHeight);
+    final designWidth = (1920.0 * clipAspect).round().clamp(1, 4096).toDouble();
+    final s = area.height / 1920.0;
+    final frames = t.keyframes;
+    final maxFont = frames.map((k) => k.size).reduce(math.max);
+    final painter = TextOverlayPainter(t, fontSize: maxFont);
+    final size = painter.size;
+    final tileW = _even(size.width * s + 4);
+    final tileH = _even(size.height * s + 4);
+    final tile = await _writeCanvasPng(tileW, tileH, (c) {
+      c.translate(tileW / 2, tileH / 2);
+      c.scale(s);
+      painter.paint(c, -size.center(Offset.zero));
+    }, path.join(workDir.path, 'text_tile_$index.png'));
+    if (tile == null) return null;
+
+    // The preview draws the text 7 canvas px inside its box (3 px border +
+    // 4 px padding), top-left at the keyframe position.
+    const inset = 7.0;
+    final motionPath = [
+      for (final k in frames)
+        () {
+          final ks = TextOverlayPainter(t, fontSize: k.size).size;
+          final cx = k.position.dx * designWidth + inset + ks.width / 2;
+          final cy = k.position.dy * 1920.0 + inset + ks.height / 2;
+          return (
+            k.time.inMicroseconds / 1e6,
+            area.left + cx * s,
+            area.top + cy * s,
+            size.width <= 0 ? 1.0 : ks.width / size.width,
+          );
+        }()
+    ];
+    return _ComposeLayer.motion(_MotionLayer(
+      inputs: [
+        '-loop 1 -framerate ${_n(fps)} -t ${_secs(end - start)} '
+            '-i "${tile.path}"'
+      ],
+      tileGraph: (idx, out) => '[${idx[0]}:v]format=rgba[$out];',
+      tileW: tileW,
+      tileH: tileH,
+      start: start,
+      end: end,
+      path: motionPath,
+      rotationDeg: t.rotation,
+      opacity: t.opacity.clamp(0.0, 1.0).toDouble(),
+      animIn: t.animIn,
+      animOut: t.animOut,
+      animSeconds: TextAnimations.seconds(t),
+      animScale: s,
     ));
   }
 
@@ -3070,6 +3204,20 @@ class ExportService {
     final f = <String>['format=rgba'];
     var w = m.tileW.toDouble();
     var h = m.tileH.toDouble();
+
+    // Typewriter (text): reveal the tile left to right, before rotating it
+    // like the preview does. T is the tile's local time.
+    var reveal = '';
+    if (m.animSeconds > 0) {
+      final ds = _secs(m.animSeconds);
+      final len = _secs(math.max(1e-3, m.end - m.start));
+      if (m.animIn == 'typewriter') reveal += '*clip(T/$ds,0,1)';
+      if (m.animOut == 'typewriter') reveal += '*clip(($len-T)/$ds,0,1)';
+    }
+    if (reveal.isNotEmpty) {
+      f.add("geq=r='r(X,Y)':g='g(X,Y)':b='b(X,Y)'"
+          ":a='if(lt(X,W*(1$reveal)),alpha(X,Y),0)'");
+    }
 
     // Rotation (degrees, clockwise like Transform.rotate).
     var rot = m.rotationDeg % 360;
@@ -3215,6 +3363,14 @@ class ExportService {
       final start = t.startTime.inMilliseconds / 1000.0;
       final end = t.endTime.inMilliseconds / 1000.0;
       if (end <= start) continue;
+      if (t.keyframeData.isNotEmpty) {
+        final moving = await _textMotionLayer(
+            project, t, i, workDir, targetWidth, targetHeight, targetFps);
+        if (moving != null) {
+          layers.add(moving);
+          continue;
+        }
+      }
       final clipAspect = await _getClipAspectRatio(project, t.startTime);
       final area =
           await _clipAreaAt(project, t.startTime, targetWidth, targetHeight);
@@ -3237,11 +3393,12 @@ class ExportService {
       final start = s.startTime.inMilliseconds / 1000.0;
       final end = s.endTime.inMilliseconds / 1000.0;
       if (end <= start) continue;
-      if (s.isAnimated) {
-        final gif = await _gifStickerLayer(
-            project, s, targetWidth, targetHeight, targetFps);
-        if (gif != null) {
-          layers.add(gif);
+      // GIFs and moving stickers go through the motion pipeline.
+      if (s.isAnimated || s.keyframeData.isNotEmpty) {
+        final moving = await _stickerMotionLayer(
+            project, s, i, workDir, targetWidth, targetHeight, targetFps);
+        if (moving != null) {
+          layers.add(moving);
           continue;
         }
       }

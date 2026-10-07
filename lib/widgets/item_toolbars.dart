@@ -105,7 +105,7 @@ class OverlayItemToolbar extends StatelessWidget {
           () => ItemSheets.overlayAnimation(context, id),
           badge: _animBadge(clip.animIn, clip.animOut)),
       ToolbarTool(Icons.route_rounded, 'Motion',
-          () => ItemSheets.overlayMotion(context, id),
+          () => ItemSheets.motion(context, TimelineItemKind.overlay, id),
           badge: keyframes > 0 ? '$keyframes' : null, highlight: true),
       ToolbarTool(Icons.layers_outlined, 'Layer',
           () => ItemSheets.overlayLayer(context, id),
@@ -158,6 +158,12 @@ class TextItemToolbar extends StatelessWidget {
           badge: overlay.rotation.abs() > 0.5
               ? '${overlay.rotation.round()}°'
               : null),
+      ToolbarTool(Icons.route_rounded, 'Motion',
+          () => ItemSheets.motion(context, TimelineItemKind.text, id),
+          badge: overlay.keyframes.isNotEmpty
+              ? '${overlay.keyframes.length}'
+              : null,
+          highlight: true),
       ToolbarTool(Icons.copy_rounded, 'Duplicate', () {
         provider.duplicateTextOverlay(id);
         _snack(context, 'Text duplicated');
@@ -208,6 +214,12 @@ class StickerItemToolbar extends StatelessWidget {
       ToolbarTool(Icons.animation_rounded, 'Animate',
           () => ItemSheets.stickerAnimation(context, id),
           badge: _animBadge(sticker.animIn, sticker.animOut)),
+      ToolbarTool(Icons.route_rounded, 'Motion',
+          () => ItemSheets.motion(context, TimelineItemKind.sticker, id),
+          badge: sticker.keyframes.isNotEmpty
+              ? '${sticker.keyframes.length}'
+              : null,
+          highlight: true),
       ToolbarTool(Icons.layers_outlined, 'Layer',
           () => ItemSheets.stickerLayer(context, id)),
       ToolbarTool(Icons.copy_rounded, 'Duplicate', () {
@@ -827,28 +839,36 @@ class ItemSheets {
         },
       );
 
-  static Future<void> overlayMotion(BuildContext context, String id) => _show(
+  /// Motion keyframes for a media overlay, text or sticker.
+  static Future<void> motion(
+          BuildContext context, TimelineItemKind kind, String id) =>
+      _show(
         context,
         title: 'Motion',
         icon: Icons.route_rounded,
         builder: (p) {
-          final c = p.overlayClipById(id);
-          if (c == null) return null;
-          final frames = c.keyframes;
-          final here = p.overlayHasKeyframeAtPlayhead(id);
-          final inside = p.currentPosition >= c.startTime &&
-              p.currentPosition <= c.endTime;
+          final span = p.itemSpan(kind, id);
+          if (span == null) return null;
+          final count = p.keyframeCount(kind, id);
+          final here = p.hasKeyframeAtPlayhead(kind, id);
+          final inside =
+              p.currentPosition >= span.$1 && p.currentPosition <= span.$2;
+          final what = switch (kind) {
+            TimelineItemKind.text => 'text',
+            TimelineItemKind.sticker => 'sticker',
+            _ => 'overlay',
+          };
           return Column(
             crossAxisAlignment: CrossAxisAlignment.start,
             children: [
               Text(
-                frames.isEmpty
-                    ? 'Make the overlay move: add a keyframe, move the '
-                        'playhead, then drag or pinch the overlay. It glides '
+                count == 0
+                    ? 'Make the $what move: add a keyframe, move the '
+                        'playhead, then drag or pinch the $what. It glides '
                         'between keyframes.'
-                    : '${frames.length} keyframes. With the playhead on the '
-                        'overlay, dragging or pinching it sets a keyframe '
-                        'at that moment.',
+                    : '$count keyframes. With the playhead on the $what, '
+                        'dragging or pinching it sets a keyframe at that '
+                        'moment.',
                 style: TextStyle(color: AppColors.textSecondary),
               ),
               const SizedBox(height: 14),
@@ -858,21 +878,21 @@ class ItemSheets {
                 children: [
                   FilledButton.icon(
                     onPressed: inside && !here
-                        ? () => p.addOverlayKeyframeAtPlayhead(id)
+                        ? () => p.addKeyframeAtPlayhead(kind, id)
                         : null,
                     icon: const Icon(Icons.add_rounded),
                     label: const Text('Keyframe here'),
                   ),
                   OutlinedButton.icon(
-                    onPressed:
-                        here ? () => p.removeOverlayKeyframeAtPlayhead(id) : null,
+                    onPressed: here
+                        ? () => p.removeKeyframeAtPlayhead(kind, id)
+                        : null,
                     icon: const Icon(Icons.remove_rounded),
                     label: const Text('Remove here'),
                   ),
                   TextButton.icon(
-                    onPressed: frames.isEmpty
-                        ? null
-                        : () => p.clearOverlayKeyframes(id),
+                    onPressed:
+                        count == 0 ? null : () => p.clearKeyframes(kind, id),
                     icon: const Icon(Icons.clear_all_rounded),
                     label: const Text('Clear motion'),
                   ),
@@ -881,7 +901,7 @@ class ItemSheets {
               if (!inside)
                 Padding(
                   padding: const EdgeInsets.only(top: 8),
-                  child: Text('Move the playhead onto the overlay first.',
+                  child: Text('Move the playhead onto the $what first.',
                       style: TextStyle(
                           color: AppColors.textTertiary, fontSize: 12)),
                 ),

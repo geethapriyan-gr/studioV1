@@ -495,6 +495,29 @@ class _TimelineWidgetState extends State<TimelineWidget>
     }
   }
 
+  /// Diamonds marking motion keyframes along an item block [width] wide.
+  List<Widget> _keyframeMarkers(Iterable<Duration> times, double width) => [
+        for (final t in times)
+          Positioned(
+            left: (_durationToPixels(t) - 5)
+                .clamp(0.0, math.max(0.0, width - 10)),
+            bottom: 3,
+            child: IgnorePointer(
+              child: Transform.rotate(
+                angle: math.pi / 4,
+                child: Container(
+                  width: 8,
+                  height: 8,
+                  decoration: BoxDecoration(
+                    color: AppColors.warning,
+                    border: Border.all(color: Colors.black54, width: 1),
+                  ),
+                ),
+              ),
+            ),
+          ),
+      ];
+
   void _finalizeTextTrim() {
     // Finalize any remaining accumulated delta
     if (_textTrimAccumulatedDeltaMs != 0) {
@@ -1410,6 +1433,8 @@ class _TimelineWidgetState extends State<TimelineWidget>
               ),
             ),
           ),
+          // Motion keyframes
+          ..._keyframeMarkers(sticker.keyframes.map((k) => k.time), width),
           if (isSelected) ...[
             // Left trim handle
             Positioned(
@@ -2804,6 +2829,8 @@ class _TimelineWidgetState extends State<TimelineWidget>
               ),
             ),
           ),
+          // Motion keyframes
+          ..._keyframeMarkers(overlay.keyframes.map((k) => k.time), width),
           if (isSelected) ...[
             // Left trim handle
             Positioned(

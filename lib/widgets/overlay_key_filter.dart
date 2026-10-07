@@ -3,6 +3,7 @@ import 'dart:ui' as ui;
 import 'package:flutter/material.dart';
 
 import '../models/chroma_key_settings.dart';
+import '../utils/chroma_key.dart';
 
 /// Removes a key colour (green screen) from its child, live, using the same
 /// formula as the exporter's FFmpeg `colorkey` filter.
@@ -79,7 +80,8 @@ class _OverlayKeyFilterState extends State<OverlayKeyFilter> {
       ..setFloat(3, s.keyColor.g)
       ..setFloat(4, s.keyColor.b)
       ..setFloat(5, s.similarity.clamp(0.0, 1.0))
-      ..setFloat(6, s.blend.clamp(0.0, 1.0));
+      ..setFloat(6, s.blend.clamp(0.0, 1.0))
+      ..setFloat(7, ChromaKey.despillMode(s).toDouble());
     return ImageFiltered(
       imageFilter: ui.ImageFilter.shader(shader),
       child: widget.child,

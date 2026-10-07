@@ -1,12 +1,24 @@
 import 'dart:io';
-import 'package:flutter/material.dart';
-import 'package:provider/provider.dart';
-import 'package:path/path.dart' as p;
-import '../providers/video_editor_provider.dart';
-import '../services/media_picker_service.dart';
-import '../main.dart' show AppColors;
-import 'modern_slider.dart';
+import 'dart:typed_data';
 
+import 'package:file_picker/file_picker.dart';
+import 'package:flutter/material.dart';
+import 'package:flutter/services.dart';
+import 'package:provider/provider.dart';
+
+import '../main.dart' show AppColors;
+import '../models/chroma_key_settings.dart';
+import '../providers/video_editor_provider.dart';
+import '../services/video_thumbnail_service.dart';
+import '../utils/chroma_key.dart';
+
+/// Green screen panel for the selected clip.
+///
+/// Live and non-destructive: the preview shows the key as you change it and
+/// the export renders exactly that. Three steps — the colour to remove (auto,
+/// tap it in the preview, or a preset), how strongly to remove it, and what
+/// shows behind. The subject is moved and sized by dragging and pinching it
+/// in the preview.
 class ChromaKeyEditor extends StatefulWidget {
   const ChromaKeyEditor({super.key});
 
@@ -15,275 +27,138 @@ class ChromaKeyEditor extends StatefulWidget {
 }
 
 class _ChromaKeyEditorState extends State<ChromaKeyEditor> {
+  bool _detecting = false;
+  List<String> _library = const [];
+
+  static const _presets = [
+    ('Green', Color(0xFF00FF00)),
+    ('Studio green', Color(0xFF00B140)),
+    ('Blue', Color(0xFF0047BB)),
+  ];
+
+  @override
+  void initState() {
+    super.initState();
+    _loadLibrary();
+  }
+
+  Future<void> _loadLibrary() async {
+    try {
+      final manifest = await AssetManifest.loadFromAssetBundle(rootBundle);
+      final images = manifest
+          .listAssets()
+          .where((a) => a.startsWith('assets/image-library/'))
+          .toList()
+        ..sort();
+      if (mounted) setState(() => _library = images);
+    } catch (_) {}
+  }
+
+  void _snack(String text) {
+    ScaffoldMessenger.of(context)
+      ..hideCurrentSnackBar()
+      ..showSnackBar(SnackBar(content: Text(text)));
+  }
+
+  Future<void> _autoDetect(VideoEditorProvider provider) async {
+    setState(() => _detecting = true);
+    final color = await provider.autoDetectChromaColor();
+    if (!mounted) return;
+    setState(() => _detecting = false);
+    if (color == null) {
+      _snack('No green or blue screen found at the edges — '
+          'tap "Pick" and tap the background instead.');
+    } else {
+      HapticFeedback.lightImpact();
+    }
+  }
+
+  Future<void> _pickBackground(
+      VideoEditorProvider provider, bool isVideo) async {
+    try {
+      final result = await FilePicker.platform.pickFiles(
+        type: isVideo ? FileType.video : FileType.image,
+      );
+      final path = result?.files.single.path;
+      if (path == null) return;
+      await provider.setChromaKeyBackground(File(path));
+    } catch (e) {
+      if (mounted) _snack('Could not use that file: $e');
+    }
+  }
+
   @override
   Widget build(BuildContext context) {
     return Consumer<VideoEditorProvider>(
-      builder: (context, provider, child) {
-        final settings = provider.currentChromaKeySettings;
-        final backgrounds = provider.chromaKeyBackgrounds;
-        final activeBackground = provider.activeChromaKeyBackgroundPath;
-
+      builder: (context, provider, _) {
+        final hasClip = provider.selectedVideoClipId != null;
+        final s = provider.currentChromaKeySettings ??
+            ChromaKey.defaults.copyWith(enabled: false);
+        final on = s.enabled;
         return Container(
           color: AppColors.surface,
           child: Column(
-            mainAxisSize: MainAxisSize.min,
             children: [
-              // ── Header ──────────────────────────────────────────────────
-              Padding(
-                padding:
-                    const EdgeInsets.symmetric(horizontal: 12, vertical: 8),
-                child: Row(
-                  mainAxisAlignment: MainAxisAlignment.spaceBetween,
-                  children: [
-                    Text(
-                      'Chroma Key',
-                      style: TextStyle(
-                        color: AppColors.textPrimary,
-                        fontWeight: FontWeight.w600,
-                        fontSize: 13,
-                      ),
-                    ),
-                    IconButton(
-                      icon: Icon(Icons.refresh,
-                          color: AppColors.textTertiary, size: 18),
-                      onPressed: () => provider.resetChromaKey(),
-                      tooltip: 'Reset',
-                      padding: const EdgeInsets.all(6),
-                      constraints:
-                          const BoxConstraints(minWidth: 32, minHeight: 32),
-                    ),
-                  ],
-                ),
-              ),
-
-              // ── Scrollable body ──────────────────────────────────────────
+              _header(provider, on, hasClip),
               Expanded(
-                child: SingleChildScrollView(
-                  padding: const EdgeInsets.symmetric(horizontal: 12),
-                  child: Column(
-                    mainAxisSize: MainAxisSize.min,
-                    crossAxisAlignment: CrossAxisAlignment.start,
-                    children: [
-                      const SizedBox(height: 4),
-
-                      // ── Background Section ────────────────────────────────
-                      Text(
-                        'Background',
-                        style: TextStyle(
-                            color: AppColors.textTertiary, fontSize: 11),
-                      ),
-                      const SizedBox(height: 10),
-
-                      // Upload buttons
-                      Row(
+                child: !hasClip
+                    ? Center(
+                        child: Text('Select a clip to use green screen.',
+                            style: TextStyle(color: AppColors.textTertiary)),
+                      )
+                    : ListView(
+                        padding: const EdgeInsets.fromLTRB(14, 4, 14, 18),
                         children: [
-                          Expanded(
-                            child: _buildActionButton(
-                              icon: Icons.image_outlined,
-                              label: 'Upload Image',
-                              onPressed: () =>
-                                  _pickBackground(isVideo: false),
-                            ),
+                          _stepTitle('1', 'Colour to remove'),
+                          _colourRow(provider, s),
+                          if (provider.chromaPickMode) _pickHint(),
+                          const SizedBox(height: 16),
+                          _stepTitle('2', 'Adjust'),
+                          _slider(
+                            label: 'Strength',
+                            hint: 'Higher removes more of the colour',
+                            value: s.similarity,
+                            min: 0.02,
+                            max: 0.7,
+                            enabled: on,
+                            onChanged: (v) => provider.updateChromaKeySettings(
+                                similarity: v, undoKey: 'chroma-strength'),
                           ),
-                          const SizedBox(width: 8),
-                          Expanded(
-                            child: _buildActionButton(
-                              icon: Icons.videocam_outlined,
-                              label: 'Upload Video',
-                              onPressed: () =>
-                                  _pickBackground(isVideo: true),
-                            ),
+                          _slider(
+                            label: 'Edge softness',
+                            hint: 'Smooths the outline (hair, motion blur)',
+                            value: s.blend,
+                            min: 0.0,
+                            max: 0.4,
+                            enabled: on,
+                            onChanged: (v) => provider.updateChromaKeySettings(
+                                blend: v, undoKey: 'chroma-softness'),
                           ),
+                          if (ChromaKey.canDespill(s.keyColor))
+                            SwitchListTile(
+                              dense: true,
+                              contentPadding: EdgeInsets.zero,
+                              title: Text('Clean up coloured edges',
+                                  style:
+                                      TextStyle(color: AppColors.textPrimary)),
+                              subtitle: Text(
+                                  'Removes the screen\'s tint from hair and edges',
+                                  style: TextStyle(
+                                      color: AppColors.textTertiary,
+                                      fontSize: 11)),
+                              value: s.spillReduction > 0.5,
+                              onChanged: on
+                                  ? (v) => provider.updateChromaKeySettings(
+                                      spillReduction: v ? 1.0 : 0.0)
+                                  : null,
+                            ),
+                          const SizedBox(height: 12),
+                          _stepTitle('3', 'Background'),
+                          _backgroundRow(provider, s),
+                          const SizedBox(height: 16),
+                          _subjectCard(provider, s, on),
                         ],
                       ),
-                      const SizedBox(height: 12),
-
-                      // Current background preview
-                      if (activeBackground != null) ...[
-                        _buildBackgroundPreview(activeBackground, provider),
-                        const SizedBox(height: 12),
-                      ],
-
-                      // Available backgrounds list
-                      if (backgrounds.isNotEmpty) ...[
-                        Text(
-                          'Available Backgrounds',
-                          style: TextStyle(
-                              color: AppColors.textTertiary, fontSize: 11),
-                        ),
-                        const SizedBox(height: 8),
-                        SizedBox(
-                          height: 80,
-                          child: ListView.builder(
-                            scrollDirection: Axis.horizontal,
-                            itemCount: backgrounds.length,
-                            itemBuilder: (context, index) {
-                              final path = backgrounds[index];
-                              final isSelected = path == activeBackground;
-                              final isVideo =
-                                  provider.isChromaKeyBackgroundVideo(path);
-                              return _buildBackgroundThumbnail(
-                                path,
-                                isSelected,
-                                isVideo,
-                                () => _selectBackground(path),
-                                () => _removeBackground(path),
-                              );
-                            },
-                          ),
-                        ),
-                        const SizedBox(height: 12),
-                      ],
-
-                      Container(height: 1, color: AppColors.border),
-                      const SizedBox(height: 16),
-
-                      // ── Key Color Section ─────────────────────────────────
-                      Text(
-                        'Key Color',
-                        style: TextStyle(
-                            color: AppColors.textTertiary, fontSize: 11),
-                      ),
-                      const SizedBox(height: 10),
-                      _buildColorPicker(settings?.keyColor, provider),
-
-                      const SizedBox(height: 16),
-                      Container(height: 1, color: AppColors.border),
-                      const SizedBox(height: 16),
-
-                      // ── Keying Parameters ─────────────────────────────────
-                      Text(
-                        'Keying Parameters',
-                        style: TextStyle(
-                            color: AppColors.textTertiary, fontSize: 11),
-                      ),
-                      const SizedBox(height: 12),
-
-                      ModernSlider(
-                        value: settings?.similarity ?? 0.3,
-                        min: 0.0,
-                        max: 0.6,
-                        divisions: 60,
-                        label: 'Similarity  (how aggressively the key color is removed)',
-                        onChanged: (value) =>
-                            provider.updateChromaKeySettings(
-                                similarity: value),
-                      ),
-                      const SizedBox(height: 12),
-
-                      ModernSlider(
-                        value: settings?.blend ?? 0.05,
-                        min: 0.0,
-                        max: 0.5,
-                        divisions: 50,
-                        label: 'Blend  (edge softness / feathering)',
-                        onChanged: (value) =>
-                            provider.updateChromaKeySettings(blend: value),
-                      ),
-
-                      const SizedBox(height: 16),
-                      Container(height: 1, color: AppColors.border),
-                      const SizedBox(height: 16),
-
-                      // ── Position & Scale ──────────────────────────────────
-                      Text(
-                        'Position & Scale',
-                        style: TextStyle(
-                            color: AppColors.textTertiary, fontSize: 11),
-                      ),
-                      const SizedBox(height: 12),
-
-                      ModernSlider(
-                        value: settings?.position.dx ?? 0.5,
-                        min: 0.0,
-                        max: 1.0,
-                        divisions: 100,
-                        label: 'Position X',
-                        onChanged: (value) =>
-                            provider.updateChromaKeySettings(
-                          position: Offset(
-                              value, settings?.position.dy ?? 0.5),
-                        ),
-                      ),
-                      const SizedBox(height: 12),
-
-                      ModernSlider(
-                        value: settings?.position.dy ?? 0.5,
-                        min: 0.0,
-                        max: 1.0,
-                        divisions: 100,
-                        label: 'Position Y',
-                        onChanged: (value) =>
-                            provider.updateChromaKeySettings(
-                          position: Offset(
-                              settings?.position.dx ?? 0.5, value),
-                        ),
-                      ),
-                      const SizedBox(height: 12),
-
-                      ModernSlider(
-                        value: settings?.scale ?? 1.0,
-                        min: 0.1,
-                        max: 3.0,
-                        divisions: 100,
-                        label: 'Scale',
-                        onChanged: (value) =>
-                            provider.updateChromaKeySettings(scale: value),
-                      ),
-
-                      const SizedBox(height: 16),
-                      Container(height: 1, color: AppColors.border),
-                      const SizedBox(height: 16),
-
-                      // ── Tips ──────────────────────────────────────────────
-                      Container(
-                        padding: const EdgeInsets.all(12),
-                        decoration: BoxDecoration(
-                          color: AppColors.surfaceLight,
-                          borderRadius: BorderRadius.circular(12),
-                          border: Border.all(color: AppColors.border),
-                        ),
-                        child: Column(
-                          crossAxisAlignment: CrossAxisAlignment.start,
-                          children: [
-                            Row(
-                              children: [
-                                Icon(Icons.tips_and_updates_outlined,
-                                    color: AppColors.primary, size: 16),
-                                const SizedBox(width: 8),
-                                Text(
-                                  'Tips for best results',
-                                  style: TextStyle(
-                                    color: AppColors.textSecondary,
-                                    fontSize: 11,
-                                    fontWeight: FontWeight.w600,
-                                  ),
-                                ),
-                              ],
-                            ),
-                            const SizedBox(height: 8),
-                            Text(
-                              '• Start with Similarity ~0.30 and Blend ~0.05\n'
-                              '• Increase Similarity to remove more green\n'
-                              '• Increase Blend to soften harsh edges\n'
-                              '• Effect is applied at export time',
-                              style: TextStyle(
-                                color: AppColors.textTertiary,
-                                fontSize: 11,
-                                height: 1.5,
-                              ),
-                            ),
-                          ],
-                        ),
-                      ),
-                      const SizedBox(height: 16),
-
-                      // ── Apply Button ──────────────────────────────────────
-                      _buildApplyButton(provider),
-                      const SizedBox(height: 16),
-                    ],
-                  ),
-                ),
               ),
             ],
           ),
@@ -292,399 +167,453 @@ class _ChromaKeyEditorState extends State<ChromaKeyEditor> {
     );
   }
 
-  // ── Apply button ──────────────────────────────────────────────────────────
-  Widget _buildApplyButton(VideoEditorProvider provider) {
-    final isProcessing = provider.isChromaKeyProcessing;
+  // ── Header ─────────────────────────────────────────────────────────────
 
-    if (isProcessing) {
-      return Column(
-        children: [
-          ClipRRect(
-            borderRadius: BorderRadius.circular(8),
-            child: LinearProgressIndicator(
-              value: provider.chromaKeyProcessingProgress,
-              backgroundColor: AppColors.surfaceLight,
-              valueColor:
-                  AlwaysStoppedAnimation<Color>(AppColors.primary),
-              minHeight: 6,
-            ),
-          ),
-          const SizedBox(height: 8),
-          Text(
-            'Processing… ${(provider.chromaKeyProcessingProgress * 100).toInt()}%',
-            style: TextStyle(
-                color: AppColors.textTertiary, fontSize: 12),
-          ),
-          const SizedBox(height: 8),
-          GestureDetector(
-            onTap: () => provider.cancelChromaKeyProcessing(),
-            child: Container(
-              padding:
-                  const EdgeInsets.symmetric(horizontal: 20, vertical: 10),
-              decoration: BoxDecoration(
-                color: Colors.red.withOpacity(0.15),
-                borderRadius: BorderRadius.circular(12),
-                border: Border.all(color: Colors.red.withOpacity(0.5)),
-              ),
-              child: const Row(
-                mainAxisSize: MainAxisSize.min,
-                children: [
-                  Icon(Icons.cancel_outlined, color: Colors.red, size: 16),
-                  SizedBox(width: 6),
-                  Text('Cancel',
-                      style: TextStyle(color: Colors.red, fontSize: 12)),
-                ],
-              ),
-            ),
-          ),
-          if (provider.chromaKeyProcessingError != null) ...[
-            const SizedBox(height: 8),
-            Container(
-              padding: const EdgeInsets.all(8),
-              decoration: BoxDecoration(
-                color: Colors.red.withOpacity(0.12),
-                borderRadius: BorderRadius.circular(8),
-                border: Border.all(color: Colors.red.withOpacity(0.3)),
-              ),
-              child: Text(
-                provider.chromaKeyProcessingError!,
-                style: const TextStyle(color: Colors.red, fontSize: 11),
-              ),
-            ),
-          ],
-        ],
-      );
-    }
-
-    return SizedBox(
-      width: double.infinity,
-      child: GestureDetector(
-        onTap: () => _applyChromaKey(provider),
-        child: Container(
-          padding: const EdgeInsets.symmetric(vertical: 14),
-          decoration: BoxDecoration(
-            color: AppColors.primary,
-            borderRadius: BorderRadius.circular(12),
-            border: Border.all(color: AppColors.primary),
-            boxShadow: [
-              BoxShadow(
-                color: AppColors.primary.withOpacity(0.3),
-                blurRadius: 8,
-                offset: const Offset(0, 2),
-              )
-            ],
-          ),
-          child: Row(
-            mainAxisAlignment: MainAxisAlignment.center,
-            children: [
-              Icon(
-                Icons.check_circle_outline,
-                color: AppColors.textPrimary,
-                size: 18,
-              ),
-              const SizedBox(width: 8),
-              Text(
-                'Apply Chroma Key',
-                style: TextStyle(
-                  color: AppColors.textPrimary,
-                  fontSize: 13,
-                  fontWeight: FontWeight.w600,
-                ),
-              ),
-            ],
-          ),
-        ),
-      ),
-    );
-  }
-
-  // ── Apply logic (unchanged) ────────────────────────────────────────────────
-  Future<void> _applyChromaKey(VideoEditorProvider provider) async {
-    final success = await provider.applyChromaKey(
-      onProgress: (progress) {
-        // Progress is handled in the provider
-      },
-    );
-
-    if (mounted) {
-      if (success) {
-        ScaffoldMessenger.of(context).showSnackBar(
-          const SnackBar(
-            content: Text('Chroma key applied successfully!'),
-            backgroundColor: Colors.green,
-          ),
-        );
-        provider.toggleChromaKeyEditor();
-      } else {
-        ScaffoldMessenger.of(context).showSnackBar(
-          SnackBar(
-            content: Text(
-                'Failed to apply chroma key: ${provider.chromaKeyProcessingError}'),
-            backgroundColor: Colors.red,
-          ),
-        );
-      }
-    }
-  }
-
-  // ── Upload button ──────────────────────────────────────────────────────────
-  Widget _buildActionButton({
-    required IconData icon,
-    required String label,
-    required VoidCallback onPressed,
-  }) {
-    return GestureDetector(
-      onTap: onPressed,
-      child: Container(
-        padding: const EdgeInsets.symmetric(vertical: 12),
-        decoration: BoxDecoration(
-          color: AppColors.surfaceLight,
-          borderRadius: BorderRadius.circular(12),
-          border: Border.all(color: AppColors.border),
-        ),
-        child: Column(
-          mainAxisSize: MainAxisSize.min,
-          children: [
-            Container(
-              padding: const EdgeInsets.all(8),
-              decoration: BoxDecoration(
-                color: AppColors.border.withOpacity(0.5),
-                shape: BoxShape.circle,
-              ),
-              child:
-                  Icon(icon, color: AppColors.textSecondary, size: 18),
-            ),
-            const SizedBox(height: 6),
-            Text(
-              label,
-              style: TextStyle(
-                color: AppColors.textSecondary,
-                fontSize: 10,
-                fontWeight: FontWeight.w400,
-              ),
-            ),
-          ],
-        ),
-      ),
-    );
-  }
-
-  // ── Current background preview ─────────────────────────────────────────────
-  Widget _buildBackgroundPreview(
-      String path, VideoEditorProvider provider) {
-    final isVideo = provider.isChromaKeyBackgroundVideo(path);
+  Widget _header(VideoEditorProvider provider, bool on, bool hasClip) {
     return Container(
-      height: 60,
+      padding: const EdgeInsets.fromLTRB(14, 8, 6, 8),
       decoration: BoxDecoration(
-        color: AppColors.surfaceLight,
-        borderRadius: BorderRadius.circular(12),
-        border: Border.all(color: AppColors.primary, width: 1.5),
+        border: Border(bottom: BorderSide(color: AppColors.border)),
       ),
       child: Row(
         children: [
-          ClipRRect(
-            borderRadius:
-                const BorderRadius.horizontal(left: Radius.circular(10)),
-            child: SizedBox(
-              width: 80,
-              height: 60,
-              child: isVideo
-                  ? Icon(Icons.videocam_outlined,
-                      color: AppColors.textTertiary, size: 28)
-                  : Image.file(
-                      File(path),
-                      fit: BoxFit.cover,
-                      errorBuilder: (_, __, ___) => Icon(
-                        Icons.broken_image_outlined,
-                        color: AppColors.textTertiary,
-                      ),
-                    ),
-            ),
-          ),
+          Icon(Icons.filter_vintage_rounded, color: AppColors.primary),
           const SizedBox(width: 10),
           Expanded(
-            child: Text(
-              p.basename(path),
-              style: TextStyle(
-                  color: AppColors.textSecondary, fontSize: 12),
-              overflow: TextOverflow.ellipsis,
+            child: Column(
+              crossAxisAlignment: CrossAxisAlignment.start,
+              mainAxisSize: MainAxisSize.min,
+              children: [
+                Text('Green screen',
+                    style: TextStyle(
+                        color: AppColors.textPrimary,
+                        fontWeight: FontWeight.w700,
+                        fontSize: 15)),
+                Text(on ? 'On — live in the preview' : 'Off',
+                    style: TextStyle(
+                        color: on ? AppColors.success : AppColors.textTertiary,
+                        fontSize: 11)),
+              ],
             ),
           ),
-          IconButton(
-            icon: Icon(Icons.close,
-                color: AppColors.textTertiary, size: 18),
-            onPressed: () => provider.updateChromaKeySettings(
-              backgroundPath: null,
-              isBackgroundVideo: false,
+          if (hasClip && on)
+            GestureDetector(
+              onTapDown: (_) => provider.setChromaCompare(true),
+              onTapUp: (_) => provider.setChromaCompare(false),
+              onTapCancel: () => provider.setChromaCompare(false),
+              child: Container(
+                margin: const EdgeInsets.only(right: 6),
+                padding:
+                    const EdgeInsets.symmetric(horizontal: 10, vertical: 7),
+                decoration: BoxDecoration(
+                  color: provider.chromaCompare
+                      ? AppColors.primary.withValues(alpha: 0.2)
+                      : AppColors.surfaceLight,
+                  borderRadius: BorderRadius.circular(20),
+                  border: Border.all(color: AppColors.border),
+                ),
+                child: Row(mainAxisSize: MainAxisSize.min, children: [
+                  Icon(Icons.compare_rounded,
+                      size: 16, color: AppColors.textSecondary),
+                  const SizedBox(width: 4),
+                  Text('Hold: original',
+                      style: TextStyle(
+                          color: AppColors.textSecondary, fontSize: 11)),
+                ]),
+              ),
             ),
+          if (hasClip)
+            Switch(
+              value: on,
+              onChanged: (v) => provider.updateChromaKeySettings(enabled: v),
+            ),
+          IconButton(
+            tooltip: 'Reset',
+            onPressed: hasClip ? provider.resetChromaKey : null,
+            icon: Icon(Icons.restart_alt_rounded,
+                color: AppColors.textTertiary, size: 20),
+          ),
+          IconButton(
+            tooltip: 'Done',
+            onPressed: provider.toggleChromaKeyEditor,
+            icon: Icon(Icons.check_rounded, color: AppColors.primary),
           ),
         ],
       ),
     );
   }
 
-  // ── Background thumbnail strip ─────────────────────────────────────────────
-  Widget _buildBackgroundThumbnail(
-    String path,
-    bool isSelected,
-    bool isVideo,
-    VoidCallback onTap,
-    VoidCallback onRemove,
-  ) {
-    return GestureDetector(
-      onTap: onTap,
-      child: Container(
-        width: 80,
-        margin: const EdgeInsets.only(right: 8),
-        decoration: BoxDecoration(
-          borderRadius: BorderRadius.circular(10),
-          border: Border.all(
-            color:
-                isSelected ? AppColors.primary : AppColors.border,
-            width: isSelected ? 2 : 1,
+  Widget _stepTitle(String n, String title) {
+    return Padding(
+      padding: const EdgeInsets.only(top: 8, bottom: 8),
+      child: Row(
+        children: [
+          Container(
+            width: 20,
+            height: 20,
+            alignment: Alignment.center,
+            decoration: BoxDecoration(
+              color: AppColors.primary.withValues(alpha: 0.18),
+              shape: BoxShape.circle,
+            ),
+            child: Text(n,
+                style: TextStyle(
+                    color: AppColors.primary,
+                    fontSize: 11,
+                    fontWeight: FontWeight.w800)),
           ),
-          boxShadow: isSelected
-              ? [
-                  BoxShadow(
-                    color: AppColors.primary.withOpacity(0.3),
-                    blurRadius: 6,
-                    offset: const Offset(0, 2),
-                  )
-                ]
-              : null,
+          const SizedBox(width: 8),
+          Text(title,
+              style: TextStyle(
+                  color: AppColors.textPrimary,
+                  fontWeight: FontWeight.w600,
+                  fontSize: 13)),
+        ],
+      ),
+    );
+  }
+
+  // ── Step 1: colour ─────────────────────────────────────────────────────
+
+  Widget _colourRow(VideoEditorProvider provider, ChromaKeySettings s) {
+    final picking = provider.chromaPickMode;
+    return SizedBox(
+      height: 72,
+      child: ListView(
+        scrollDirection: Axis.horizontal,
+        children: [
+          _bigChoice(
+            icon: Icons.auto_awesome_rounded,
+            label: 'Auto',
+            busy: _detecting,
+            onTap: _detecting ? null : () => _autoDetect(provider),
+          ),
+          _bigChoice(
+            icon: Icons.colorize_rounded,
+            label: picking ? 'Tap preview' : 'Pick',
+            selected: picking,
+            onTap: () => provider.setChromaPickMode(!picking),
+          ),
+          for (final (label, color) in _presets)
+            _bigChoice(
+              swatch: color,
+              label: label,
+              selected:
+                  s.enabled && s.keyColor.toARGB32() == color.toARGB32(),
+              onTap: () => provider.updateChromaKeySettings(
+                  enabled: true, keyColor: color, spillReduction: 1.0),
+            ),
+          if (s.enabled &&
+              !_presets.any(
+                  (p) => p.$2.toARGB32() == s.keyColor.toARGB32()))
+            _bigChoice(
+              swatch: s.keyColor,
+              label: 'Picked',
+              selected: true,
+              onTap: () {},
+            ),
+        ],
+      ),
+    );
+  }
+
+  Widget _pickHint() {
+    return Container(
+      margin: const EdgeInsets.only(top: 8),
+      padding: const EdgeInsets.all(10),
+      decoration: BoxDecoration(
+        color: AppColors.primary.withValues(alpha: 0.12),
+        borderRadius: BorderRadius.circular(10),
+      ),
+      child: Row(children: [
+        Icon(Icons.touch_app_rounded, color: AppColors.primary, size: 18),
+        const SizedBox(width: 8),
+        Expanded(
+          child: Text('Tap the green (or blue) background in the preview.',
+              style: TextStyle(color: AppColors.textPrimary, fontSize: 12)),
         ),
-        child: Stack(
-          children: [
-            ClipRRect(
-              borderRadius: BorderRadius.circular(8),
-              child: SizedBox(
-                width: 80,
-                height: 80,
-                child: isVideo
-                    ? Container(
-                        color: AppColors.surfaceLight,
-                        child: Icon(Icons.videocam_outlined,
-                            color: AppColors.textTertiary, size: 28),
-                      )
-                    : Image.file(
-                        File(path),
-                        fit: BoxFit.cover,
-                        errorBuilder: (_, __, ___) => Container(
-                          color: AppColors.surfaceLight,
-                          child: Icon(Icons.broken_image_outlined,
-                              color: AppColors.textTertiary),
-                        ),
-                      ),
-              ),
-            ),
-            // Remove button
-            Positioned(
-              top: 2,
-              right: 2,
-              child: GestureDetector(
-                onTap: onRemove,
-                child: Container(
-                  padding: const EdgeInsets.all(3),
-                  decoration: const BoxDecoration(
-                    color: Colors.red,
+      ]),
+    );
+  }
+
+  Widget _bigChoice({
+    IconData? icon,
+    Color? swatch,
+    required String label,
+    bool selected = false,
+    bool busy = false,
+    VoidCallback? onTap,
+  }) {
+    return Padding(
+      padding: const EdgeInsets.only(right: 8),
+      child: GestureDetector(
+        onTap: onTap == null
+            ? null
+            : () {
+                HapticFeedback.selectionClick();
+                onTap();
+              },
+        child: AnimatedContainer(
+          duration: const Duration(milliseconds: 150),
+          width: 74,
+          decoration: BoxDecoration(
+            color: selected
+                ? AppColors.primary.withValues(alpha: 0.18)
+                : AppColors.surfaceLight,
+            borderRadius: BorderRadius.circular(14),
+            border: Border.all(
+                color: selected ? AppColors.primary : AppColors.border,
+                width: selected ? 2 : 1),
+          ),
+          child: Column(
+            mainAxisAlignment: MainAxisAlignment.center,
+            children: [
+              if (busy)
+                const SizedBox(
+                    width: 22,
+                    height: 22,
+                    child: CircularProgressIndicator(strokeWidth: 2))
+              else if (swatch != null)
+                Container(
+                  width: 24,
+                  height: 24,
+                  decoration: BoxDecoration(
+                    color: swatch,
                     shape: BoxShape.circle,
+                    border: Border.all(color: Colors.white54),
                   ),
-                  child: const Icon(Icons.close,
-                      color: Colors.white, size: 10),
-                ),
-              ),
-            ),
-            if (isVideo)
-              const Positioned(
-                bottom: 4,
-                left: 4,
-                child: Icon(Icons.play_circle_filled,
-                    color: Colors.white, size: 14),
-              ),
-          ],
+                )
+              else
+                Icon(icon,
+                    color: selected ? AppColors.primary : AppColors.textPrimary),
+              const SizedBox(height: 6),
+              Text(label,
+                  maxLines: 1,
+                  overflow: TextOverflow.ellipsis,
+                  style: TextStyle(
+                      color:
+                          selected ? AppColors.primary : AppColors.textSecondary,
+                      fontSize: 11)),
+            ],
+          ),
         ),
       ),
     );
   }
 
-  // ── Color picker ───────────────────────────────────────────────────────────
-  Widget _buildColorPicker(Color? currentColor, VideoEditorProvider provider) {
-    final colors = [
-      const Color(0xFF00FF00), // Green
-      const Color(0xFF0000FF), // Blue
-      const Color(0xFFFFFF00), // Yellow
-      const Color(0xFFFF00FF), // Magenta
-      const Color(0xFF00FFFF), // Cyan
-      const Color(0xFFFF0000), // Red
-    ];
+  // ── Step 2: sliders ────────────────────────────────────────────────────
 
-    return Row(
-      mainAxisAlignment: MainAxisAlignment.spaceEvenly,
-      children: colors.map((color) {
-        final isSelected =
-            currentColor?.toARGB32() == color.toARGB32();
-        return GestureDetector(
-          onTap: () =>
-              provider.updateChromaKeySettings(keyColor: color),
-          child: Container(
-            width: 38,
-            height: 38,
-            decoration: BoxDecoration(
-              color: color,
-              shape: BoxShape.circle,
-              border: Border.all(
-                color:
-                    isSelected ? AppColors.textPrimary : Colors.transparent,
-                width: 2.5,
-              ),
-              boxShadow: isSelected
-                  ? [
-                      BoxShadow(
-                        color: color.withValues(alpha: color.a * 0.5),
-                        blurRadius: 8,
-                        spreadRadius: 2,
-                      ),
-                    ]
-                  : null,
+  Widget _slider({
+    required String label,
+    required String hint,
+    required double value,
+    required double min,
+    required double max,
+    required bool enabled,
+    required ValueChanged<double> onChanged,
+  }) {
+    final provider = Provider.of<VideoEditorProvider>(context, listen: false);
+    final v = value.clamp(min, max).toDouble();
+    return Column(
+      crossAxisAlignment: CrossAxisAlignment.start,
+      children: [
+        Row(children: [
+          Text(label,
+              style: TextStyle(
+                  color: enabled
+                      ? AppColors.textPrimary
+                      : AppColors.textTertiary)),
+          const Spacer(),
+          Text('${((v - min) / (max - min) * 100).round()}',
+              style: TextStyle(
+                  color: AppColors.textSecondary,
+                  fontWeight: FontWeight.w600)),
+        ]),
+        Slider(
+          value: v,
+          min: min,
+          max: max,
+          onChanged: enabled ? onChanged : null,
+          onChangeEnd: enabled ? (_) => provider.sealUndo() : null,
+        ),
+        Text(hint,
+            style: TextStyle(color: AppColors.textTertiary, fontSize: 11)),
+        const SizedBox(height: 6),
+      ],
+    );
+  }
+
+  // ── Step 3: background ─────────────────────────────────────────────────
+
+  Widget _backgroundRow(VideoEditorProvider provider, ChromaKeySettings s) {
+    final active = s.backgroundPath;
+    final own = provider.chromaKeyBackgrounds;
+    return SizedBox(
+      height: 84,
+      child: ListView(
+        scrollDirection: Axis.horizontal,
+        children: [
+          _bgTile(
+            selected: active == null,
+            onTap: provider.clearChromaBackground,
+            child: Column(
+              mainAxisAlignment: MainAxisAlignment.center,
+              children: [
+                Icon(Icons.block_rounded, color: AppColors.textSecondary),
+                Text('None',
+                    style: TextStyle(
+                        color: AppColors.textSecondary, fontSize: 11)),
+              ],
             ),
           ),
-        );
-      }).toList(),
+          _bgTile(
+            onTap: () => _pickBackground(provider, false),
+            child: Column(
+              mainAxisAlignment: MainAxisAlignment.center,
+              children: [
+                Icon(Icons.add_photo_alternate_outlined,
+                    color: AppColors.primary),
+                Text('Photo',
+                    style: TextStyle(color: AppColors.primary, fontSize: 11)),
+              ],
+            ),
+          ),
+          _bgTile(
+            onTap: () => _pickBackground(provider, true),
+            child: Column(
+              mainAxisAlignment: MainAxisAlignment.center,
+              children: [
+                Icon(Icons.video_library_outlined, color: AppColors.primary),
+                Text('Video',
+                    style: TextStyle(color: AppColors.primary, fontSize: 11)),
+              ],
+            ),
+          ),
+          for (final path in own.reversed)
+            _bgTile(
+              selected: path == active,
+              onTap: () => provider.updateChromaKeySettings(
+                  backgroundPath: path,
+                  isBackgroundVideo:
+                      provider.isChromaKeyBackgroundVideo(path)),
+              onLongPress: () => provider.removeChromaKeyBackground(path),
+              child: provider.isChromaKeyBackgroundVideo(path)
+                  ? _VideoThumb(path: path)
+                  : Image(
+                      image: ResizeImage(FileImage(File(path)), width: 160),
+                      fit: BoxFit.cover,
+                      errorBuilder: (_, __, ___) =>
+                          const Icon(Icons.broken_image_outlined),
+                    ),
+            ),
+          for (final asset in _library)
+            _bgTile(
+              selected: active != null &&
+                  active.endsWith('bg_${asset.split('/').last}'),
+              onTap: () => provider.setChromaBackgroundAsset(asset),
+              child: Image(
+                image: ResizeImage(AssetImage(asset), width: 160),
+                fit: BoxFit.cover,
+              ),
+            ),
+        ],
+      ),
     );
   }
 
-  // ── Picker / select / remove (logic unchanged) ────────────────────────────
-  Future<void> _pickBackground({required bool isVideo}) async {
-    try {
-      final provider = context.read<VideoEditorProvider>();
-      final media = await MediaPickerService.open(
-        context,
-        mediaFilter: isVideo ? 'video' : 'image',
-      );
-      if (media != null) {
-        final file = await media.getFile();
-        await provider.setChromaKeyBackground(file);
-      }
-    } catch (e) {
-      if (mounted) {
-        ScaffoldMessenger.of(context).showSnackBar(
-          SnackBar(content: Text('Failed to pick file: $e')),
-        );
-      }
-    }
-  }
-
-  void _selectBackground(String path) {
-    final provider = context.read<VideoEditorProvider>();
-    final isVideo = provider.isChromaKeyBackgroundVideo(path);
-    provider.updateChromaKeySettings(
-      backgroundPath: path,
-      isBackgroundVideo: isVideo,
+  Widget _bgTile({
+    required Widget child,
+    required VoidCallback onTap,
+    VoidCallback? onLongPress,
+    bool selected = false,
+  }) {
+    return Padding(
+      padding: const EdgeInsets.only(right: 8),
+      child: GestureDetector(
+        onTap: () {
+          HapticFeedback.selectionClick();
+          onTap();
+        },
+        onLongPress: onLongPress,
+        child: Container(
+          width: 70,
+          clipBehavior: Clip.antiAlias,
+          decoration: BoxDecoration(
+            color: AppColors.surfaceLight,
+            borderRadius: BorderRadius.circular(12),
+            border: Border.all(
+                color: selected ? AppColors.primary : AppColors.border,
+                width: selected ? 2.5 : 1),
+          ),
+          child: child,
+        ),
+      ),
     );
   }
 
-  void _removeBackground(String path) {
-    final provider = context.read<VideoEditorProvider>();
-    provider.removeChromaKeyBackground(path);
+  // ── Subject ────────────────────────────────────────────────────────────
+
+  Widget _subjectCard(
+      VideoEditorProvider provider, ChromaKeySettings s, bool on) {
+    final moved = (s.position - const Offset(0.5, 0.5)).distance > 0.001 ||
+        (s.scale - 1).abs() > 0.001;
+    return Container(
+      padding: const EdgeInsets.all(12),
+      decoration: BoxDecoration(
+        color: AppColors.surfaceLight,
+        borderRadius: BorderRadius.circular(12),
+        border: Border.all(color: AppColors.border),
+      ),
+      child: Row(
+        children: [
+          Icon(Icons.open_with_rounded, color: AppColors.primary),
+          const SizedBox(width: 10),
+          Expanded(
+            child: Text(
+              on
+                  ? 'Drag the person in the preview to move them; pinch to '
+                      'resize. (${(s.scale * 100).round()}%)'
+                  : 'Turn the green screen on to place the person over the '
+                      'background.',
+              style: TextStyle(color: AppColors.textSecondary, fontSize: 12),
+            ),
+          ),
+          if (moved)
+            TextButton(
+              onPressed: provider.resetChromaSubject,
+              child: const Text('Centre'),
+            ),
+        ],
+      ),
+    );
+  }
+}
+
+/// First frame of a background video.
+class _VideoThumb extends StatelessWidget {
+  final String path;
+  const _VideoThumb({required this.path});
+
+  @override
+  Widget build(BuildContext context) {
+    return FutureBuilder<Uint8List?>(
+      future: VideoThumbnailService().extractFirstFrame(path),
+      builder: (context, snap) {
+        final bytes = snap.data;
+        return Stack(
+          fit: StackFit.expand,
+          children: [
+            if (bytes != null)
+              Image.memory(bytes, fit: BoxFit.cover)
+            else
+              Container(color: AppColors.surface),
+            const Center(
+              child: Icon(Icons.play_circle_outline_rounded,
+                  color: Colors.white70),
+            ),
+          ],
+        );
+      },
+    );
   }
 }

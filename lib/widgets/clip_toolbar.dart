@@ -15,6 +15,11 @@ class ClipToolbar extends StatelessWidget {
 
   const ClipToolbar({super.key, required this.provider, required this.clip});
 
+  bool _playheadInside(VideoEditorProvider provider) {
+    final pos = provider.currentPosition;
+    return pos > clip.startTime && pos < clip.endTime;
+  }
+
   void _snack(BuildContext context, String text, {SnackBarAction? action}) {
     ScaffoldMessenger.of(context)
       ..hideCurrentSnackBar()
@@ -59,6 +64,30 @@ class ClipToolbar extends StatelessWidget {
       ToolbarTool(Icons.auto_awesome_rounded, 'Effects',
           () => ClipToolSheets.effects(context, clip.id),
           badge: effectsCount > 0 ? '$effectsCount' : null, highlight: true),
+      // Remove everything before / after the playhead.
+      ToolbarTool(Icons.first_page_rounded, 'Trim left', () async {
+        if (!_playheadInside(provider)) {
+          _snack(context, 'Move the playhead inside the clip to trim it');
+          return;
+        }
+        await provider.applyLeftTrimAtCursor(clip.id);
+        await provider.seekTo(provider.currentPosition);
+        if (context.mounted) {
+          _snack(context, 'Removed the part before the playhead',
+              action: SnackBarAction(label: 'UNDO', onPressed: provider.undo));
+        }
+      }),
+      ToolbarTool(Icons.last_page_rounded, 'Trim right', () async {
+        if (!_playheadInside(provider)) {
+          _snack(context, 'Move the playhead inside the clip to trim it');
+          return;
+        }
+        await provider.applyRightTrimAtCursor(clip.id);
+        if (context.mounted) {
+          _snack(context, 'Removed the part after the playhead',
+              action: SnackBarAction(label: 'UNDO', onPressed: provider.undo));
+        }
+      }),
       // Tapping an open panel's tool again returns to the timeline.
       ToolbarTool(
           Icons.tune_rounded,

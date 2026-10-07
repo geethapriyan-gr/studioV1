@@ -37,13 +37,14 @@ class TextOverlayAdapter extends TypeAdapter<TextOverlay> {
       outlineColor: fields[16] as Color?,
       outlineWidth: (fields[17] as num?)?.toDouble() ?? 0,
       shadow: fields[18] as bool? ?? true,
+      keyframeData: _doubles(fields[19]),
     );
   }
 
   @override
   void write(BinaryWriter writer, TextOverlay obj) {
     writer
-      ..writeByte(19)
+      ..writeByte(20)
       ..writeByte(0)
       ..write(obj.id)
       ..writeByte(1)
@@ -81,7 +82,9 @@ class TextOverlayAdapter extends TypeAdapter<TextOverlay> {
       ..writeByte(17)
       ..write(obj.outlineWidth)
       ..writeByte(18)
-      ..write(obj.shadow);
+      ..write(obj.shadow)
+      ..writeByte(19)
+      ..write(obj.keyframeData);
   }
 
   @override
@@ -195,10 +198,7 @@ class VideoClipAdapter extends TypeAdapter<VideoClip> {
       shadow: fields[27] as bool? ?? false,
       animIn: fields[28] as String? ?? 'none',
       animOut: fields[29] as String? ?? 'none',
-      keyframeData: (fields[30] as List?)
-              ?.map((e) => (e as num).toDouble())
-              .toList() ??
-          const <double>[],
+      keyframeData: _doubles(fields[30]),
     );
   }
 
@@ -302,13 +302,14 @@ class StickerModelAdapter extends TypeAdapter<StickerModel> {
       flipX: fields[8] as bool? ?? false,
       animIn: fields[9] as String? ?? 'none',
       animOut: fields[10] as String? ?? 'none',
+      keyframeData: _doubles(fields[11]),
     );
   }
 
   @override
   void write(BinaryWriter writer, StickerModel obj) {
     writer
-      ..writeByte(11)
+      ..writeByte(12)
       ..writeByte(0)
       ..write(obj.id)
       ..writeByte(1)
@@ -330,7 +331,9 @@ class StickerModelAdapter extends TypeAdapter<StickerModel> {
       ..writeByte(9)
       ..write(obj.animIn)
       ..writeByte(10)
-      ..write(obj.animOut);
+      ..write(obj.animOut)
+      ..writeByte(11)
+      ..write(obj.keyframeData);
   }
 
   @override
@@ -643,3 +646,8 @@ class TextAlignEnumAdapter extends TypeAdapter<TextAlignEnum> {
           runtimeType == other.runtimeType &&
           typeId == other.typeId;
 }
+
+/// Reads a stored list of numbers (missing in older projects) as doubles.
+List<double> _doubles(dynamic value) =>
+    (value as List?)?.map((e) => (e as num).toDouble()).toList() ??
+    const <double>[];

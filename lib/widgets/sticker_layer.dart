@@ -127,19 +127,35 @@ class _DraggableStickerWidgetState extends State<_DraggableStickerWidget>
   TextAnimState _anim(VideoEditorProvider p, bool selected) {
     final s = widget.sticker;
     final animated = s.animIn != 'none' || s.animOut != 'none';
+    // Moving stickers re-evaluate every frame while playing, too.
+    final moving =
+        s.keyframeData.isNotEmpty && p.isPlaying && _dragPos == null;
     if (!animated || selected || !p.isPlaying || _dragPos != null) {
-      if (_ticker.isActive) _ticker.stop();
+      _setTicking(moving);
       return const TextAnimState();
     }
     final len = (s.endTime - s.startTime).inMilliseconds / 1000.0;
     final t = (p.smoothPosition - s.startTime).inMicroseconds / 1e6;
     final state = TextAnimations.atTimes(s.animIn, s.animOut, len, t);
-    if (state.isIdle) {
-      if (_ticker.isActive) _ticker.stop();
-    } else if (!_ticker.isActive) {
-      _ticker.start();
-    }
+    _setTicking(moving || !state.isIdle);
     return state;
+  }
+
+  void _setTicking(bool on) {
+    if (on && !_ticker.isActive) {
+      _ticker.start();
+    } else if (!on && _ticker.isActive) {
+      _ticker.stop();
+    }
+  }
+
+  /// Centre and scale at the current time (motion keyframes).
+  (Offset, double) _motion(VideoEditorProvider p) {
+    final s = widget.sticker;
+    if (s.keyframeData.isEmpty) return (s.position, s.scale);
+    final now = p.isPlaying ? p.smoothPosition : p.currentPosition;
+    return ItemKeyframe.at(
+        s.keyframeData, now - s.startTime, s.position, s.scale);
   }
 
   @override
@@ -147,8 +163,9 @@ class _DraggableStickerWidgetState extends State<_DraggableStickerWidget>
     final provider = Provider.of<VideoEditorProvider>(context, listen: false);
     final s = widget.sticker;
     final isSelected = provider.selectedStickerId == s.id;
-    final position = _dragPos ?? s.position;
-    final scale = _dragScale ?? s.scale;
+    final (motionPos, motionScale) = _motion(provider);
+    final position = _dragPos ?? motionPos;
+    final scale = _dragScale ?? motionScale;
     final rotation = _dragRotation ?? s.rotation;
     final cw = widget.constraints.maxWidth;
     final ch = widget.constraints.maxHeight;
@@ -182,16 +199,16 @@ class _DraggableStickerWidgetState extends State<_DraggableStickerWidget>
         onTap: () => provider.selectSticker(s.id),
         onScaleStart: (_) {
           provider.selectSticker(s.id);
-          _startScale = s.scale;
+          _startScale = motionScale;
           _startRotation = s.rotation;
           setState(() {
-            _dragPos = s.position;
-            _dragScale = s.scale;
+            _dragPos = motionPos;
+            _dragScale = motionScale;
             _dragRotation = s.rotation;
           });
         },
         onScaleUpdate: (d) {
-          final raw = (_dragPos ?? s.position) +
+          final raw = (_dragPos ?? motionPos) +
               Offset(d.focalPointDelta.dx / cw, d.focalPointDelta.dy / ch);
           setState(() {
             _dragPos = Offset(raw.dx.clamp(0.0, 1.0), raw.dy.clamp(0.0, 1.0));
@@ -204,19 +221,21 @@ class _DraggableStickerWidgetState extends State<_DraggableStickerWidget>
           SnapGuides.snapCenter(_dragPos!);
         },
         onScaleEnd: (_) {
-          final pos = SnapGuides.snapCenter(_dragPos ?? s.position);
+          final pos = SnapGuides.snapCenter(_dragPos ?? motionPos);
           SnapGuides.clear();
           var rot = _dragRotation ?? s.rotation;
           // Snap near-straight angles to the nearest quarter turn.
           final quarter = (rot / (math.pi / 2)).round() * (math.pi / 2);
           if ((rot - quarter).abs() < 0.07) rot = quarter;
-          // One undo step for the whole gesture.
-          provider.updateSticker(
+          // One undo step for the whole gesture; with motion this edits the
+          // keyframe at the playhead.
+          provider.updateStickerTransform(
             s.id,
             position: pos,
-            scale: _dragScale ?? s.scale,
+            scale: _dragScale ?? motionScale,
             rotation: rot,
           );
+          provider.sealUndo();
           setState(() {
             _dragPos = null;
             _dragScale = null;

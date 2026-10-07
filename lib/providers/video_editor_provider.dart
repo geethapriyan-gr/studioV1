@@ -2,6 +2,7 @@ import 'dart:async';
 import 'dart:io';
 import 'dart:ui' as ui;
 import 'dart:math' as math;
+import 'dart:typed_data';
 import 'package:flutter/material.dart';
 import 'package:video_editor/video_editor.dart';
 import 'package:video_player/video_player.dart';
@@ -18,7 +19,9 @@ import '../models/transition.dart';
 import '../models/video_effect.dart';
 import '../models/filter_presets.dart';
 import '../services/export_service.dart';
-import '../services/chroma_key_service.dart';
+import '../utils/chroma_key.dart';
+import 'package:flutter/services.dart' show rootBundle;
+import 'package:video_thumbnail/video_thumbnail.dart';
 import '../services/waveform_service.dart';
 import '../services/hive_service.dart';
 import '../services/video_thumbnail_service.dart';
@@ -121,14 +124,19 @@ class VideoEditorProvider extends ChangeNotifier {
   // Editor panel mode enum - replaces multiple showX booleans
   EditorPanelMode _editorPanelMode = EditorPanelMode.none;
 
-  // Chroma key state - current clip's chroma key settings being edited
-  ChromaKeySettings? _currentChromaKeySettings;
-
   /// Get the current editor panel mode
   EditorPanelMode get editorPanelMode => _editorPanelMode;
 
-  /// Get current chroma key settings for the selected clip
-  ChromaKeySettings? get currentChromaKeySettings => _currentChromaKeySettings;
+  /// Green-screen settings of the selected clip (defaults, switched off,
+  /// when it has none). Always read from the clip, so switching clips with
+  /// the panel open never carries settings over.
+  ChromaKeySettings? get currentChromaKeySettings {
+    final id = _selectedVideoClipId;
+    final clip = id == null ? null : _clipById(id);
+    if (clip == null) return null;
+    return clip.chromaKeySettings ??
+        ChromaKey.defaults.copyWith(enabled: false);
+  }
 
   /// Check if chroma key is enabled for current clip
   bool get isChromaKeyEnabled {
@@ -5746,7 +5754,12 @@ class VideoEditorProvider extends ChangeNotifier {
     }
   }
 
-  // --- CHROMA KEY METHODS ---
+  // --- CHROMA KEY (GREEN SCREEN) ---
+  //
+  // The key is live: the preview keys the clip with the same formula the
+  // exporter uses, so there is no "apply" or re-encode step. Settings live
+  // on the clip ([VideoClip.chromaKeySettings]); [currentChromaKeySettings]
+  // reads the selected clip's.
 
   /// Getter for backwards compatibility - shows if chroma key editor is open
   bool get showChromaKeyEditor => _editorPanelMode == EditorPanelMode.chromaKey;
@@ -5759,79 +5772,97 @@ class VideoEditorProvider extends ChangeNotifier {
   /// Check if a background path is a video based on extension
   bool isChromaKeyBackgroundVideo(String path) {
     final ext = p.extension(path).toLowerCase();
-    return ['.mp4', '.mov', '.avi', '.mkv', '.webm'].contains(ext);
+    return ['.mp4', '.mov', '.avi', '.mkv', '.webm', '.m4v'].contains(ext);
   }
 
-  /// Toggle the chroma key editor panel
+  bool _chromaPickMode = false;
+  bool _chromaCompare = false;
+
+  /// True while the next tap on the preview picks the colour to remove.
+  bool get chromaPickMode => _chromaPickMode;
+
+  /// True while "hold to compare" shows the clip without the key.
+  bool get chromaCompare => _chromaCompare;
+
+  void setChromaPickMode(bool on) {
+    if (_chromaPickMode == on) return;
+    _chromaPickMode = on;
+    notifyListeners();
+  }
+
+  void setChromaCompare(bool on) {
+    if (_chromaCompare == on) return;
+    _chromaCompare = on;
+    notifyListeners();
+  }
+
+  /// Opens/closes the green-screen panel for the selected clip.
   void toggleChromaKeyEditor() {
-    print('DEBUG PROVIDER: toggleChromaKeyEditor called');
-    print('DEBUG PROVIDER: Current _editorPanelMode = $_editorPanelMode');
+    _chromaPickMode = false;
+    _chromaCompare = false;
     if (_editorPanelMode == EditorPanelMode.chromaKey) {
       _editorPanelMode = EditorPanelMode.none;
-      print('DEBUG PROVIDER: Set mode to none');
     } else {
       _showStickerPanel = false;
       _editorPanelMode = EditorPanelMode.chromaKey;
-      print('DEBUG PROVIDER: Set mode to chromaKey');
-      // Initialize current chroma key settings from selected clip
-      if (_selectedVideoClipId != null && _currentProject != null) {
-        try {
-          final clip = _currentProject!.videoClips.firstWhere(
-            (c) => c.id == _selectedVideoClipId,
-          );
-          _currentChromaKeySettings =
-              clip.chromaKeySettings ?? ChromaKeySettings.greenScreen();
-          print(
-              'DEBUG PROVIDER: Initialized settings from clip: $_currentChromaKeySettings');
-        } catch (_) {
-          _currentChromaKeySettings = ChromaKeySettings.greenScreen();
-        }
-      } else {
-        _currentChromaKeySettings = ChromaKeySettings.greenScreen();
-        print(
-            'DEBUG PROVIDER: Using default green screen settings (no clip selected)');
-      }
     }
-    print('DEBUG PROVIDER: Calling notifyListeners');
     notifyListeners();
-    print('DEBUG PROVIDER: toggleChromaKeyEditor complete');
   }
 
-  /// Set chroma key background from file (picture or video)
+  /// Uses [backgroundFile] (photo or video) behind the selected clip.
   Future<void> setChromaKeyBackground(File backgroundFile) async {
     if (_currentProject == null) return;
-
-    recordUndo();
-
-    // Copy file to app documents
     final savedFile = await _importFileToAppDocs(backgroundFile);
-
-    // Add to project's chroma key backgrounds (just the path)
+    recordUndo();
     _currentProject = _currentProject!.addChromaKeyBackground(savedFile.path);
+    _applyChromaDraft((s) => s.copyWith(
+        backgroundPath: savedFile.path,
+        isBackgroundVideo: isChromaKeyBackgroundVideo(savedFile.path)));
+  }
 
-    // Update current clip's chroma key settings
-    if (_selectedVideoClipId != null) {
-      final isVideo = isChromaKeyBackgroundVideo(savedFile.path);
-      _currentChromaKeySettings = (_currentChromaKeySettings ??
-              ChromaKeySettings.greenScreen())
-          .copyWith(backgroundPath: savedFile.path, isBackgroundVideo: isVideo);
-
-      final clipIndex = _currentProject!.videoClips
-          .indexWhere((c) => c.id == _selectedVideoClipId);
-      if (clipIndex != -1) {
-        final clip = _currentProject!.videoClips[clipIndex];
-        final updatedClip =
-            clip.copyWith(chromaKeySettings: _currentChromaKeySettings);
-        _currentProject = _currentProject!
-            .updateVideoClip(_selectedVideoClipId!, updatedClip);
-      }
+  /// Uses one of the bundled library images as the background.
+  Future<void> setChromaBackgroundAsset(String assetPath) async {
+    final appDir = await getApplicationDocumentsDirectory();
+    final file = File(p.join(appDir.path, 'bg_${p.basename(assetPath)}'));
+    if (!file.existsSync()) {
+      final data = await rootBundle.load(assetPath);
+      await file.writeAsBytes(
+          data.buffer.asUint8List(data.offsetInBytes, data.lengthInBytes));
     }
+    await setChromaKeyBackground(file);
+  }
 
+  /// No background: the keyed-out area shows black (or the clip below).
+  void clearChromaBackground() {
+    recordUndo();
+    _applyChromaDraft((s) => ChromaKeySettings(
+          enabled: s.enabled,
+          keyColor: s.keyColor,
+          similarity: s.similarity,
+          blend: s.blend,
+          position: s.position,
+          scale: s.scale,
+          spillReduction: s.spillReduction,
+        ));
+  }
+
+  /// Applies [change] to the selected clip's green-screen settings.
+  void _applyChromaDraft(ChromaKeySettings Function(ChromaKeySettings) change) {
+    if (_currentProject == null || _selectedVideoClipId == null) return;
+    final clipIndex = _currentProject!.videoClips
+        .indexWhere((c) => c.id == _selectedVideoClipId);
+    if (clipIndex == -1) return;
+    final clip = _currentProject!.videoClips[clipIndex];
+    final updated = change(clip.chromaKeySettings ??
+        ChromaKey.defaults.copyWith(enabled: false));
+    _currentProject = _currentProject!
+        .updateVideoClip(clip.id, clip.copyWith(chromaKeySettings: updated));
     _scheduleAutoSave();
     notifyListeners();
   }
 
-  /// Update chroma key settings (color, similarity, blend, position, scale, HSV range, spill reduction, feather, edge transition, shadow removal, skin protection)
+  /// Changes the selected clip's green-screen settings. [undoKey] merges a
+  /// slider drag or a drag of the subject into one undo step.
   void updateChromaKeySettings({
     bool? enabled,
     String? backgroundPath,
@@ -5841,257 +5872,140 @@ class VideoEditorProvider extends ChangeNotifier {
     double? blend,
     Offset? position,
     double? scale,
-    double? hueMin,
-    double? hueMax,
-    double? saturationMin,
-    double? saturationMax,
-    double? valueMin,
-    double? valueMax,
     double? spillReduction,
-    double? edgeFeather,
-    double? edgeTransition,
-    double? shadowRemoval,
-    double? skinProtection,
+    String? undoKey,
   }) {
     if (_currentProject == null || _selectedVideoClipId == null) return;
-
-    recordUndo();
-
-    _currentChromaKeySettings =
-        (_currentChromaKeySettings ?? ChromaKeySettings.greenScreen()).copyWith(
-      enabled: enabled,
-      backgroundPath: backgroundPath,
-      isBackgroundVideo: isBackgroundVideo,
-      keyColor: keyColor,
-      similarity: similarity,
-      blend: blend,
-      position: position,
-      scale: scale,
-      hueMin: hueMin,
-      hueMax: hueMax,
-      saturationMin: saturationMin,
-      saturationMax: saturationMax,
-      valueMin: valueMin,
-      valueMax: valueMax,
-      spillReduction: spillReduction,
-      edgeFeather: edgeFeather,
-      edgeTransition: edgeTransition,
-      shadowRemoval: shadowRemoval,
-      skinProtection: skinProtection,
-    );
-
-    // Update the clip's chroma key settings
-    final clipIndex = _currentProject!.videoClips
-        .indexWhere((c) => c.id == _selectedVideoClipId);
-    if (clipIndex != -1) {
-      final clip = _currentProject!.videoClips[clipIndex];
-      final updatedClip =
-          clip.copyWith(chromaKeySettings: _currentChromaKeySettings);
-      _currentProject =
-          _currentProject!.updateVideoClip(_selectedVideoClipId!, updatedClip);
-    }
-
-    _scheduleAutoSave();
-    notifyListeners();
+    recordUndo(coalesceKey: undoKey);
+    _applyChromaDraft((s) => s.copyWith(
+          enabled: enabled,
+          backgroundPath: backgroundPath,
+          isBackgroundVideo: isBackgroundVideo,
+          keyColor: keyColor,
+          similarity: similarity,
+          blend: blend,
+          position: position,
+          scale: scale,
+          spillReduction: spillReduction,
+        ));
   }
 
   /// Enable or disable chroma key effect
   void toggleChromaKeyEnabled() {
-    if (_currentChromaKeySettings == null) return;
-    updateChromaKeySettings(enabled: !_currentChromaKeySettings!.enabled);
+    final on = currentChromaKeySettings?.enabled ?? false;
+    updateChromaKeySettings(enabled: !on);
   }
 
-  /// Reset chroma key to default green screen settings
+  /// Back to the defaults (keeps the chosen background).
   void resetChromaKey() {
-    if (_currentProject == null || _selectedVideoClipId == null) return;
-
+    final bg = currentChromaKeySettings;
     recordUndo();
+    _applyChromaDraft((_) => ChromaKey.defaults.copyWith(
+          backgroundPath: bg?.backgroundPath,
+          isBackgroundVideo: bg?.isBackgroundVideo,
+        ));
+  }
 
-    _currentChromaKeySettings = ChromaKeySettings.greenScreen();
-
-    // Update the clip's chroma key settings
-    final clipIndex = _currentProject!.videoClips
-        .indexWhere((c) => c.id == _selectedVideoClipId);
-    if (clipIndex != -1) {
-      final clip = _currentProject!.videoClips[clipIndex];
-      final updatedClip =
-          clip.copyWith(chromaKeySettings: _currentChromaKeySettings);
-      _currentProject =
-          _currentProject!.updateVideoClip(_selectedVideoClipId!, updatedClip);
-    }
-
-    _scheduleAutoSave();
-    notifyListeners();
+  /// Puts the subject back in the centre at its original size.
+  void resetChromaSubject() {
+    updateChromaKeySettings(position: const Offset(0.5, 0.5), scale: 1.0);
   }
 
   /// Remove chroma key background from project
   void removeChromaKeyBackground(String backgroundPath) {
     if (_currentProject == null) return;
-
     recordUndo();
     _currentProject =
         _currentProject!.removeChromaKeyBackground(backgroundPath);
-
-    // If this was the active background, clear it from current settings
-    if (_currentChromaKeySettings?.backgroundPath != null) {
-      if (_currentChromaKeySettings!.backgroundPath == backgroundPath) {
-        updateChromaKeySettings(backgroundPath: null, isBackgroundVideo: false);
-      }
+    if (currentChromaKeySettings?.backgroundPath == backgroundPath) {
+      clearChromaBackground();
+      return;
     }
-
     _scheduleAutoSave();
     notifyListeners();
   }
 
   /// Get current chroma key background path for preview
   String? get activeChromaKeyBackgroundPath {
-    return _currentChromaKeySettings?.backgroundPath;
+    return currentChromaKeySettings?.backgroundPath;
   }
 
-  // Chroma key processing state
-  bool _isChromaKeyProcessing = false;
-  double _chromaKeyProcessingProgress = 0.0;
-  String? _chromaKeyProcessingError;
-
-  /// Check if chroma key is currently being processed
-  bool get isChromaKeyProcessing => _isChromaKeyProcessing;
-
-  /// Get chroma key processing progress (0.0 to 1.0)
-  double get chromaKeyProcessingProgress => _chromaKeyProcessingProgress;
-
-  /// Get chroma key processing error message
-  String? get chromaKeyProcessingError => _chromaKeyProcessingError;
-
-  /// Apply chroma key effect to the selected clip
-  /// This processes the video and replaces the clip with the processed version
-  Future<bool> applyChromaKey({Function(double)? onProgress}) async {
-    if (_currentProject == null || _selectedVideoClipId == null) {
-      _chromaKeyProcessingError = 'No project or clip selected';
-      notifyListeners();
-      return false;
-    }
-
-    final settings = _currentChromaKeySettings;
-    if (settings == null ||
-        !settings.enabled ||
-        settings.backgroundPath == null) {
-      _chromaKeyProcessingError = 'Chroma key not configured';
-      notifyListeners();
-      return false;
-    }
-
-    final clipIndex = _currentProject!.videoClips
-        .indexWhere((c) => c.id == _selectedVideoClipId);
-    if (clipIndex == -1) {
-      _chromaKeyProcessingError = 'Clip not found';
-      notifyListeners();
-      return false;
-    }
-
-    final clip = _currentProject!.videoClips[clipIndex];
-    if (clip.mediaType != MediaType.video || clip.videoFile == null) {
-      _chromaKeyProcessingError = 'Selected clip is not a video';
-      notifyListeners();
-      return false;
-    }
-
-    // Start processing
-    _isChromaKeyProcessing = true;
-    _chromaKeyProcessingProgress = 0.0;
-    _chromaKeyProcessingError = null;
-    notifyListeners();
-
+  /// The selected clip's frame at the playhead as straight RGBA pixels
+  /// (small: colour picking does not need full resolution).
+  Future<(Uint8List, int, int)?> _grabSelectedClipFrame() async {
+    final id = _selectedVideoClipId;
+    final clip = id == null ? null : _clipById(id);
+    if (clip == null) return null;
+    Uint8List? encoded;
     try {
-      final originalVideoPath = clip.videoFile?.path;
-      final originalPlaybackPath = _resolvePlaybackPath(clip);
-      await _pauseAllPreviewControllers();
-
-      final result = await ChromaKeyService.processClip(
-        clip: clip,
-        settings: settings,
-        onProgress: (progress) {
-          _chromaKeyProcessingProgress = progress;
-          onProgress?.call(progress);
-          notifyListeners();
-        },
-      );
-
-      if (result.success && result.outputPath != null) {
-        // Create a new file in the app documents directory
-        final appDir = await getApplicationDocumentsDirectory();
-        final newPath = p.join(
-          appDir.path,
-          'chroma_${_uuid.v4()}_${DateTime.now().millisecondsSinceEpoch}.mp4',
+      if (clip.mediaType == MediaType.video && clip.videoFile != null) {
+        final path = _resolvePlaybackPath(clip) ?? clip.videoFile!.path;
+        final source =
+            calculateSourcePositionForTimeline(clip, _currentPosition);
+        encoded = await VideoThumbnail.thumbnailData(
+          video: path,
+          imageFormat: ImageFormat.PNG,
+          timeMs: source.inMilliseconds,
+          maxHeight: 360,
+          quality: 100,
         );
-
-        // Copy the processed file to permanent storage
-        await File(result.outputPath!).copy(newPath);
-
-        // Delete the temp file
-        try {
-          await File(result.outputPath!).delete();
-        } catch (_) {}
-
-        // Update the clip with the processed video file
-        final processedFile = File(newPath);
-        // The processed file contains the clip's source window at 1x speed;
-        // playback speed is still applied on top of it (preview and export).
-        final processedDuration = clip.trimmedDuration > Duration.zero
-            ? clip.trimmedDuration
-            : clip.duration;
-        final updatedClip = clip.copyWith(
-          videoFile: processedFile,
-          sourceStart: Duration.zero,
-          sourceEnd: processedDuration,
-          trimStart: Duration.zero,
-          trimEnd: processedDuration,
-          endTime: clip.startTime +
-              timelineLengthForSource(processedDuration, clip.playbackSpeed),
-          isReversed: false,
-          clearReversedFilePath: true,
-          clearChromaKeySettings: true,
-        );
-
-        recordUndo();
-        _currentProject = _currentProject!
-            .updateVideoClip(_selectedVideoClipId!, updatedClip);
-
-        // Clear the cached preview controller for this path
-        if (originalVideoPath != null) {
-          await _discardPreviewController(originalVideoPath);
-        }
-        if (originalPlaybackPath != null &&
-            originalPlaybackPath != originalVideoPath) {
-          await _discardPreviewController(originalPlaybackPath);
-        }
-        await _discardPreviewController(newPath);
-        _activePreviewClipId = null;
-
-        _isChromaKeyProcessing = false;
-        _chromaKeyProcessingProgress = 1.0;
-        _scheduleAutoSave();
-        notifyListeners();
-        return true;
-      } else {
-        _chromaKeyProcessingError = result.errorMessage ?? 'Processing failed';
-        _isChromaKeyProcessing = false;
-        notifyListeners();
-        return false;
+      } else if (clip.imageFile != null) {
+        encoded = await clip.imageFile!.readAsBytes();
       }
     } catch (e) {
-      _chromaKeyProcessingError = 'Error: $e';
-      _isChromaKeyProcessing = false;
-      notifyListeners();
-      return false;
+      debugPrint('Could not read the frame for colour picking: $e');
+    }
+    if (encoded == null) return null;
+    try {
+      final codec = await ui.instantiateImageCodec(encoded, targetHeight: 360);
+      final image = (await codec.getNextFrame()).image;
+      codec.dispose();
+      final data =
+          await image.toByteData(format: ui.ImageByteFormat.rawStraightRgba);
+      final w = image.width;
+      final h = image.height;
+      image.dispose();
+      if (data == null) return null;
+      return (
+        data.buffer.asUint8List(data.offsetInBytes, data.lengthInBytes),
+        w,
+        h
+      );
+    } catch (_) {
+      return null;
     }
   }
 
-  /// Cancel chroma key processing
-  Future<void> cancelChromaKeyProcessing() async {
-    await ChromaKeyService.cancel();
-    _isChromaKeyProcessing = false;
-    _chromaKeyProcessingProgress = 0.0;
-    notifyListeners();
+  /// Picks the colour to remove at [uv] (0..1 in the clip's picture) and
+  /// turns the green screen on. Returns false when the frame was not
+  /// readable.
+  Future<bool> pickChromaColorAt(Offset uv) async {
+    final frame = await _grabSelectedClipFrame();
+    _chromaPickMode = false;
+    if (frame == null) {
+      notifyListeners();
+      return false;
+    }
+    final (pixels, w, h) = frame;
+    final color = ChromaKey.sample(pixels, w, h, uv);
+    updateChromaKeySettings(
+      enabled: true,
+      keyColor: color,
+      spillReduction: ChromaKey.canDespill(color) ? 1.0 : 0.0,
+    );
+    return true;
+  }
+
+  /// Finds the green/blue screen colour from the frame's edges and turns
+  /// the green screen on. Returns the colour, or null when none was found.
+  Future<Color?> autoDetectChromaColor() async {
+    final frame = await _grabSelectedClipFrame();
+    if (frame == null) return null;
+    final (pixels, w, h) = frame;
+    final color = ChromaKey.detect(pixels, w, h);
+    if (color == null) return null;
+    updateChromaKeySettings(enabled: true, keyColor: color, spillReduction: 1.0);
+    return color;
   }
 
   /// Reorder video clips by moving a clip to a new position
@@ -6593,7 +6507,7 @@ class VideoEditorProvider extends ChangeNotifier {
   // ── Text ───────────────────────────────────────────────────────────────
 
   /// Splits a text overlay at the playhead. The first half keeps the in
-  /// animation, the second half the out animation.
+  /// animation, the second half the out animation; motion is split too.
   bool cutTextOverlay(String overlayId) {
     final project = _currentProject;
     if (project == null) return false;
@@ -6602,48 +6516,18 @@ class VideoEditorProvider extends ChangeNotifier {
     final o = project.textOverlays[i];
     final cut = _currentPosition;
     if (cut <= o.startTime || cut >= o.endTime) return false;
-    final first = TextOverlay(
-      id: _uuid.v4(),
-      text: o.text,
-      position: o.position,
-      fontSize: o.fontSize,
-      color: o.color,
-      fontFamily: o.fontFamily,
-      fontWeight: o.fontWeight,
-      startTime: o.startTime,
-      endTime: cut,
-      rotation: o.rotation,
-      opacity: o.opacity,
-      fontStyle: o.fontStyle,
-      textAlign: o.textAlign,
-      animIn: o.animIn,
-      animOut: 'none',
-      boxColor: o.boxColor,
-      outlineColor: o.outlineColor,
-      outlineWidth: o.outlineWidth,
-      shadow: o.shadow,
-    );
-    final second = TextOverlay(
-      id: _uuid.v4(),
-      text: o.text,
-      position: o.position,
-      fontSize: o.fontSize,
-      color: o.color,
-      fontFamily: o.fontFamily,
-      fontWeight: o.fontWeight,
-      startTime: cut,
-      endTime: o.endTime,
-      rotation: o.rotation,
-      opacity: o.opacity,
-      fontStyle: o.fontStyle,
-      textAlign: o.textAlign,
-      animIn: 'none',
-      animOut: o.animOut,
-      boxColor: o.boxColor,
-      outlineColor: o.outlineColor,
-      outlineWidth: o.outlineWidth,
-      shadow: o.shadow,
-    );
+    final (firstFrames, secondFrames) = ItemKeyframe.split(
+        o.keyframeData, cut - o.startTime, o.position, o.fontSize);
+    final first = o.copyWith(
+        id: _uuid.v4(),
+        endTime: cut,
+        animOut: 'none',
+        keyframeData: firstFrames);
+    final second = o.copyWith(
+        id: _uuid.v4(),
+        startTime: cut,
+        animIn: 'none',
+        keyframeData: secondFrames);
     final list = List<TextOverlay>.from(project.textOverlays)
       ..removeAt(i)
       ..insertAll(i, [first, second]);
@@ -6661,33 +6545,247 @@ class VideoEditorProvider extends ChangeNotifier {
     final i = _indexOf<TextOverlay>(project.textOverlays, overlayId, (t) => t.id);
     if (i == -1) return null;
     final o = project.textOverlays[i];
-    final copy = TextOverlay(
+    Offset nudge(Offset p) =>
+        Offset((p.dx + 0.04).clamp(0.0, 0.95), (p.dy + 0.04).clamp(0.0, 0.95));
+    final copy = o.copyWith(
       id: _uuid.v4(),
-      text: o.text,
-      position: Offset((o.position.dx + 0.04).clamp(0.0, 0.95),
-          (o.position.dy + 0.04).clamp(0.0, 0.95)),
-      fontSize: o.fontSize,
-      color: o.color,
-      fontFamily: o.fontFamily,
-      fontWeight: o.fontWeight,
-      startTime: o.startTime,
-      endTime: o.endTime,
-      rotation: o.rotation,
-      opacity: o.opacity,
-      fontStyle: o.fontStyle,
-      textAlign: o.textAlign,
-      animIn: o.animIn,
-      animOut: o.animOut,
-      boxColor: o.boxColor,
-      outlineColor: o.outlineColor,
-      outlineWidth: o.outlineWidth,
-      shadow: o.shadow,
+      position: nudge(o.position),
+      keyframeData: ItemKeyframe.encode([
+        for (final k in o.keyframes)
+          ItemKeyframe(k.time, nudge(k.position), k.size)
+      ]),
     );
     recordUndo();
     _currentProject = project.addTextOverlay(copy);
     _selectOnly(text: copy.id);
     _commitEdit();
     return copy.id;
+  }
+
+  /// Moves/resizes a text overlay (top-left [position], [fontSize]). With
+  /// motion keyframes, edits the keyframe at the playhead instead. Inside a
+  /// gesture the whole gesture is one undo step.
+  void updateTextTransform(String overlayId,
+      {Offset? position, double? fontSize}) {
+    final project = _currentProject;
+    if (project == null) return;
+    final i = _indexOf<TextOverlay>(project.textOverlays, overlayId, (t) => t.id);
+    if (i == -1) return;
+    final o = project.textOverlays[i];
+    final TextOverlay updated;
+    if (o.keyframeData.isEmpty) {
+      updated = o.copyWith(position: position, fontSize: fontSize);
+    } else {
+      final local = _itemLocalTime(o.startTime, o.endTime);
+      final (pos, size) =
+          ItemKeyframe.at(o.keyframeData, local, o.position, o.fontSize);
+      updated = o.copyWith(
+          keyframeData: _withItemKeyframe(o.keyframeData,
+              ItemKeyframe(local, position ?? pos, fontSize ?? size)));
+    }
+    recordUndo(coalesceKey: 'text-transform:$overlayId');
+    _currentProject = project.updateTextOverlay(overlayId, updated);
+    _commitEdit();
+  }
+
+  /// Moves/resizes/rotates a sticker. Position and scale go to the keyframe
+  /// at the playhead when the sticker has motion.
+  void updateStickerTransform(String stickerId,
+      {Offset? position, double? scale, double? rotation}) {
+    final project = _currentProject;
+    if (project == null) return;
+    final i = _indexOf<StickerModel>(project.stickers, stickerId, (s) => s.id);
+    if (i == -1) return;
+    final s = project.stickers[i];
+    final StickerModel updated;
+    if (s.keyframeData.isEmpty) {
+      updated = s.copyWith(position: position, scale: scale, rotation: rotation);
+    } else {
+      final local = _itemLocalTime(s.startTime, s.endTime);
+      final (pos, size) =
+          ItemKeyframe.at(s.keyframeData, local, s.position, s.scale);
+      updated = s.copyWith(
+          rotation: rotation,
+          keyframeData: _withItemKeyframe(s.keyframeData,
+              ItemKeyframe(local, position ?? pos, scale ?? size)));
+    }
+    recordUndo(coalesceKey: 'sticker-transform:$stickerId');
+    _currentProject = project.updateSticker(stickerId, updated);
+    _commitEdit();
+  }
+
+  /// Time into an item spanning [start]..[end] at the playhead (clamped).
+  Duration _itemLocalTime(Duration start, Duration end) {
+    var local = _currentPosition - start;
+    if (local < Duration.zero) local = Duration.zero;
+    if (local > end - start) local = end - start;
+    return local;
+  }
+
+  List<double> _withItemKeyframe(List<double> data, ItemKeyframe frame) {
+    final frames = ItemKeyframe.decode(data)
+        .where((k) => (k.time - frame.time).abs() > _keyframeSnap)
+        .toList()
+      ..add(frame);
+    return ItemKeyframe.encode(frames);
+  }
+
+  // ── Motion for any item (text, sticker, media overlay) ────────────────
+
+  /// Number of motion keyframes of an item.
+  int keyframeCount(TimelineItemKind kind, String id) {
+    switch (kind) {
+      case TimelineItemKind.overlay:
+        return overlayClipById(id)?.keyframes.length ?? 0;
+      case TimelineItemKind.text:
+      case TimelineItemKind.sticker:
+        return ItemKeyframe.decode(_itemKeyframeData(kind, id)).length;
+      case TimelineItemKind.audio:
+        return 0;
+    }
+  }
+
+  /// Start and end of an item on the timeline (null when not found).
+  (Duration, Duration)? itemSpan(TimelineItemKind kind, String id) {
+    final project = _currentProject;
+    if (project == null) return null;
+    switch (kind) {
+      case TimelineItemKind.text:
+        for (final t in project.textOverlays) {
+          if (t.id == id) return (t.startTime, t.endTime);
+        }
+      case TimelineItemKind.sticker:
+        for (final s in project.stickers) {
+          if (s.id == id) return (s.startTime, s.endTime);
+        }
+      case TimelineItemKind.overlay:
+        final c = overlayClipById(id);
+        if (c != null) return (c.startTime, c.endTime);
+      case TimelineItemKind.audio:
+        for (final a in project.audioOverlays) {
+          if (a.id == id) return (a.startTime, a.endTime);
+        }
+    }
+    return null;
+  }
+
+  /// True when the item has a motion keyframe at the playhead.
+  bool hasKeyframeAtPlayhead(TimelineItemKind kind, String id) {
+    if (kind == TimelineItemKind.overlay) {
+      return overlayHasKeyframeAtPlayhead(id);
+    }
+    final span = itemSpan(kind, id);
+    if (span == null) return false;
+    final local = _itemLocalTime(span.$1, span.$2);
+    return ItemKeyframe.decode(_itemKeyframeData(kind, id))
+        .any((k) => (k.time - local).abs() <= _keyframeSnap);
+  }
+
+  List<double> _itemKeyframeData(TimelineItemKind kind, String id) {
+    final project = _currentProject;
+    if (project == null) return const [];
+    if (kind == TimelineItemKind.text) {
+      for (final t in project.textOverlays) {
+        if (t.id == id) return t.keyframeData;
+      }
+    } else if (kind == TimelineItemKind.sticker) {
+      for (final s in project.stickers) {
+        if (s.id == id) return s.keyframeData;
+      }
+    }
+    return const [];
+  }
+
+  /// Rewrites a text/sticker's keyframes with [edit], which gets the
+  /// current data, the local time at the playhead and the item's place and
+  /// size there, and returns the new data (null = no change). When the
+  /// motion is cleared the item stays where it is at the playhead.
+  void _editItemMotion(
+      TimelineItemKind kind,
+      String id,
+      List<double>? Function(
+              List<double> data, Duration local, Offset pos, double size)
+          edit) {
+    final project = _currentProject;
+    if (project == null) return;
+    if (kind == TimelineItemKind.text) {
+      final i = _indexOf<TextOverlay>(project.textOverlays, id, (t) => t.id);
+      if (i == -1) return;
+      final o = project.textOverlays[i];
+      final local = _itemLocalTime(o.startTime, o.endTime);
+      final (pos, size) =
+          ItemKeyframe.at(o.keyframeData, local, o.position, o.fontSize);
+      final data = edit(o.keyframeData, local, pos, size);
+      if (data == null) return;
+      recordUndo();
+      _currentProject = project.updateTextOverlay(
+          id,
+          o.copyWith(
+            keyframeData: data,
+            position: data.isEmpty ? pos : null,
+            fontSize: data.isEmpty ? size : null,
+          ));
+    } else if (kind == TimelineItemKind.sticker) {
+      final i = _indexOf<StickerModel>(project.stickers, id, (s) => s.id);
+      if (i == -1) return;
+      final s = project.stickers[i];
+      final local = _itemLocalTime(s.startTime, s.endTime);
+      final (pos, size) =
+          ItemKeyframe.at(s.keyframeData, local, s.position, s.scale);
+      final data = edit(s.keyframeData, local, pos, size);
+      if (data == null) return;
+      recordUndo();
+      _currentProject = project.updateSticker(
+          id,
+          s.copyWith(
+            keyframeData: data,
+            position: data.isEmpty ? pos : null,
+            scale: data.isEmpty ? size : null,
+          ));
+    } else {
+      return;
+    }
+    _commitEdit();
+  }
+
+  /// Adds a keyframe at the playhead holding the item's current place and
+  /// size. The first keyframe also pins the start, so the item moves from
+  /// where it is now.
+  void addKeyframeAtPlayhead(TimelineItemKind kind, String id) {
+    if (kind == TimelineItemKind.overlay) {
+      addOverlayKeyframeAtPlayhead(id);
+      return;
+    }
+    _editItemMotion(kind, id, (data, local, pos, size) {
+      var out = _withItemKeyframe(data, ItemKeyframe(local, pos, size));
+      if (data.isEmpty && local > _keyframeSnap) {
+        out = _withItemKeyframe(out, ItemKeyframe(Duration.zero, pos, size));
+      }
+      return out;
+    });
+  }
+
+  void removeKeyframeAtPlayhead(TimelineItemKind kind, String id) {
+    if (kind == TimelineItemKind.overlay) {
+      removeOverlayKeyframeAtPlayhead(id);
+      return;
+    }
+    _editItemMotion(kind, id, (data, local, pos, size) {
+      final frames = ItemKeyframe.decode(data);
+      final kept =
+          frames.where((k) => (k.time - local).abs() > _keyframeSnap).toList();
+      return kept.length == frames.length ? null : ItemKeyframe.encode(kept);
+    });
+  }
+
+  /// Removes all motion; the item stays where it is at the playhead.
+  void clearKeyframes(TimelineItemKind kind, String id) {
+    if (kind == TimelineItemKind.overlay) {
+      clearOverlayKeyframes(id);
+      return;
+    }
+    _editItemMotion(
+        kind, id, (data, local, pos, size) => data.isEmpty ? null : const []);
   }
 
   // ── Stickers ───────────────────────────────────────────────────────────
@@ -6700,8 +6798,18 @@ class VideoEditorProvider extends ChangeNotifier {
     final s = project.stickers[i];
     final cut = _currentPosition;
     if (cut <= s.startTime || cut >= s.endTime) return false;
-    final first = s.copyWith(id: _uuid.v4(), endTime: cut, animOut: 'none');
-    final second = s.copyWith(id: _uuid.v4(), startTime: cut, animIn: 'none');
+    final (firstFrames, secondFrames) = ItemKeyframe.split(
+        s.keyframeData, cut - s.startTime, s.position, s.scale);
+    final first = s.copyWith(
+        id: _uuid.v4(),
+        endTime: cut,
+        animOut: 'none',
+        keyframeData: firstFrames);
+    final second = s.copyWith(
+        id: _uuid.v4(),
+        startTime: cut,
+        animIn: 'none',
+        keyframeData: secondFrames);
     final list = List<StickerModel>.from(project.stickers)
       ..removeAt(i)
       ..insertAll(i, [first, second]);
@@ -6718,10 +6826,15 @@ class VideoEditorProvider extends ChangeNotifier {
     final i = _indexOf<StickerModel>(project.stickers, stickerId, (s) => s.id);
     if (i == -1) return null;
     final s = project.stickers[i];
+    Offset nudge(Offset p) =>
+        Offset((p.dx + 0.05).clamp(0.0, 1.0), (p.dy + 0.05).clamp(0.0, 1.0));
     final copy = s.copyWith(
       id: _uuid.v4(),
-      position: Offset((s.position.dx + 0.05).clamp(0.0, 1.0),
-          (s.position.dy + 0.05).clamp(0.0, 1.0)),
+      position: nudge(s.position),
+      keyframeData: ItemKeyframe.encode([
+        for (final k in s.keyframes)
+          ItemKeyframe(k.time, nudge(k.position), k.size)
+      ]),
     );
     recordUndo();
     _currentProject = project.addSticker(copy);
