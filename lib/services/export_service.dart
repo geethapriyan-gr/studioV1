@@ -1314,7 +1314,7 @@ class ExportService {
 
     final filterString = filters.join(',');
 
-    final command = '-y -i "$inputPath" -vf "$filterString" -c:v $encoder -preset $preset -tune fastdecode -threads 0 -b:v 3M -c:a copy "$outputPath"';
+    final command = '-y -i "$inputPath" -vf "$filterString" -c:v $encoder -preset $preset -tune fastdecode -threads 0 -crf $_crf -c:a copy "$outputPath"';
 
     final result = await _executeFFmpeg(command, onProgress,
         outputPath: outputPath, duration: duration);
@@ -1873,7 +1873,7 @@ class ExportService {
     final command =
         '$inputArgs -filter_complex "$fcStr" '
         '-map "[out]" -map 0:a? '
-        '-c:v $encoder -preset $preset -tune fastdecode -threads 0 -b:v 3M -r $targetFps -pix_fmt yuv420p -c:a copy -shortest "$tempOutput"';
+        '-c:v $encoder -preset $preset -tune fastdecode -threads 0 -crf $_crf -r $targetFps -pix_fmt yuv420p -c:a copy -shortest "$tempOutput"';
 
     final result = await _executeFFmpeg(command, onProgress, outputPath: tempOutput, duration: duration);
     return result ?? inputPath;
@@ -1920,7 +1920,7 @@ class ExportService {
             '-y -loop 1 -t $duration -i "$overlayFilePath" -i "$currentInput" '
             '-filter_complex "[0:v]scale=$width:$height:force_original_aspect_ratio=decrease$opacityFilter[opacity];'
             '[1:v][opacity]overlay=$x:$y:enable=\'between(t,$start,$end)\'[out]" '
-            '-map "[out]" -map 1:a? -c:v $encoder -preset $preset -tune fastdecode -threads 0 -b:v 3M -c:a copy -shortest "$tempOutput"';
+            '-map "[out]" -map 1:a? -c:v $encoder -preset $preset -tune fastdecode -threads 0 -crf $_crf -c:a copy -shortest "$tempOutput"';
       } else {
         // Video overlay — use source-relative trim points
         final sourceStartSec = overlay.trimStart.inMilliseconds / 1000.0;
@@ -1947,19 +1947,19 @@ class ExportService {
                 '[1:v][opacity]overlay=$x:$y:enable=\'between(t,$start,$end)\'[out];'
                 '[0:a]volume=$overlayVol,adelay=$delayMs|$delayMs[a_delayed];'
                 '[1:a][a_delayed]amix=inputs=2:duration=first:dropout_transition=0[aout]" '
-                '-map "[out]" -map "[aout]" -c:v $encoder -preset $preset -tune fastdecode -threads 0 -b:v 3M -c:a aac "$tempOutput"';
+                '-map "[out]" -map "[aout]" -c:v $encoder -preset $preset -tune fastdecode -threads 0 -crf $_crf -c:a aac "$tempOutput"';
           } else {
             command = '-y -i "$trimmedOverlay" -i "$currentInput" '
                 '-filter_complex "[0:v]setpts=PTS-STARTPTS+$start/TB,scale=$width:$height:force_original_aspect_ratio=decrease$opacityFilter[opacity];'
                 '[1:v][opacity]overlay=$x:$y:enable=\'between(t,$start,$end)\'[out];'
                 '[0:a]volume=$overlayVol,adelay=$delayMs|$delayMs[aout]" '
-                '-map "[out]" -map "[aout]" -c:v $encoder -preset $preset -tune fastdecode -threads 0 -b:v 3M -c:a aac "$tempOutput"';
+                '-map "[out]" -map "[aout]" -c:v $encoder -preset $preset -tune fastdecode -threads 0 -crf $_crf -c:a aac "$tempOutput"';
           }
         } else {
           command = '-y -i "$trimmedOverlay" -i "$currentInput" '
               '-filter_complex "[0:v]setpts=PTS-STARTPTS+$start/TB,scale=$width:$height:force_original_aspect_ratio=decrease$opacityFilter[opacity];'
               '[1:v][opacity]overlay=$x:$y:enable=\'between(t,$start,$end)\'[out]" '
-              '-map "[out]" -map 1:a? -c:v $encoder -preset $preset -tune fastdecode -threads 0 -b:v 3M -c:a copy "$tempOutput"';
+              '-map "[out]" -map 1:a? -c:v $encoder -preset $preset -tune fastdecode -threads 0 -crf $_crf -c:a copy "$tempOutput"';
         }
       }
 
@@ -2095,7 +2095,7 @@ class ExportService {
     final command =
         '$inputArgs -filter_complex "$fcStr" '
         '-map "[out]" -map 0:a? '
-        '-c:v $encoder -preset $preset -tune fastdecode -threads 0 -b:v 3M -r $targetFps -pix_fmt yuv420p -c:a copy -shortest "$tempOutput"';
+        '-c:v $encoder -preset $preset -tune fastdecode -threads 0 -crf $_crf -r $targetFps -pix_fmt yuv420p -c:a copy -shortest "$tempOutput"';
 
     final result = await _executeFFmpeg(command, onProgress,
         outputPath: tempOutput, duration: duration);
