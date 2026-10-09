@@ -28,6 +28,9 @@ import '../services/video_thumbnail_service.dart';
 import '../utils/track_allocation.dart';
 import '../utils/audio_fades.dart';
 import '../utils/sticker_catalog.dart';
+import '../utils/caption_style.dart';
+import '../utils/text_overlay_painter.dart';
+import '../services/caption_service.dart';
 
 class VideoEditorProvider extends ChangeNotifier {
   VideoProject? _currentProject;
@@ -7166,6 +7169,80 @@ class VideoEditorProvider extends ChangeNotifier {
         _currentProject = project.copyWith(overlayClips: list);
     }
     if (_isPlaying) unawaited(_syncAudioPlayback(force: true));
+    _commitEdit();
+  }
+
+  // ── Auto-captions ──────────────────────────────────────────────────────
+
+  /// Captions are text items whose id starts with this, so they can be
+  /// restyled or removed together.
+  static const String captionIdPrefix = 'caption-';
+
+  List<TextOverlay> get captions => [
+        for (final t in _currentProject?.textOverlays ?? const <TextOverlay>[])
+          if (t.id.startsWith(captionIdPrefix)) t
+      ];
+
+  /// Centres a caption horizontally near the bottom of the preview box.
+  TextOverlay _placeCaption(TextOverlay t) {
+    final painter = TextOverlayPainter(t);
+    // The preview draws text 7 canvas px inside its box on each side.
+    final w = painter.size.width + 14;
+    final h = painter.size.height + 14;
+    final designWidth = 1920.0 * canvasAspectAt(t.startTime);
+    return t.copyWith(
+      position: Offset(
+        ((designWidth - w) / 2 / designWidth).clamp(0.0, 1.0),
+        (0.86 - h / 1920 / 2).clamp(0.0, 1.0),
+      ),
+    );
+  }
+
+  /// Replaces the project's captions with [cues] in [style] (one undo step).
+  void setCaptions(List<CaptionCue> cues, CaptionStyle style) {
+    final project = _currentProject;
+    if (project == null) return;
+    final kept = project.textOverlays
+        .where((t) => !t.id.startsWith(captionIdPrefix))
+        .toList();
+    final added = [
+      for (final c in cues)
+        _placeCaption(style.applyTo(TextOverlay(
+          id: '$captionIdPrefix${_uuid.v4()}',
+          text: c.text,
+          position: Offset.zero,
+          startTime: c.start,
+          endTime: c.end,
+        ))),
+    ];
+    recordUndo();
+    _currentProject = project.copyWith(textOverlays: [...kept, ...added]);
+    _commitEdit();
+  }
+
+  /// Gives every caption [style] (one undo step).
+  void restyleCaptions(CaptionStyle style) {
+    final project = _currentProject;
+    if (project == null || captions.isEmpty) return;
+    recordUndo();
+    _currentProject = project.copyWith(textOverlays: [
+      for (final t in project.textOverlays)
+        t.id.startsWith(captionIdPrefix) ? _placeCaption(style.applyTo(t)) : t
+    ]);
+    _commitEdit();
+  }
+
+  void removeCaptions() {
+    final project = _currentProject;
+    if (project == null || captions.isEmpty) return;
+    recordUndo();
+    _currentProject = project.copyWith(
+        textOverlays: project.textOverlays
+            .where((t) => !t.id.startsWith(captionIdPrefix))
+            .toList());
+    if (_selectedTextOverlayId?.startsWith(captionIdPrefix) ?? false) {
+      _selectedTextOverlayId = null;
+    }
     _commitEdit();
   }
 }

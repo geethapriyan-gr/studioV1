@@ -16,3 +16,13 @@ subprojects {
 tasks.register("clean", Delete) {
     delete rootProject.buildDir
 }
+
+// whisper.cpp (auto-captions) is unusably slow without optimisation, so compile
+// it with full optimisation even in debug builds of the app.
+subprojects { p ->
+    p.plugins.withId("com.android.library") {
+        if (p.name == "whisper_edge") {
+            p.android.defaultConfig.externalNativeBuild.cmake.arguments "-DCMAKE_C_FLAGS_DEBUG=-O3 -DNDEBUG", "-DCMAKE_CXX_FLAGS_DEBUG=-O3 -DNDEBUG"
+        }
+    }
+}

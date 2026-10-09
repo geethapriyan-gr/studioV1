@@ -73,6 +73,7 @@ dependencies:
   cupertino_icons: ^1.0.8
   share_plus: ^12.0.2
   gal: ^2.3.3
+  whisper_edge: 0.2.0
 
 dev_dependencies:
   flutter_test:

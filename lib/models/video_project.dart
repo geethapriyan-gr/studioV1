@@ -722,6 +722,9 @@ class StickerModel {
   /// Animated GIF stickers play in the preview and in the export.
   bool get isAnimated => assetPath.toLowerCase().endsWith('.gif');
 
+  /// A vector shape (box, arrow, highlight...) rather than a picture.
+  bool get isShape => assetPath.startsWith('shape:');
+
   StickerModel copyWith({
     String? id,
     String? assetPath,

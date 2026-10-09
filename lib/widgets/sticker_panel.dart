@@ -6,6 +6,7 @@ import 'package:provider/provider.dart';
 
 import '../main.dart' show AppColors;
 import '../providers/video_editor_provider.dart';
+import '../utils/shape_spec.dart';
 import '../utils/sticker_catalog.dart';
 import 'length_prompt.dart';
 import 'sticker_layer.dart' show stickerImageProvider;
@@ -60,9 +61,17 @@ class _StickerPanelState extends State<StickerPanel> {
     });
   }
 
+  static final List<StickerEntry> _shapes = [
+    for (final (label, spec) in ShapeSpec.presets)
+      StickerEntry(spec.toPath(), label, StickerCatalog.shapes),
+  ];
+
   StickerEntry _entryFor(String path) {
-    for (final e in _bundled) {
+    for (final e in [..._bundled, ..._shapes]) {
       if (e.path == path) return e;
+    }
+    if (ShapeSpec.isShape(path)) {
+      return StickerEntry(path, 'Shape', StickerCatalog.shapes);
     }
     return StickerEntry(path, 'My sticker', StickerCatalog.mine);
   }
@@ -71,7 +80,7 @@ class _StickerPanelState extends State<StickerPanel> {
     final q = _query.trim().toLowerCase();
     if (q.isNotEmpty) {
       return [
-        for (final e in _bundled)
+        for (final e in [..._shapes, ..._bundled])
           if (e.label.toLowerCase().contains(q) ||
               e.category.toLowerCase().contains(q))
             e,
@@ -80,11 +89,16 @@ class _StickerPanelState extends State<StickerPanel> {
     switch (_category) {
       case StickerCatalog.recent:
         return _recents
-            .where((p) => p.startsWith('assets/') || File(p).existsSync())
+            .where((p) =>
+                p.startsWith('assets/') ||
+                ShapeSpec.isShape(p) ||
+                File(p).existsSync())
             .map(_entryFor)
             .toList();
       case StickerCatalog.mine:
         return _custom.map(_entryFor).toList();
+      case StickerCatalog.shapes:
+        return _shapes;
       default:
         return _bundled.where((e) => e.category == _category).toList();
     }

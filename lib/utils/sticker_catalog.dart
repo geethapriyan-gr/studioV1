@@ -22,9 +22,11 @@ class StickerCatalog {
 
   static const String recent = 'Recent';
   static const String mine = 'My stickers';
+  static const String shapes = 'Shapes';
   static const List<String> categories = [
     recent,
     mine,
+    shapes,
     'Logos',
     'Study',
     'Words',

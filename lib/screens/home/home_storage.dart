@@ -33,15 +33,67 @@ class ExportedVideo {
 }
 
 /// File-system helpers for the home screen: storage stats, cache cleanup
-/// and discovering exported videos. The editor writes every export to the
-/// temp folder as `edited_video_<time>.mp4` before saving a copy where the
-/// user chose, so that folder is the export history.
+/// and discovering exported videos.
+///
+/// Exports live in `<app documents>/exports/` as `edited_video_<time>.mp4`.
+/// They used to be written to the temp (cache) folder, which Android and
+/// phone "cleaner" tools empty on their own, so exports vanished after a
+/// day or so; [migrateExports] moves any that are still there.
 class HomeStorage {
   HomeStorage._();
+
+  static const String _exportsFolder = 'exports';
 
   static bool _isExport(String path) {
     final name = p.basename(path);
     return name.startsWith('edited_video_') && name.endsWith('.mp4');
+  }
+
+  /// Permanent folder for exported videos (created when missing).
+  static Future<Directory> exportsDir() async {
+    final docs = await getApplicationDocumentsDirectory();
+    final dir = Directory(p.join(docs.path, _exportsFolder));
+    if (!await dir.exists()) await dir.create(recursive: true);
+    return dir;
+  }
+
+  /// Where the editor writes a new export.
+  static Future<String> newExportPath() async {
+    final dir = await exportsDir();
+    return p.join(
+        dir.path, 'edited_video_${DateTime.now().millisecondsSinceEpoch}.mp4');
+  }
+
+  /// Moves exports left in the temp folder by older versions into the
+  /// permanent exports folder. Returns old path → new path.
+  static Future<Map<String, String>> migrateExports() async {
+    final moved = <String, String>{};
+    try {
+      final temp = await getTemporaryDirectory();
+      if (!await temp.exists()) return moved;
+      final dir = await exportsDir();
+      await for (final e in temp.list(followLinks: false)) {
+        if (e is! File || !_isExport(e.path)) continue;
+        final target = p.join(dir.path, p.basename(e.path));
+        try {
+          final stat = await e.stat();
+          if (stat.size <= 0) continue;
+          File out;
+          try {
+            out = await e.rename(target); // same volume: instant
+          } catch (_) {
+            out = await e.copy(target);
+            await e.delete();
+          }
+          // Keep the original date so the list order stays right.
+          try {
+            await out.setLastModified(stat.modified);
+          } catch (_) {}
+          moved[e.path] = target;
+        } catch (_) {}
+      }
+    } catch (_) {}
+    return moved;
   }
 
   static bool _isRenderCache(String relative) {
@@ -72,9 +124,11 @@ class HomeStorage {
   static Future<StorageUsage> usage() async {
     final docs = await getApplicationDocumentsDirectory();
     final temp = await getTemporaryDirectory();
+    final exportsDir = await HomeStorage.exportsDir();
 
-    final projectMedia = await _sizeOf(docs);
-    var exports = 0, render = 0, other = 0;
+    final exportsSize = await _sizeOf(exportsDir);
+    final projectMedia = await _sizeOf(docs) - exportsSize;
+    var exports = exportsSize, render = 0, other = 0;
     if (await temp.exists()) {
       await for (final e in temp.list(followLinks: false)) {
         final size = await _sizeOf(e);
@@ -114,10 +168,10 @@ class HomeStorage {
   }
 
   static Future<List<ExportedVideo>> exports() async {
-    final temp = await getTemporaryDirectory();
+    await migrateExports();
+    final dir = await exportsDir();
     final result = <ExportedVideo>[];
-    if (!await temp.exists()) return result;
-    await for (final e in temp.list(followLinks: false)) {
+    await for (final e in dir.list(followLinks: false)) {
       if (e is! File || !_isExport(e.path)) continue;
       try {
         final stat = await e.stat();

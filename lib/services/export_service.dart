@@ -19,6 +19,7 @@ import '../effects/effect_engine.dart';
 import '../utils/audio_fades.dart';
 import '../utils/chroma_key.dart';
 import '../utils/overlay_shapes.dart';
+import '../utils/shape_spec.dart';
 import '../utils/sticker_catalog.dart';
 import '../utils/text_overlay_painter.dart';
 
@@ -2251,6 +2252,8 @@ class ExportService {
   /// images (first frame for GIFs).
   static Future<ui.Image?> _loadStickerImage(String stickerPath) async {
     try {
+      final shape = ShapeSpec.parse(stickerPath);
+      if (shape != null) return await shape.render(longSide: 1600);
       final resolved = StickerCatalog.resolve(stickerPath);
       final Uint8List bytes;
       if (resolved.startsWith('assets/')) {

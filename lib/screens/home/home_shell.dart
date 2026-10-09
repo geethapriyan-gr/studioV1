@@ -57,6 +57,9 @@ class _HomeShellState extends State<HomeShell> {
   /// Exports made since the last project was opened belong to that project
   /// (only one project can be open between two visits to the home screen).
   Future<void> _attributeNewExports(HomePrefs prefs) async {
+    // Rescue exports older versions left in the cache folder (which the
+    // system empties) before anything lists them.
+    await prefs.renameExports(await HomeStorage.migrateExports());
     final projectId = prefs.lastOpenedId;
     final since = prefs.lastOpenedAtMs;
     if (projectId == null || since == 0) return;

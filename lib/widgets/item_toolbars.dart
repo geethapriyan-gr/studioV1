@@ -9,6 +9,7 @@ import '../models/chroma_key_settings.dart';
 import '../models/video_project.dart';
 import '../providers/video_editor_provider.dart';
 import '../utils/overlay_shapes.dart';
+import '../utils/shape_spec.dart';
 import '../utils/text_overlay_painter.dart';
 import 'clip_toolbar.dart';
 import 'length_prompt.dart';
@@ -198,6 +199,10 @@ class StickerItemToolbar extends StatelessWidget {
     final id = sticker.id;
     final degrees = sticker.rotation * 180 / math.pi;
     final tools = <ToolbarTool>[
+      if (sticker.isShape)
+        ToolbarTool(Icons.palette_outlined, 'Style',
+            () => ItemSheets.shapeStyle(context, id),
+            highlight: true),
       ToolbarTool(Icons.content_cut_rounded, 'Split', () {
         _split(context, sticker.startTime, sticker.endTime,
             provider.currentPosition, () => provider.cutSticker(id));
@@ -233,7 +238,7 @@ class StickerItemToolbar extends StatelessWidget {
       }, danger: true),
     ];
     return SelectionToolbar(
-      title: 'Sticker',
+      title: sticker.isShape ? 'Shape' : 'Sticker',
       subtitle: _secs(sticker.endTime - sticker.startTime),
       onClose: () => provider.selectSticker(null),
       tools: tools,
@@ -484,6 +489,105 @@ class ItemSheets {
             animIn: s.animIn,
             animOut: s.animOut,
             onChanged: (i, o) => p.updateSticker(id, animIn: i, animOut: o),
+          );
+        },
+      );
+
+  static const _shapeColors = [
+    Color(0xFFFF3B30),
+    Color(0xFFFFD60A),
+    Color(0xFF34C759),
+    Color(0xFF0A84FF),
+    Color(0xFFBF5AF2),
+    Colors.white,
+    Colors.black,
+    Color(0xCC000000),
+  ];
+
+  /// Look of a shape (box, arrow, highlight...): kind, colour, line
+  /// thickness, fill and stretch. A slider drag is one undo step.
+  static Future<void> shapeStyle(BuildContext context, String id) => _show(
+        context,
+        title: 'Shape style',
+        icon: Icons.palette_outlined,
+        builder: (p) {
+          final s = _sticker(p, id);
+          final spec = s == null ? null : ShapeSpec.parse(s.assetPath);
+          if (s == null || spec == null) return null;
+          void set(ShapeSpec v, {String? undoKey}) =>
+              p.updateSticker(id, assetPath: v.toPath(), undoKey: undoKey);
+          return Column(
+            crossAxisAlignment: CrossAxisAlignment.start,
+            children: [
+              Wrap(
+                spacing: 10,
+                runSpacing: 10,
+                children: [
+                  for (final (key, label, icon) in ShapeSpec.types)
+                    _ChoiceTile(
+                      icon: icon,
+                      label: label,
+                      selected: spec.type == key,
+                      onTap: () => set(spec.copyWith(
+                        type: key,
+                        // Arrows and lines read best long and thin.
+                        aspect: (key == 'arrow' || key == 'line') &&
+                                spec.aspect < 2
+                            ? 3.0
+                            : null,
+                      )),
+                    ),
+                ],
+              ),
+              const SizedBox(height: 16),
+              Wrap(
+                spacing: 10,
+                runSpacing: 10,
+                children: [
+                  for (final color in _shapeColors)
+                    _Swatch(
+                      color: color,
+                      selected:
+                          spec.color.toARGB32() == color.toARGB32(),
+                      onTap: () => set(spec.copyWith(color: color)),
+                    ),
+                ],
+              ),
+              const SizedBox(height: 14),
+              Text('Thickness',
+                  style: TextStyle(color: AppColors.textSecondary)),
+              _LiveSlider(
+                value: spec.stroke,
+                min: 4,
+                max: 90,
+                enabled: !(spec.filled && spec.canFill),
+                label: (v) => v.round().toString(),
+                onChanged: (v) => set(spec.copyWith(stroke: v),
+                    undoKey: 'shape-stroke:$id'),
+                onChangeEnd: (_) => p.sealUndo(),
+              ),
+              Text('Stretch', style: TextStyle(color: AppColors.textSecondary)),
+              _LiveSlider(
+                value: spec.aspect,
+                min: 0.3,
+                max: 8,
+                label: (v) => '${v.toStringAsFixed(1)}:1',
+                onChanged: (v) => set(spec.copyWith(aspect: v),
+                    undoKey: 'shape-aspect:$id'),
+                onChangeEnd: (_) => p.sealUndo(),
+              ),
+              if (spec.canFill)
+                SwitchListTile(
+                  contentPadding: EdgeInsets.zero,
+                  title: Text('Filled',
+                      style: TextStyle(color: AppColors.textPrimary)),
+                  value: spec.filled,
+                  onChanged: (v) => set(spec.copyWith(filled: v)),
+                ),
+              Text('Drag, pinch and twist the shape in the preview.',
+                  style:
+                      TextStyle(color: AppColors.textTertiary, fontSize: 12)),
+            ],
           );
         },
       );

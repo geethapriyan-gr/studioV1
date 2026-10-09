@@ -8,7 +8,6 @@ import 'package:flutter/scheduler.dart' show Ticker;
 import 'package:provider/provider.dart';
 import 'package:video_player/video_player.dart';
 import 'package:file_picker/file_picker.dart';
-import 'package:path_provider/path_provider.dart';
 import 'package:video_thumbnail/video_thumbnail.dart';
 import 'dart:async';
 
@@ -33,6 +32,7 @@ import '../transitions/transition_factory.dart';
 import '../main.dart' show AppColors;
 import '../splash_screen.dart';
 import 'home/home_shell.dart';
+import 'home/home_storage.dart';
 import '../effects/effects_preview.dart';
 import '../widgets/clip_toolbar.dart';
 import 'export_screen.dart';
@@ -40,6 +40,7 @@ import '../widgets/clip_tool_sheets.dart';
 import '../utils/text_overlay_painter.dart';
 import '../utils/snap_guides.dart';
 import '../widgets/item_toolbars.dart';
+import '../widgets/captions_sheet.dart';
 
 class _RectClipper extends CustomClipper<Path> {
   final Rect rect;
@@ -1412,6 +1413,14 @@ class _VideoEditorScreenState extends State<VideoEditorScreen>
               ),
               const SizedBox(width: 6),
               _buildToolButton(
+                icon: Icons.closed_caption_outlined,
+                label: 'Captions',
+                isActive: provider.captions.isNotEmpty,
+                activeColor: AppColors.textTrack,
+                onPressed: () => CaptionsSheet.show(context),
+              ),
+              const SizedBox(width: 6),
+              _buildToolButton(
                 icon: (provider.showAudioEditor ||
                         provider.selectedAudioOverlayId != null)
                     ? Icons.audiotrack
@@ -1847,10 +1856,8 @@ class _VideoEditorScreenState extends State<VideoEditorScreen>
       await provider.forceAutoSave();
       String? outputPath;
       if (Platform.isAndroid || Platform.isIOS) {
-        final dir = await getTemporaryDirectory();
-        final fileName =
-            'edited_video_${DateTime.now().millisecondsSinceEpoch}.mp4';
-        outputPath = '${dir.path}/$fileName';
+        // Permanent app storage: the cache folder gets emptied by the system.
+        outputPath = await HomeStorage.newExportPath();
       } else {
         outputPath = await FilePicker.platform.saveFile(
           dialogTitle: 'Save Video',

@@ -8,6 +8,7 @@ import '../main.dart' show AppColors;
 import '../models/video_project.dart';
 import '../providers/video_editor_provider.dart';
 import '../utils/snap_guides.dart';
+import '../utils/shape_spec.dart';
 import '../utils/sticker_catalog.dart';
 import '../utils/text_overlay_painter.dart';
 
@@ -17,6 +18,8 @@ const double kStickerBaseSize = 600.0;
 
 /// Image provider for a stored sticker path (bundled asset or own image).
 ImageProvider stickerImageProvider(String path) {
+  final shape = ShapeSpec.parse(path);
+  if (shape != null) return ShapeImageProvider(shape);
   final resolved = StickerCatalog.resolve(path);
   return resolved.startsWith('assets/')
       ? AssetImage(resolved)

@@ -107,6 +107,17 @@ class HomePrefs extends ChangeNotifier {
     await _put('exports', map);
   }
 
+  /// Follows exports that moved (old path → new path), keeping their
+  /// project.
+  Future<void> renameExports(Map<String, String> moved) async {
+    if (moved.isEmpty) return;
+    final map = _exports;
+    for (final key in map.keys.toList()) {
+      map[key] = map[key]!.map((p) => moved[p] ?? p).toList();
+    }
+    await _put('exports', map);
+  }
+
   Future<void> forgetProject(String projectId) async {
     final exports = _exports..remove(projectId);
     final folders = _projectFolders..remove(projectId);
